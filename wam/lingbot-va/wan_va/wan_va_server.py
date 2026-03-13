@@ -513,6 +513,7 @@ class VA_Server:
                     cache_name=self.cache_name,
                     action_mode=False)
 
+                # TODO: 在以下流匹配的过程中加入FBFM核心逻辑
                 if not last_step or video_step != -1:
                     video_noise_pred = data_seq_to_patch(
                         self.job_config.patch_size, video_noise_pred,
@@ -577,6 +578,12 @@ class VA_Server:
         torch.cuda.empty_cache()
         return actions, latents
 
+    def _feedback(self, obs):
+        # 1. 将obs转换成latent
+        latent_model_input = self._encode_obs(obs)
+        # 2. 将latent输入加入反馈队列
+        # 3. 维护掩码W
+
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
@@ -616,14 +623,19 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        feedback = obs.get('feedback', False)    # 状态反馈标志
 
         if reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
             return dict()
+        elif feedback:
+            # FBFM 处理中间帧逻辑
+            logger.info(f"################# Feedback #################")
+            self._feedback(obs=obs)
+            return dict()
         elif compute_kv_cache:
-            logger.info(
-                f"################# Compute KV Cache #################")
+            logger.info(f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
             return dict()
         else:

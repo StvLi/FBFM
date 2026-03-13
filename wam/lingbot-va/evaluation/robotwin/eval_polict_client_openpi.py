@@ -616,7 +616,7 @@ def eval_policy(task_name,
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
-                        _ = model.infer(dict(obs=obs, state_feedback=True)) # 将最新观测发送到server 进行FBFM
+                        _ = model.infer(dict(obs=obs, feedback=True)) # 将最新观测发送到server 进行FBFM 这一逻辑仅进行反馈 不考虑正常推理obs
                     
             first = False
 
