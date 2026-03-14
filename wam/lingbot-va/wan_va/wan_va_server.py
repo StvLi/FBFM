@@ -37,6 +37,8 @@ from utils import (
     save_async,
 )
 
+# FBFM
+import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 
 class VA_Server:
 
@@ -582,7 +584,8 @@ class VA_Server:
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
         # 2. 将latent输入加入反馈队列
-        # 3. 维护掩码W
+        self.left_over.append_state_latent(latent_model_input)
+        # 3. 维护掩码W(RTCPrevChunk自动实现)
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
@@ -640,6 +643,13 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            if action is not None:
+                self.left_over = FBFM.prepare_prev_chunk_left_over(
+                    observed_state_latents = action,
+                    inference_delay = 4,            # TODO:推理延迟
+                    execution_horizon = 4,          # TODO:执行时间
+                    state_execution_horizon = 4,    # TODO:状态执行时间
+                )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     

@@ -117,7 +117,6 @@ class RTCPrevChunk:
 
         self.state = torch.cat([self.state, new_latent], dim=0)
 
-
 def prepare_prev_chunk_left_over(
     action_left_over: Tensor | None = None,
     observed_state_latents: Tensor | None = None,
