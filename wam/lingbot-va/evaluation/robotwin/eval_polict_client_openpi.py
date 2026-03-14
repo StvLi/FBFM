@@ -612,7 +612,7 @@ def eval_policy(task_name,
                     TASK_ENV.take_action(ee_action, action_type='ee')
                    
                     if (j+1) % action_per_frame == 0:
-                        # TODO: 在此处应该插入对obs的处理 获取obs - 发送server - VAE编码
+                        # 对obs的处理 获取obs - 发送server - （server: VAE编码）
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)

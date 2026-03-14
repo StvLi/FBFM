@@ -19,6 +19,9 @@ Real-Time Chunking (RTC) implementation for LeRobot.
 
 Based on Physical Intelligence's Kinetix implementation:
 https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/main/src/model.py#L214
+
+Based on LeRobot's RTC implementation:
+https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/rtc/modeling_rtc.py
 """
 
 import logging
@@ -28,9 +31,9 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from lerobot.configs.types import RTCAttentionSchedule
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.policies.rtc.debug_tracker import Tracker
+from fbfm.configs.types import RTCAttentionSchedule
+from fbfm.policies.fbfm.configuration_rtc import RTCConfig
+from fbfm.policies.fbfm.debug_tracker import Tracker
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +266,8 @@ class RTCProcessor:
 
         This method wraps an original denoising callable that only takes ``x_t`` and
         returns a base denoised velocity ``v_t``. It then applies Real-Time Chunking
-        (RTC) prefix guidance using the leftover prefix from the previous chunk.
+        (RTC) and feedback flow-matching prefix guidance using the leftover prefix 
+        actions and observed latented states from the previous chunk.
 
         Args:
             x_t (Tensor): Current latent/state to denoise. Shape ``(B, T, A)`` or ``(T, A)``.
@@ -350,63 +354,58 @@ class RTCProcessor:
         if execution_horizon > prev_chunk_tensor.shape[1]:
             execution_horizon = prev_chunk_tensor.shape[1]
 
-        batch_size = x_t.shape[0]
-        action_chunk_size = x_t.shape[1]
-        action_dim = x_t.shape[2]
+        batch_size = x_t.shape[0]           # B(B) Batch数量
+        chunk_size = x_t.shape[1]           # T(H) Chunk内step数
+        output_dim = x_t.shape[2]           # D(n) step维数(状态+动作)
 
         # Optionally build a full [state; action] prefix when state feedback is
         # enabled and state latents have been collected in RTCPrevChunk. The
         # guidance is still applied to the *entire* x (state + action together)
         # by using this combined prefix tensor in the original RTC formula.
         use_state_feedback = (
-            isinstance(prev_chunk_left_over, RTCPrevChunk)
-            and self.rtc_config.state_feedback_enabled
-            and self.rtc_config.chunk_state_dim is not None
-            and self.rtc_config.chunk_action_dim is not None
-            and prev_chunk_left_over.state is not None
+            isinstance(prev_chunk_left_over, RTCPrevChunk)      # FBFM需要RTCPrevChunk输入状态反馈
+            and self.rtc_config.state_feedback_enabled          # 确认状态反馈是能
+            and self.rtc_config.chunk_state_dim is not None     # 确认状态维数
+            and self.rtc_config.chunk_action_dim is not None    # 确认动作维数
+            and prev_chunk_left_over.state is not None          # 确认存在至少一帧状态输入
         )
 
-        state_dim_rtc = None
-        action_part_dim_rtc = None
-
         if use_state_feedback:
-            state_dim = self.rtc_config.chunk_state_dim
-            action_part_dim = self.rtc_config.chunk_action_dim
-            state_dim_rtc = state_dim
-            action_part_dim_rtc = action_part_dim
-            if state_dim + action_part_dim != action_dim:
+            state_dim = self.rtc_config.chunk_state_dim    # 配置导入的全部状态维数
+            action_dim = self.rtc_config.chunk_action_dim  # 配置导入的全部动作维数
+            if state_dim + action_dim != output_dim:       # 检查配置导入的维数合法性
                 raise ValueError(
                     f"chunk_state_dim + chunk_action_dim must equal x_t last dim: "
-                    f"got {state_dim} + {action_part_dim} != {action_dim}"
+                    f"got {state_dim} + {action_dim} != {output_dim}"
                 )
 
             # Start from zeros and fill state and (optionally) action segments.
-            combined_prefix = torch.zeros(
+            combined_prefix = torch.zeros(                  
                 batch_size,
-                action_chunk_size,
-                action_dim,
+                chunk_size,
+                output_dim,
                 device=x_t.device,
                 dtype=x_t.dtype,
             )
 
-            # --- Fill state segment [ :state_dim ] ---
+            # --- Fill state segment [ :state_dim ] --- (B,T,D_state)
             state_src = prev_chunk_left_over.state
-            if state_src.dim() == 1:
-                state_src = state_src.unsqueeze(0).unsqueeze(0)
-            elif state_src.dim() == 2:
-                state_src = state_src.unsqueeze(0)
-            elif state_src.dim() != 3:
-                raise ValueError(
-                    f"RTCPrevChunk.state must be 1D, 2D or 3D tensor, got shape {tuple(state_src.shape)}"
-                )
+            if state_src is not None:
+                if state_src.dim() == 1:
+                    state_src = state_src.unsqueeze(0).unsqueeze(0)
+                elif state_src.dim() == 2:
+                    state_src = state_src.unsqueeze(0)
+                elif state_src.dim() != 3:
+                    raise ValueError(
+                        f"RTCPrevChunk.state must be 1D, 2D or 3D tensor, got shape {tuple(state_src.shape)}"
+                    )
+                # 准备公式中的 ‘Y’ 的状态部分
+                t_state = min(state_src.shape[1], chunk_size)   # 有效状态反馈的步数
+                d_state = min(state_src.shape[2], state_dim)    # 有效状态反馈的维数 （应当为全部） but OK
+                combined_prefix[:, :t_state, :d_state] = state_src[:, :t_state, :d_state]
 
-            t_state = min(state_src.shape[1], action_chunk_size)
-            d_state = min(state_src.shape[2], state_dim)
-            combined_prefix[:, :t_state, :d_state] = state_src[:, :t_state, :d_state]
-
-            # --- Fill action segment [state_dim:] if available ---
+            # --- Fill action segment [state_dim:] if available --- (B,T,D_action])
             action_src = prev_chunk_left_over.action
-            t_act = 0
             if action_src is not None:
                 if action_src.dim() == 1:
                     action_src = action_src.unsqueeze(0).unsqueeze(0)
@@ -416,51 +415,46 @@ class RTCProcessor:
                     raise ValueError(
                         f"RTCPrevChunk.action must be 1D, 2D or 3D tensor, got shape {tuple(action_src.shape)}"
                     )
-
-                if action_src.shape[2] != action_part_dim:
-                    raise ValueError(
-                        "RTCPrevChunk.action last dim must match action part dim of x_t "
-                        f"(expected {action_part_dim}, got {action_src.shape[2]})"
-                    )
-
-                t_act = min(action_src.shape[1], action_chunk_size)
-                combined_prefix[:, :t_act, state_dim : state_dim + action_part_dim] = action_src[:, :t_act, :]
+                # 准备公式中的 ‘Y’ 的动作部分
+                t_action = min(action_src.shape[1], chunk_size)    # 有效动作反馈的步数
+                d_action = min(action_src.shape[2], action_dim)    # 有效动作反馈的维数 （应当为全部） but OK
+                combined_prefix[:, :t_action, state_dim : state_dim + d_action] = action_src[:, :t_action, :d_action]
 
             prev_chunk_tensor = combined_prefix
 
             # Weights diag(W): chunk layout is *per-timestep* [state; action].
-            #   x_t[t] = [ state(t) of dim state_dim ; action(t) of dim action_part_dim ]
+            #   x_t[t] = [ state(t) of dim state_dim ; action(t) of dim action_dim ]
             # So over the chunk we have:
-            #   step 0: [s0_1..s0_state_dim, a0_1..a0_action_part_dim]
-            #   step 1: [s1_1..s1_state_dim, a1_1..a1_action_part_dim]
+            #   step 0: [s0_1..s0_state_dim, a0_1..a0_action_dim]
+            #   step 1: [s1_1..s1_state_dim, a1_1..a1_action_dim]
             #   ...
             # W is (1, T, D): W[t, 0:state_dim]=1 for t in "当前已有状态" else 0;
             # W[t, state_dim:]=1 for t in "上个chunk遗留动作" else 0.
             state_exec_horizon = (
                 prev_chunk_left_over.state_execution_horizon
                 if prev_chunk_left_over.state_execution_horizon is not None
-                else self.rtc_config.state_execution_horizon
+                else self.rtc_config.state_execution_horizon    # weired but OK
             )
-            t_state_cap = min(t_state, state_exec_horizon, action_chunk_size)
+            t_state_cap = min(t_state, state_exec_horizon, chunk_size)
             weights = torch.zeros(
-                1,
-                action_chunk_size,
-                action_dim,
+                1,                  # B = 1
+                chunk_size,         # T
+                output_dim,         # D
                 device=x_t.device,
                 dtype=x_t.dtype,
             )
             weights[:, :t_state_cap, :state_dim] = 1.0
-            weights[:, :t_act, state_dim:] = 1.0
-        else:
+            weights[:, :t_action, state_dim:] = 1.0
+        else:   # 不应该走进这个分支
             weights = (
-                self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
+                self.get_prefix_weights(inference_delay, execution_horizon, chunk_size)
                 .to(x_t.device)
                 .unsqueeze(0)
                 .unsqueeze(-1)
             )
 
-        if prev_chunk_tensor.shape[1] < action_chunk_size or prev_chunk_tensor.shape[2] < action_dim:
-            padded = torch.zeros(batch_size, action_chunk_size, action_dim).to(x_t.device)
+        if prev_chunk_tensor.shape[1] < chunk_size or prev_chunk_tensor.shape[2] < output_dim:
+            padded = torch.zeros(batch_size, chunk_size, output_dim).to(x_t.device)
             padded[:, : prev_chunk_tensor.shape[1], : prev_chunk_tensor.shape[2]] = prev_chunk_tensor
             prev_chunk_tensor = padded
 
@@ -469,15 +463,15 @@ class RTCProcessor:
         )
 
         with torch.enable_grad():
-            v_t = original_denoise_step_partial(x_t)
-            x_t.requires_grad_(True)
-
+            v_t = original_denoise_step_partial(x_t)    # v()
+            x_t.requires_grad_(True)    
             x1_t = x_t - time * v_t  # noqa: N806
             err = (prev_chunk_tensor - x1_t) * weights
             grad_outputs = err.clone().detach()
+            # 自动求梯度（雅可比矩阵）
             correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
 
-        # Tau-dependent base guidance (same formula for both state and action).
+        # Tau-dependent base guidance (same formula for both state and action). # 系数: k_p
         tau_tensor = torch.as_tensor(tau, device=x_t.device)
         squared_one_minus_tau = (1 - tau_tensor) ** 2
         inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (
@@ -502,9 +496,9 @@ class RTCProcessor:
             base_guidance_weight, state_max_guidance_weight
         )
 
-        if use_state_feedback and state_dim_rtc is not None:
-            correction_state = correction[:, :, :state_dim_rtc]
-            correction_action = correction[:, :, state_dim_rtc:]
+        if use_state_feedback and state_dim is not None:
+            correction_state = correction[:, :, :state_dim]
+            correction_action = correction[:, :, state_dim:]
             result = v_t - torch.cat(
                 [
                     state_guidance_weight * correction_state,
