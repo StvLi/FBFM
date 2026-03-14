@@ -36,6 +36,7 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
+from modules.rtc import RTCConfig, RTCProcessor, RTCAttentionSchedule
 
 
 class VA_Server:
@@ -90,6 +91,19 @@ class VA_Server:
                                             device=self.device,
                                             eval_mode=True,
                                             )
+
+        # Initialize RTC processor for action diffusion guidance (optional).
+        self.rtc_processor = None
+        if getattr(job_config, "rtc_enabled", False):
+            rtc_config = RTCConfig(
+                enabled=True,
+                execution_horizon=getattr(job_config, "rtc_execution_horizon", 10),
+                max_guidance_weight=getattr(job_config, "rtc_max_guidance_weight", 5.0),
+                prefix_attention_schedule=RTCAttentionSchedule.from_value(
+                    getattr(job_config, "rtc_prefix_attention_schedule", "exp")
+                ),
+            )
+            self.rtc_processor = RTCProcessor(rtc_config)
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -448,7 +462,8 @@ class VA_Server:
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
-    def _infer(self, obs, frame_st_id=0):
+    def _infer(self, obs, frame_st_id=0, prev_action_chunk=None):
+        # prev_action_chunk carries the previous action chunk for RTC prefix guidance.
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
@@ -529,6 +544,7 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
+            # 2. Action Generation Loop (with optional RTC guidance)
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
@@ -547,11 +563,43 @@ class VA_Server:
                     None,
                     action_cond,
                     frame_st_id=frame_st_id)
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True)
+
+                def denoise_step_partial(current_actions):
+                    action_noise_pred_local = self.transformer(
+                        self._repeat_input_for_cfg({
+                            **input_dict['action_res_lst'],
+                            'noisy_latents': current_actions,
+                        }),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=True)
+                    return action_noise_pred_local
+
+                if self.rtc_processor is not None and self.rtc_processor.rtc_config.enabled:
+                    prev_chunk_left_over = None
+                    inference_delay = getattr(self.job_config, "rtc_inference_delay", 0)
+                    execution_horizon = getattr(self.job_config, "rtc_execution_horizon", 10)
+
+                    if prev_action_chunk is not None:
+                        # Convert previous action chunk to RTC prefix tensor shape: (B, T, A).
+                        prev_chunk_left_over = prev_action_chunk.flatten(2, 3).permute(0, 2, 1)
+                        
+                    # Flatten (B, C, F, N, 1) -> (B, T, A) for RTC computation.
+                    x_t = actions.squeeze(-1).permute(0, 2, 3, 1).flatten(2, 3)
+                    v_t = self.rtc_processor.denoise_step(
+                        x_t=x_t,
+                        prev_chunk_left_over=prev_chunk_left_over,
+                        inference_delay=inference_delay,
+                        time=float(t.item()) / float(self.action_scheduler.num_train_timesteps),
+                        original_denoise_step_partial=lambda x: denoise_step_partial(
+                            x.view(1, frame_chunk_size * self.action_per_frame, self.job_config.action_dim)
+                        ),
+                        execution_horizon=execution_horizon,
+                    )
+                    action_noise_pred = v_t.view(1, frame_chunk_size, self.action_per_frame, self.job_config.action_dim)
+                    action_noise_pred = action_noise_pred.permute(0, 3, 1, 2).unsqueeze(-1)
+                else:
+                    action_noise_pred = denoise_step_partial(actions)
 
                 if not last_step:
                     action_noise_pred = rearrange(action_noise_pred,
@@ -628,7 +676,10 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            prev_action_chunk = getattr(self, "_prev_action_chunk", None)
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id, prev_action_chunk=prev_action_chunk)
+            # Cache previous chunk in model format for RTC guidance on next step.
+            self._prev_action_chunk = torch.from_numpy(action).to(self.device).unsqueeze(0).unsqueeze(-1)
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):

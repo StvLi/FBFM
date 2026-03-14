@@ -27,6 +27,12 @@ va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
 
+# RTC config (action chunk guidance)
+va_robotwin_cfg.rtc_enabled = False
+va_robotwin_cfg.rtc_execution_horizon = 10
+va_robotwin_cfg.rtc_max_guidance_weight = 5.0
+va_robotwin_cfg.rtc_prefix_attention_schedule = "exp"
+
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0
 
