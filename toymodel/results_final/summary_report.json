@@ -1,0 +1,49 @@
+{
+  "exp_a": {
+    "num_step_conditions": 6,
+    "num_sinusoidal_conditions": 6,
+    "avg_step_jitter_improvement": 12.065967371354574,
+    "avg_step_action_mse_improvement": 6.9516621924959106,
+    "avg_step_energy_improvement": 1.1406783049923979,
+    "best_step_jitter_case": "step_stiff×3",
+    "best_step_jitter_improvement": 26.74074590719237,
+    "avg_sinusoidal_position_improvement": 1.0048744657844058,
+    "avg_sinusoidal_jitter_improvement": 1.0036774235183257
+  },
+  "exp_b": {
+    "num_conditions": 6,
+    "avg_jitter_improvement": 12.6710559696932,
+    "avg_action_mse_improvement": 6.332898216032334,
+    "avg_energy_improvement": 1.1532921695884404,
+    "cases_where_fbfm_not_better_than_rtc_in_jitter": [
+      "pos_offset_mm"
+    ]
+  },
+  "exp_c": {
+    "step_cases_jacobian_beats_identity": 2,
+    "step_cases_total": 2,
+    "step_cases_rtc_beats_identity": 2,
+    "sin_cases_identity_worse_than_vanilla_on_position": 3,
+    "step_combined_jitter": {
+      "vanilla": 0.6482463762164116,
+      "rtc": 0.2300785407423973,
+      "fbfm_id": 0.37340580597519873,
+      "fbfm": 0.041027511656284335
+    }
+  },
+  "exp_d": {
+    "best_fbfm_state_weight": 10.0,
+    "best_fbfm_jitter": 0.0433441624045372,
+    "best_rtc_action_weight": 1.0,
+    "best_rtc_jitter": 0.35213877260684967,
+    "vanilla_jitter": 1.0547991196314495,
+    "fbfm_vs_vanilla_best_jitter_gain": 24.33543667972771,
+    "rtc_vs_vanilla_best_jitter_gain": 2.995407497512621,
+    "fbfm_state_sensitivity_range": {
+      "min_jitter": 0.0433441624045372,
+      "max_jitter": 0.04363676657279333,
+      "min_position_mse": 0.09094399213790894,
+      "max_position_mse": 0.09102603544791539
+    }
+  }
+}
