@@ -78,14 +78,26 @@ class FBFMConfig:
     # Guidance parameters
     max_guidance_weight: float = 10.0       # β for action
     state_max_guidance_weight: float = 10.0  # β for state
-    execution_horizon: int = 10             # for prefix weight schedule
-    state_execution_horizon: int = 10       # for state prefix
+
+    # 3-segment action window (paper Fig.X):
+    #   [0, inference_delay)          → frozen, weight=1.0
+    #   [inference_delay, H-empty_horizon) → modifiable, decaying weight
+    #   [H-empty_horizon, H)          → empty tail, weight=0.0
+    inference_delay: int = 4
+    empty_horizon: int = 5
+
+    # State feedback window: how many observed states (from frozen segment)
+    # are used as FBFM state prefix.  Typically = inference_delay.
+    state_feedback_horizon: int = 4
 
     # Denoising
     num_denoise_steps: int = 20
 
-    # Prefix attention schedule: 'linear' or 'ones'
-    prefix_schedule: str = "linear"
+    # Prefix attention schedule: 'linear', 'exponential', or 'ones'
+    prefix_schedule: str = "exponential"
+
+    # Exponential decay rate for prefix weights (only used if prefix_schedule='exponential')
+    exponential_decay_rate: float = 0.7
 
 
 @dataclass
@@ -353,28 +365,15 @@ class FBFMProcessor:
             correction_state = correction[:, :, :state_dim]
             correction_action = correction[:, :, state_dim:]
 
-            # FBFM: Use tighter clip for smoother action (reduces jitter)
-            # Apply temporal smoothing to action correction for continuity
+            # FBFM: Moderate clip to balance smoothness and responsiveness
+            # Use soft clipping (tanh-based) for smoother transitions
             action_corr_raw = action_gw * correction_action
 
-            # Simple temporal smoothing: weighted average with neighbors
-            if action_corr_raw.shape[1] > 2:
-                # Pad for boundary handling
-                padded = torch.nn.functional.pad(action_corr_raw, (0, 0, 1, 1), mode='replicate')
-                # Smooth: 0.25*prev + 0.5*curr + 0.25*next
-                smoothed = (padded[:, :-2, :] * 0.25 +
-                           padded[:, 1:-1, :] * 0.5 +
-                           padded[:, 2:, :] * 0.25)
-                action_corr_smooth = smoothed
-            else:
-                action_corr_smooth = action_corr_raw
-
-            # Tighter clip for FBFM to reduce jitter (±1.0 instead of ±2.0)
-            action_correction_clipped = torch.clamp(
-                action_corr_smooth,
-                min=-1.0,
-                max=1.0
-            )
+            # Soft clip using tanh: smoothly saturates instead of hard cutoff
+            # tanh(x/scale) * limit gives smooth saturation at ±limit
+            clip_limit = 1.5
+            scale = 0.5  # Controls transition smoothness
+            action_correction_clipped = clip_limit * torch.tanh(action_corr_raw / scale)
 
             guided_v = v_t + torch.cat(
                 [
@@ -384,7 +383,7 @@ class FBFMProcessor:
                 dim=-1,
             )
         else:
-            # RTC & Vanilla: Looser clip (±2.0) - allows faster response but more jitter
+            # RTC & Vanilla: Standard clip to prevent extreme spikes
             action_correction_clipped = torch.clamp(
                 action_gw * correction,
                 min=-2.0,
@@ -448,14 +447,16 @@ class FBFMProcessor:
             combined_prefix[:, :t_act, state_dim : state_dim + d_act] = actions[:t_act, :d_act].unsqueeze(0)
 
         # Weight mask W
-        # State: capped by state_execution_horizon (matching modeling_rtc.py line 457)
-        state_exec_h = min(t_state, self.cfg.state_execution_horizon, H)
-        weights[:, :state_exec_h, :state_dim] = 1.0
+        # State: capped by state_feedback_horizon (frozen-segment states only)
+        sfh = self.cfg.state_feedback_horizon
+        state_cap = min(t_state, sfh, H)
+        weights[:, :state_cap, :state_dim] = 1.0
 
-        # Action: NOT capped by execution_horizon (matching modeling_rtc.py line 465)
-        # In the original code: weights[:, :t_act, state_dim:] = 1.0
-        # t_act is simply min(action_src.shape[1], action_chunk_size)
-        weights[:, :t_act, state_dim:] = 1.0
+        # Action: use the same 3-segment schedule as RTC (shared window)
+        action_weights_1d = self._get_prefix_weights(H).to(device)
+        weights[:, :, state_dim:] = action_weights_1d.unsqueeze(0).unsqueeze(-1).expand(
+            B, H, action_dim
+        )
 
         return combined_prefix, weights
 
@@ -490,12 +491,8 @@ class FBFMProcessor:
                 actions[:t_act, :d_act].unsqueeze(0)
             )
 
-        # Build linear schedule weights, applied only to action dims
-        inference_delay = prev_chunk.inference_delay
-        execution_horizon = self.cfg.execution_horizon
-        start = min(inference_delay, execution_horizon)
-
-        weights_1d = self._get_prefix_weights(start, execution_horizon, H).to(device)
+        # Build 3-segment action weights, applied only to action dims
+        weights_1d = self._get_prefix_weights(H).to(device)
         # Expand to (B, H, D) but zero out state dims
         weights = torch.zeros(B, H, D, device=device)
         weights[:, :, state_dim:] = weights_1d.unsqueeze(0).unsqueeze(-1).expand(
@@ -504,44 +501,45 @@ class FBFMProcessor:
 
         return combined_prefix, weights
 
-    def _get_prefix_weights(self, start: int, end: int, total: int) -> Tensor:
-        """Generate prefix attention weights (linear schedule).
+    def _get_prefix_weights(self, total: int) -> Tensor:
+        """Generate 3-segment prefix weights from cfg.
 
-        Mirrors RTCProcessor.get_prefix_weights from modeling_rtc.py.
+        Returns (total,) tensor:
+          [0, d)      = 1.0  (frozen)
+          [d, H-s)    = decay (exponential / linear / ones)
+          [H-s, H)    = 0.0  (empty tail)
         """
-        start = min(start, end)
+        d = self.cfg.inference_delay
+        s = self.cfg.empty_horizon
+        H = total
+        frozen_end = d
+        modifiable_end = H - s
+        # [H-s, H): weight=0.0
 
-        if self.cfg.prefix_schedule == "ones":
-            weights = torch.ones(total)
-            weights[end:] = 0.0
-            return weights
+        weights = torch.zeros(total)
 
-        # Linear schedule (default)
-        skip = max(total - end, 0)
-        linspace_steps = total - skip - start
+        # Segment 1: Frozen actions (a0~a3)
+        if frozen_end > 0:
+            weights[:frozen_end] = 1.0
 
-        if end <= start or linspace_steps <= 0:
-            weights = torch.zeros(total)
-            weights[:start] = 1.0
-            return weights
+        # Segment 2: Modifiable with decay (a4~a10)
+        modifiable_len = modifiable_end - frozen_end
+        if modifiable_len > 0:
+            if self.cfg.prefix_schedule == "ones":
+                # Uniform weight=1.0 for the entire modifiable region
+                weights[frozen_end:modifiable_end] = 1.0
+            elif self.cfg.prefix_schedule == "exponential":
+                # Exponential decay: w[i] = λ^(i - d) for i in [d, H-s)
+                λ = self.cfg.exponential_decay_rate
+                indices = torch.arange(modifiable_len, dtype=torch.float32)
+                weights[frozen_end:modifiable_end] = λ ** indices
+            else:  # linear (legacy)
+                # Linear decay from 1.0 to 0.0
+                weights[frozen_end:modifiable_end] = torch.linspace(1.0, 0.0, modifiable_len + 2)[1:-1]
 
-        lin = torch.linspace(1, 0, linspace_steps + 2)[1:-1]
+        # Segment 3: Empty horizon (a11~a15) - already zeros
 
-        # Add trailing zeros
-        if total - end > 0:
-            lin = torch.cat([lin, torch.zeros(total - end)])
-
-        # Add leading ones
-        if start > 0:
-            lin = torch.cat([torch.ones(min(start, total)), lin])
-
-        # Ensure correct length
-        if lin.shape[0] < total:
-            lin = torch.cat([lin, torch.zeros(total - lin.shape[0])])
-        elif lin.shape[0] > total:
-            lin = lin[:total]
-
-        return lin
+        return weights
 
 
 # ======================================================================
