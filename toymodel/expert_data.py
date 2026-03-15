@@ -22,7 +22,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
-from pre_test_2.physics_env import (
+from pre_test_1.physics_env import (
     MassSpringDamperEnv,
     EnvConfig,
     generate_step_target,

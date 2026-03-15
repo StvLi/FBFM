@@ -4,7 +4,7 @@ Training script for the 1D Flow-Matching model.
 Generates expert data → trains the lightweight DiT → saves checkpoint.
 
 Usage:
-    python -m pre_test_2.train [--epochs 200] [--batch_size 256] [--lr 3e-4]
+    python -m pre_test_1.train [--epochs 200] [--batch_size 256] [--lr 3e-4]
 """
 
 import argparse
@@ -14,9 +14,9 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from pre_test_2.expert_data import generate_dataset, save_dataset, load_dataset, ExpertChunkDataset
-from pre_test_2.flow_model import FlowMatchingDiT, flow_matching_loss, flow_matching_sample
-from pre_test_2.physics_env import EnvConfig
+from pre_test_1.expert_data import generate_dataset, save_dataset, load_dataset, ExpertChunkDataset
+from pre_test_1.flow_model import FlowMatchingDiT, flow_matching_loss, flow_matching_sample
+from pre_test_1.physics_env import EnvConfig
 
 
 def train(
@@ -28,8 +28,8 @@ def train(
     steps_per_traj: int = 300,
     hidden_dim: int = 128,
     num_layers: int = 4,
-    save_dir: str = "pre_test_2/checkpoints",
-    data_path: str = "pre_test_2/data/expert_dataset.pt",
+    save_dir: str = "pre_test_1/checkpoints",
+    data_path: str = "pre_test_1/data/expert_dataset.pt",
     device: str = "auto",
     seed: int = 42,
 ):
@@ -187,7 +187,7 @@ def train(
 
 
 def load_trained_model(
-    checkpoint_path: str = "pre_test_2/checkpoints/best_model.pt",
+    checkpoint_path: str = "pre_test_1/checkpoints/best_model.pt",
     device: str = "auto",
 ) -> tuple:
     """Load a trained model and its normalization stats.

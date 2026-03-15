@@ -2,11 +2,11 @@
 Global constants and configuration factory for the 1D FBFM pre-experiment.
 
 All tunable hyper-parameters and path conventions live here so that every
-other module can ``from pre_test_2.config import …`` without circular deps.
+other module can import this file without circular deps.
 """
 
-from pre_test_2.physics_env import EnvConfig
-from pre_test_2.fbfm_processor import FBFMConfig, GuidanceMode
+from pre_test_1.physics_env import EnvConfig
+from pre_test_1.fbfm_processor import FBFMConfig, GuidanceMode
 
 # ── Dimensions ────────────────────────────────────────────────────────
 STATE_DIM = 2
@@ -23,8 +23,8 @@ REPLAN_INTERVAL = 9   # actions executed per cycle (d + 5)
 
 # ── Simulation ────────────────────────────────────────────────────────
 TOTAL_STEPS   = 300
-RESULTS_DIR   = "pre_test_2/results_final"
-CHECKPOINT    = "pre_test_2/checkpoints/best_model.pt"
+RESULTS_DIR   = "pre_test_1/results_final"
+CHECKPOINT    = "pre_test_1/checkpoints/best_model.pt"
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
 TRAIN_ENV_CFG = EnvConfig(mass=1.0, damping=0.5, stiffness=0.1, dt=0.02)

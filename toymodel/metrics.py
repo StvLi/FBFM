@@ -4,7 +4,7 @@ Metrics computation, multi-seed aggregation, and formatted table output.
 
 import numpy as np
 
-from pre_test_2.config import STATE_DIM
+from pre_test_1.config import STATE_DIM
 
 
 def compute_metrics(result, reference=None):

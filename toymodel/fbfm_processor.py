@@ -175,14 +175,14 @@ class FBFMProcessor:
         Returns:
             Tensor of shape (H, chunk_dim) – generated chunk X^1.
         """
-        cfg = self.cfg
-        H = cfg.horizon
-        D = cfg.state_dim + cfg.action_dim
+        cfg = self.cfg # local reference for convenience
+        H = cfg.horizon # chunk length
+        D = cfg.state_dim + cfg.action_dim # chunk dimension (state + action)
 
         # Ensure observation is batched
-        if observation.dim() == 1:
-            observation = observation.unsqueeze(0)
-        B = observation.shape[0]
+        if observation.dim() == 1: # (state_dim,)
+            observation = observation.unsqueeze(0) # (B, state_dim)
+        B = observation.shape[0] # batch size inferred from observation
 
         # Ensure target is batched
         if target is not None and target.dim() == 1:
@@ -454,12 +454,20 @@ class FBFMProcessor:
 
         # Action: use the same 3-segment schedule as RTC (shared window)
         action_weights_1d = self._get_prefix_weights(H).to(device)
+        # Only apply action guidance on timesteps that actually have leftover actions.
+        # Otherwise Y action entries are zeros (placeholders), which would incorrectly
+        # pull unknown action slots toward zero.
+        action_availability = torch.zeros(H, device=device)
+        if t_act > 0:
+            action_availability[:t_act] = 1.0
+        action_weights_1d = action_weights_1d * action_availability
         weights[:, :, state_dim:] = action_weights_1d.unsqueeze(0).unsqueeze(-1).expand(
             B, H, action_dim
         )
 
         return combined_prefix, weights
 
+    # RTC baseline: action-only prefix and weights
     def _build_rtc_prefix_and_weights(
         self,
         prev_chunk: PrevChunkInfo,
@@ -493,6 +501,11 @@ class FBFMProcessor:
 
         # Build 3-segment action weights, applied only to action dims
         weights_1d = self._get_prefix_weights(H).to(device)
+        # Mask out timesteps with no leftover action feedback.
+        availability = torch.zeros(H, device=device)
+        if t_act > 0:
+            availability[:t_act] = 1.0
+        weights_1d = weights_1d * availability
         # Expand to (B, H, D) but zero out state dims
         weights = torch.zeros(B, H, D, device=device)
         weights[:, :, state_dim:] = weights_1d.unsqueeze(0).unsqueeze(-1).expand(

@@ -8,12 +8,12 @@ Provides two entry points:
 
 import torch
 
-from pre_test_2.config import (
+from pre_test_1.config import (
     STATE_DIM, ACTION_DIM, TOTAL_STEPS, REPLAN_INTERVAL, INFERENCE_DELAY,
 )
-from pre_test_2.physics_env import MassSpringDamperEnv
-from pre_test_2.fbfm_processor import GuidanceMode, PrevChunkInfo, fbfm_sample
-from pre_test_2.expert_data import PIDController, PIDConfig
+from pre_test_1.physics_env import MassSpringDamperEnv
+from pre_test_1.fbfm_processor import GuidanceMode, PrevChunkInfo, fbfm_sample
+from pre_test_1.expert_data import PIDController, PIDConfig
 
 # Max allowed action change per timestep.  PID expert's max slew ≈ 2.5;
 # we use 3.0 to leave headroom while still killing ±10 spikes.
@@ -23,27 +23,32 @@ MAX_SLEW_RATE = 3.0
 def run_rollout(model, norm_stats, cfg, env_cfg, target, init_state, device,
                 disturbance=None):
     """Closed-loop rollout for 1D mass-spring-damper."""
-    env = MassSpringDamperEnv(env_cfg)
-    state = env.reset(init_state)
+    env = MassSpringDamperEnv(env_cfg) # create a new env instance for this rollout
+    state = env.reset(init_state) # reset to the given initial state
 
-    T = TOTAL_STEPS
-    all_states = torch.zeros(T, STATE_DIM)
-    all_actions = torch.zeros(T, ACTION_DIM)
-    pred_states_list = []
-    chunk_boundaries = []
+    T = TOTAL_STEPS # total rollout length
+    all_states = torch.zeros(T, STATE_DIM) # pre-allocate tensor to store states
+    all_actions = torch.zeros(T, ACTION_DIM) # pre-allocate tensor to store actions
+    pred_states_list = [] # list to store predicted states for debugging/analysis
+    chunk_boundaries = [] # list to store indices where new chunks are sampled
 
-    current_chunk = None
-    action_idx = 0
-    observed_states = []
+    current_chunk = None # currently executing chunk of actions
+    action_idx = 0 # index within the current chunk
+    observed_states = [] # list to store states observed during the current chunk, for FBFM guidance
 
     t = 0
     while t < T:
+        # Determine if we need to sample a new chunk (either at the start or after executing REPLAN_INTERVAL actions)
         need_new = (current_chunk is None or action_idx >= min(REPLAN_INTERVAL, current_chunk.shape[0]))
         if need_new:
             chunk_boundaries.append(t)
             prev_chunk = None
             if current_chunk is not None and cfg.mode != GuidanceMode.VANILLA:
-                leftover = current_chunk[action_idx:]
+                # leftover = current_chunk[action_idx:]
+                # Leftover = chunk[4:11] (indices 4-10, 7 actions from the
+                # actual execution segment).  These anchor the next chunk's
+                # guided inference.  NOT chunk[9:] which includes empty tail.
+                leftover = current_chunk[INFERENCE_DELAY:INFERENCE_DELAY + (cfg.horizon - INFERENCE_DELAY - cfg.empty_horizon)]
                 prev_chunk = PrevChunkInfo(
                     action_leftover=leftover if leftover.shape[0] > 0 else None,
                     inference_delay=INFERENCE_DELAY,

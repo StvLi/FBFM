@@ -2,7 +2,7 @@
 CLI entry point for the FBFM pre-experiment suite.
 
 Usage:
-    python -m pre_test_2.run [--exp a|b|c|d|all] [--seeds 5]
+    python -m pre_test_1.run [--exp a|b|c|d|all] [--seeds 5]
 """
 
 import argparse
@@ -10,9 +10,9 @@ import time as time_mod
 
 import torch
 
-from pre_test_2.config import CHECKPOINT, RESULTS_DIR
-from pre_test_2.train import load_trained_model
-from pre_test_2.experiments import experiment_a, experiment_b, experiment_c, experiment_d
+from pre_test_1.config import CHECKPOINT, RESULTS_DIR
+from pre_test_1.train import load_trained_model
+from pre_test_1.experiments import experiment_a, experiment_b, experiment_c, experiment_d
 
 
 def main():
