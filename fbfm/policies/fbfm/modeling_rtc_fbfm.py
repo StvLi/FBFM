@@ -313,8 +313,9 @@ class RTCProcessor:
         tau = 1 - time
 
         # Normalize prev_chunk_left_over into a Tensor (action-only guidance).
-        # For now we ignore state latents in RTCPrevChunk; only the action field
-        # participates in the same way as the original Tensor-based API.
+        # For RTCPrevChunk we may consume action-only, state-only, or joint
+        # state+action guidance depending on the current x domain.
+        prev_state = None
         if isinstance(prev_chunk_left_over, RTCPrevChunk):
             # If an execution_horizon override was set on the struct, prefer it.
             if prev_chunk_left_over.execution_horizon is not None:
@@ -322,9 +323,7 @@ class RTCProcessor:
             # Use the delay stored in the struct if present.
             inference_delay = prev_chunk_left_over.inference_delay
             prev_action = prev_chunk_left_over.action
-            if prev_action is None:
-                v_t = original_denoise_step_partial(x_t)
-                return v_t
+            prev_state = prev_chunk_left_over.state
             prev_chunk_tensor = prev_action
         else:
             if prev_chunk_left_over is None:
@@ -341,7 +340,7 @@ class RTCProcessor:
             x_t = x_t.unsqueeze(0)
             squeezed = True
 
-        if len(prev_chunk_tensor.shape) < 3:
+        if prev_chunk_tensor is not None and len(prev_chunk_tensor.shape) < 3:
             # Add batch dimension
             prev_chunk_tensor = prev_chunk_tensor.unsqueeze(0)
 
@@ -350,12 +349,36 @@ class RTCProcessor:
 
         # If the previous action chunk is to short then it doesn't make sense to use long execution horizon
         # because there is nothing to merge
-        if execution_horizon > prev_chunk_tensor.shape[1]:
+        if prev_chunk_tensor is not None and execution_horizon > prev_chunk_tensor.shape[1]:
             execution_horizon = prev_chunk_tensor.shape[1]
 
         batch_size = x_t.shape[0]           # B(B) Batch数量
         chunk_size = x_t.shape[1]           # T(H) Chunk内step数
         output_dim = x_t.shape[2]           # D(n) step维数(状态+动作)
+
+        if isinstance(prev_chunk_left_over, RTCPrevChunk):
+            state_only_compatible = (
+                prev_state is not None
+                and prev_state.shape[-1] <= output_dim
+            )
+            action_compatible = (
+                prev_chunk_tensor is not None
+                and prev_chunk_tensor.shape[-1] <= output_dim
+            )
+            state_exact_match = (
+                prev_state is not None
+                and prev_state.shape[-1] == output_dim
+            )
+            action_exact_match = (
+                prev_chunk_tensor is not None
+                and prev_chunk_tensor.shape[-1] == output_dim
+            )
+            if state_exact_match and not action_exact_match:
+                prev_chunk_tensor = prev_state
+            elif prev_chunk_tensor is None and state_only_compatible:
+                prev_chunk_tensor = prev_state
+            elif prev_chunk_tensor is not None and not action_compatible and state_only_compatible:
+                prev_chunk_tensor = prev_state
 
         # Optionally build a full [state; action] prefix when state feedback is
         # enabled and state latents have been collected in RTCPrevChunk. The
@@ -368,6 +391,10 @@ class RTCProcessor:
             and self.rtc_config.chunk_action_dim is not None    # 确认动作维数
             and prev_chunk_left_over.state is not None          # 确认存在至少一帧状态输入
         )
+
+        if prev_chunk_tensor is None and not use_state_feedback:
+            v_t = original_denoise_step_partial(x_t)
+            return v_t
 
         if use_state_feedback:
             state_dim = self.rtc_config.chunk_state_dim    # 配置导入的全部状态维数

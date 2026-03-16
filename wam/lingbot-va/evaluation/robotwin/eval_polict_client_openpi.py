@@ -620,7 +620,15 @@ def eval_policy(task_name,
                     
             first = False
 
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+            model.infer(
+                dict(
+                    obs=key_frame_list,
+                    compute_kv_cache=True,
+                    imagine=False,
+                    save_visualization=save_visualization,
+                    prev_action=action,
+                )
+            )
   
             if TASK_ENV.eval_success:
                 succ = True

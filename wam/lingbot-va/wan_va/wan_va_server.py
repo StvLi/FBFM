@@ -39,6 +39,7 @@ from utils import (
 
 # FBFM
 import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
+from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 
 class VA_Server:
 
@@ -103,6 +104,20 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+
+        self.fbfm_enabled = getattr(job_config, 'fbfm_enabled', False)
+        self.fbfm_inference_delay = getattr(job_config, 'fbfm_inference_delay', 0)
+        self.rtc_processor = FBFM.RTCProcessor(
+            RTCConfig(
+                enabled=self.fbfm_enabled,
+                execution_horizon=getattr(job_config, 'fbfm_execution_horizon', 4),
+                max_guidance_weight=getattr(job_config, 'fbfm_max_guidance_weight', 10.0),
+                debug=getattr(job_config, 'fbfm_debug', False),
+                debug_maxlen=getattr(job_config, 'fbfm_debug_maxlen', 100),
+            )
+        )
+        self.left_over = None
+        self.last_generated_action_chunk = None
 
     def _get_t5_prompt_embeds(
         self,
@@ -251,6 +266,199 @@ class VA_Server:
             raise NotImplementedError
         action = action.squeeze(0).detach().cpu().numpy()
         return action[self.job_config.used_action_channel_ids]
+
+    def _flatten_video_latents_for_guidance(self, latents):
+        if latents is None:
+            return None
+        if latents.dim() != 5:
+            raise ValueError(f"Expected video latents with shape (B, C, F, H, W), got {tuple(latents.shape)}")
+        if latents.shape[0] != 1:
+            raise ValueError(f"Only batch size 1 is supported for FBFM guidance, got {latents.shape[0]}")
+        return rearrange(latents, 'b c f h w -> f (c h w)')
+
+    def _unflatten_video_latents_from_guidance(self, latents, reference_shape):
+        if latents.dim() == 2:
+            latents = latents.unsqueeze(0)
+        _, channels, _, height, width = reference_shape
+        return rearrange(latents, 'b f (c h w) -> b c f h w', c=channels, h=height, w=width)
+
+    def _flatten_action_chunk_for_guidance(self, action_chunk):
+        if action_chunk is None:
+            return None
+        if action_chunk.dim() != 5:
+            raise ValueError(
+                f"Expected normalized action chunk with shape (B, C, F, H, W), got {tuple(action_chunk.shape)}"
+            )
+        if action_chunk.shape[0] != 1:
+            raise ValueError(f"Only batch size 1 is supported for FBFM action buffering, got {action_chunk.shape[0]}")
+        return rearrange(action_chunk, 'b c f h w -> f (c h w)').detach()
+
+    def _unflatten_action_chunk_from_guidance(self, action_chunk, reference_shape):
+        if action_chunk.dim() == 2:
+            action_chunk = action_chunk.unsqueeze(0)
+        _, channels, _, action_per_frame, width = reference_shape
+        return rearrange(
+            action_chunk,
+            'b f (c h w) -> b c f h w',
+            c=channels,
+            h=action_per_frame,
+            w=width,
+        )
+
+    def _predict_video_noise(self, latents, timestep, frame_st_id, latent_cond, *, update_cache):
+        input_dict = self._prepare_latent_input(
+            latent_model_input=latents,
+            action_model_input=None,
+            latent_t=timestep,
+            action_t=timestep,
+            latent_cond=latent_cond,
+            action_cond=None,
+            frame_st_id=frame_st_id,
+        )
+        video_noise_pred = self.transformer(
+            self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+            update_cache=update_cache,
+            cache_name=self.cache_name,
+            action_mode=False,
+        )
+        video_noise_pred = data_seq_to_patch(
+            self.job_config.patch_size,
+            video_noise_pred,
+            latents.shape[2],
+            latents.shape[3],
+            latents.shape[4],
+            batch_size=2 if self.use_cfg else 1,
+        )
+        if self.job_config.guidance_scale > 1:
+            video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (
+                video_noise_pred[:1] - video_noise_pred[1:]
+            )
+        else:
+            video_noise_pred = video_noise_pred[:1]
+        return video_noise_pred
+
+    def _predict_action_noise(self, actions, timestep, frame_st_id, action_cond, *, update_cache):
+        input_dict = self._prepare_latent_input(
+            latent_model_input=None,
+            action_model_input=actions,
+            latent_t=timestep,
+            action_t=timestep,
+            latent_cond=None,
+            action_cond=action_cond,
+            frame_st_id=frame_st_id,
+        )
+        action_noise_pred = self.transformer(
+            self._repeat_input_for_cfg(input_dict['action_res_lst']),
+            update_cache=update_cache,
+            cache_name=self.cache_name,
+            action_mode=True,
+        )
+        action_noise_pred = rearrange(
+            action_noise_pred,
+            'b (f n) c -> b c f n 1',
+            f=actions.shape[2],
+        )
+        if self.job_config.action_guidance_scale > 1:
+            action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (
+                action_noise_pred[:1] - action_noise_pred[1:]
+            )
+        else:
+            action_noise_pred = action_noise_pred[:1]
+        return action_noise_pred
+
+    def _guided_video_step(self, latents, timestep, sigma_time, frame_st_id, latent_cond):
+        prefix = self.left_over.state if self.left_over is not None else None
+        has_feedback = prefix is not None and prefix.numel() > 0
+        logger.info(
+            "FBFM video_guided=%s frame_st_id=%s sigma=%.6f action_shape=%s state_shape=%s",
+            has_feedback,
+            frame_st_id,
+            sigma_time,
+            tuple(self.left_over.action.shape) if self.left_over is not None and self.left_over.action is not None else None,
+            tuple(prefix.shape) if prefix is not None else None,
+        )
+
+        if not has_feedback:
+            video_noise_pred = self._predict_video_noise(
+                latents,
+                timestep,
+                frame_st_id,
+                latent_cond,
+                update_cache=0,
+            )
+            return self.scheduler.step(video_noise_pred, timestep, latents, return_dict=False)
+
+        current_latents = latents.detach().requires_grad_(True)
+
+        def original_denoise(flat_latents):
+            latent_model_input = self._unflatten_video_latents_from_guidance(flat_latents, current_latents.shape)
+            video_noise_pred = self._predict_video_noise(
+                latent_model_input,
+                timestep,
+                frame_st_id,
+                latent_cond,
+                update_cache=0,
+            )
+            return self._flatten_video_latents_for_guidance(video_noise_pred)
+
+        flat_latents = self._flatten_video_latents_for_guidance(current_latents)
+        guided_velocity = self.rtc_processor.denoise_step(
+            x_t=flat_latents,
+            prev_chunk_left_over=prefix,
+            inference_delay=self.fbfm_inference_delay,
+            time=sigma_time,
+            original_denoise_step_partial=original_denoise,
+            execution_horizon=self.rtc_processor.rtc_config.execution_horizon,
+        )
+        guided_velocity = self._unflatten_video_latents_from_guidance(guided_velocity, current_latents.shape)
+        return self.scheduler.step(guided_velocity, timestep, current_latents.detach(), return_dict=False)
+
+    def _guided_action_step(self, actions, timestep, sigma_time, frame_st_id, action_cond):
+        prefix = self.left_over.action if self.left_over is not None else None
+        has_feedback = prefix is not None and prefix.numel() > 0
+        logger.info(
+            "FBFM action_guided=%s frame_st_id=%s sigma=%.6f action_shape=%s state_shape=%s",
+            has_feedback,
+            frame_st_id,
+            sigma_time,
+            tuple(prefix.shape) if prefix is not None else None,
+            tuple(self.left_over.state.shape) if self.left_over is not None and self.left_over.state is not None else None,
+        )
+
+        if not has_feedback:
+            action_noise_pred = self._predict_action_noise(
+                actions,
+                timestep,
+                frame_st_id,
+                action_cond,
+                update_cache=0,
+            )
+            return self.action_scheduler.step(action_noise_pred, timestep, actions, return_dict=False)
+
+        current_actions = actions.detach().requires_grad_(True)
+
+        def original_denoise(flat_actions):
+            action_model_input = self._unflatten_action_chunk_from_guidance(flat_actions, current_actions.shape)
+            action_noise_pred = self._predict_action_noise(
+                action_model_input,
+                timestep,
+                frame_st_id,
+                action_cond,
+                update_cache=0,
+            )
+            return self._flatten_action_chunk_for_guidance(action_noise_pred)
+
+        flat_actions = self._flatten_action_chunk_for_guidance(current_actions)
+        guided_velocity = self.rtc_processor.denoise_step(
+            x_t=flat_actions,
+            prev_chunk_left_over=prefix,
+            inference_delay=self.fbfm_inference_delay,
+            time=sigma_time,
+            original_denoise_step_partial=original_denoise,
+            execution_horizon=self.rtc_processor.rtc_config.execution_horizon,
+        )
+        guided_velocity = self._unflatten_action_chunk_from_guidance(guided_velocity, current_actions.shape)
+        return self.action_scheduler.step(guided_velocity, timestep, current_actions.detach(), return_dict=False)
     
     def _repeat_input_for_cfg(self, input_dict):
         if self.use_cfg:
@@ -390,6 +598,8 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self.left_over = None
+        self.last_generated_action_chunk = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -572,6 +782,105 @@ class VA_Server:
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
+        self.last_generated_action_chunk = actions.detach().clone()
+
+        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+
+        actions = self.postprocess_action(actions)
+        torch.cuda.empty_cache()
+        return actions, latents
+
+    def _infer_guided(self, obs, frame_st_id=0):
+        frame_chunk_size = self.job_config.frame_chunk_size
+        if frame_st_id == 0:
+            init_latent = self._encode_obs(obs)
+            self.init_latent = init_latent
+        else:
+            init_latent = self.init_latent
+
+        latents = torch.randn(
+            1,
+            48,
+            frame_chunk_size,
+            self.latent_height,
+            self.latent_width,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        actions = torch.randn(
+            1,
+            self.job_config.action_dim,
+            frame_chunk_size,
+            self.action_per_frame,
+            1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        self.scheduler.set_timesteps(self.job_config.num_inference_steps)
+        self.action_scheduler.set_timesteps(self.job_config.action_num_inference_steps)
+        timesteps = F.pad(self.scheduler.timesteps, (0, 1), mode='constant', value=0)
+        action_timesteps = F.pad(self.action_scheduler.timesteps, (0, 1), mode='constant', value=0)
+
+        if self.job_config.video_exec_step != -1:
+            timesteps = timesteps[:self.job_config.video_exec_step]
+
+        for i, t in enumerate(tqdm(timesteps)):
+            last_step = i == len(timesteps) - 1
+            latent_cond = init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
+            sigma_time = float(self.scheduler.sigmas[i].item()) if i < len(self.scheduler.sigmas) else 0.0
+
+            if not last_step or self.job_config.video_exec_step != -1:
+                latents = self._guided_video_step(latents, t, sigma_time, frame_st_id, latent_cond)
+
+            with torch.no_grad():
+                self._predict_video_noise(
+                    latents,
+                    t,
+                    frame_st_id,
+                    latent_cond,
+                    update_cache=1 if last_step else 0,
+                )
+                if frame_st_id == 0:
+                    latents[:, :, 0:1] = latent_cond
+
+        with torch.no_grad():
+            for i, t in enumerate(tqdm(action_timesteps)):
+                last_step = i == len(action_timesteps) - 1
+                action_cond = (
+                    torch.zeros(
+                        [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    if frame_st_id == 0
+                    else None
+                )
+
+                if not last_step:
+                    sigma_time = float(self.action_scheduler.sigmas[i].item()) if i < len(self.action_scheduler.sigmas) else 0.0
+                    actions = self._guided_action_step(
+                        actions,
+                        t,
+                        sigma_time,
+                        frame_st_id,
+                        action_cond,
+                    )
+
+                self._predict_action_noise(
+                    actions,
+                    t,
+                    frame_st_id,
+                    action_cond,
+                    update_cache=1 if last_step else 0,
+                )
+
+                if frame_st_id == 0:
+                    actions[:, :, 0:1] = action_cond
+
+        actions[:, ~self.action_mask] *= 0
+        self.last_generated_action_chunk = actions.detach().clone()
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
@@ -584,7 +893,19 @@ class VA_Server:
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
         # 2. 将latent输入加入反馈队列
-        self.left_over.append_state_latent(latent_model_input)
+        if latent_model_input is None:
+            return
+        if self.left_over is None:
+            self.left_over = FBFM.prepare_prev_chunk_left_over(
+                inference_delay=self.fbfm_inference_delay,
+                execution_horizon=self.rtc_processor.rtc_config.execution_horizon,
+            )
+        self.left_over.append_state_latent(self._flatten_video_latents_for_guidance(latent_model_input))
+        logger.info(
+            "FBFM feedback action_shape=%s state_shape=%s",
+            tuple(self.left_over.action.shape) if self.left_over.action is not None else None,
+            tuple(self.left_over.state.shape) if self.left_over.state is not None else None,
+        )
         # 3. 维护掩码W(RTCPrevChunk自动实现)
 
     def _compute_kv_cache(self, obs):
@@ -597,14 +918,17 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
+        prev_action = obs.get('prev_action', obs.get('state'))
+        action_model_input = self.preprocess_action(prev_action)
         action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
-        input_dict = self._prepare_latent_input(latent_model_input,
-                                                action_model_input,
-                                                frame_st_id=self.frame_st_id)
+        input_dict = self._prepare_latent_input(
+            latent_model_input=latent_model_input,
+            action_model_input=action_model_input,
+            frame_st_id=self.frame_st_id,
+        )
 
         with (
                 torch.no_grad(),
@@ -643,13 +967,19 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            if action is not None:
+            if self.fbfm_enabled:
+                action, _ = self._infer_guided(obs, frame_st_id=self.frame_st_id)
                 self.left_over = FBFM.prepare_prev_chunk_left_over(
-                    observed_state_latents = action,
-                    inference_delay = 4,            # TODO:推理延迟
-                    execution_horizon = 4,          # TODO:执行时间
-                    state_execution_horizon = 4,    # TODO:状态执行时间
+                    action_left_over=self._flatten_action_chunk_for_guidance(self.last_generated_action_chunk),
+                    inference_delay=self.fbfm_inference_delay,
+                    execution_horizon=self.rtc_processor.rtc_config.execution_horizon,
                 )
+                logger.info(
+                    "FBFM prepared next leftover action_shape=%s state_shape=%s",
+                    tuple(self.left_over.action.shape) if self.left_over.action is not None else None,
+                    tuple(self.left_over.state.shape) if self.left_over.state is not None else None,
+                )
+                return dict(action=action)
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
@@ -681,8 +1011,23 @@ class VA_Server:
         init_obs = self.load_init_obs()
         pred_latent_lst = []
         pred_action_lst = []
+        infer_fn = self._infer_guided if self.fbfm_enabled else self._infer
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents = infer_fn(
+                init_obs,
+                frame_st_id=(chunk_id * self.job_config.frame_chunk_size),
+            )
+            if self.fbfm_enabled:
+                self.left_over = FBFM.prepare_prev_chunk_left_over(
+                    action_left_over=self._flatten_action_chunk_for_guidance(self.last_generated_action_chunk),
+                    inference_delay=self.fbfm_inference_delay,
+                    execution_horizon=self.rtc_processor.rtc_config.execution_horizon,
+                )
+                logger.info(
+                    "FBFM generate leftover action_shape=%s state_shape=%s",
+                    tuple(self.left_over.action.shape) if self.left_over.action is not None else None,
+                    tuple(self.left_over.state.shape) if self.left_over.state is not None else None,
+                )
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)
