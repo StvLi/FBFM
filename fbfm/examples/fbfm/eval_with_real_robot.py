@@ -76,6 +76,8 @@ from threading import Event, Lock, Thread
 import torch
 from torch import Tensor
 
+from fbfm.policies.fbfm.fbfm_policy import FBFMPolicy
+from fbfm.policies.fbfm.modeling_fbfm_rtc import RTCPrevChunk, prepare_prev_chunk_left_over
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
@@ -102,6 +104,17 @@ from lerobot.robots.utils import make_robot_from_config
 from lerobot.utils.constants import OBS_IMAGES
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.utils import init_logging
+
+
+class VAEEncoder:
+    """Simple VAE encoder wrapper providing an encode(obs) method."""
+
+    def __init__(self, checkpoint_path: str, device: str):
+        self.checkpoint_path = checkpoint_path
+        self.device = device
+
+    def encode(self, obs):
+        raise NotImplementedError("Please implement VAE encoding logic for observations.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -455,28 +468,30 @@ def demo_cli(cfg: RTCDemoConfig):
     if cfg.policy.type == "pi05" or cfg.policy.type == "pi0":
         config.compile_model = cfg.use_torch_compile
 
-    if config.use_peft:
-        from peft import PeftConfig, PeftModel
+    # 加载基础模型
+    base_model = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
+    base_model = base_model.to(cfg.device)
+    base_model.eval()
 
-        peft_pretrained_path = cfg.policy.pretrained_path
-        peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
+    # 创建 VAE 编码器实例（需根据你的模型实现）
+    # 假设 VAEEncoder 接受 checkpoint 路径和设备，返回 latent 均值
+    vae_encoder = VAEEncoder(checkpoint_path=cfg.policy.pretrained_path, device=cfg.device)
 
-        policy = policy_class.from_pretrained(
-            pretrained_name_or_path=peft_config.base_model_name_or_path, config=config
-        )
-        policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
-    else:
-        policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
+    # 从配置获取 chunk 参数
+    H = cfg.rtc.chunk_size
+    action_dim = cfg.rtc.chunk_action_dim
+    initial_action_chunk = torch.zeros(H, action_dim, device=cfg.device)  # 或随机初始化
 
-    # Turn on RTC
-    policy.config.rtc_config = cfg.rtc
-
-    # Init RTC processort, as by default if RTC disabled in the config
-    # The processor won't be created
-    policy.init_rtc_processor()
-
-    assert policy.name in ["smolvla", "pi05", "pi0"], "Only smolvla, pi05, and pi0 are supported for RTC"
-
+    # 创建 FBFMPolicy 实例
+    policy = FBFMPolicy(
+        config=cfg.rtc,
+        model=base_model,
+        vae_encoder=vae_encoder,
+        initial_action_chunk=initial_action_chunk,
+        s_chunk=cfg.rtc.s_chunk,
+        delay_buffer_size=5,
+        initial_delay=1,
+    )
     policy = policy.to(cfg.device)
     policy.eval()
 
@@ -494,58 +509,32 @@ def demo_cli(cfg: RTCDemoConfig):
     robot_observation_processor = make_default_robot_observation_processor()
     robot_action_processor = make_default_robot_action_processor()
 
-    # Create action queue for communication between threads
-    action_queue = ActionQueue(cfg.rtc)
-
-    # Start chunk requester thread
-    get_actions_thread = Thread(
-        target=get_actions,
-        args=(policy, robot_wrapper, robot_observation_processor, action_queue, shutdown_event, cfg),
-        daemon=True,
-        name="GetActions",
-    )
-    get_actions_thread.start()
-    logger.info("Started get actions thread")
-
-    # Start action executor thread
-    actor_thread = Thread(
-        target=actor_control,
-        args=(robot_wrapper, robot_action_processor, action_queue, shutdown_event, cfg),
-        daemon=True,
-        name="Actor",
-    )
-    actor_thread.start()
-    logger.info("Started actor thread")
-
-    logger.info("Started stop by duration thread")
-
-    # Main thread monitors for duration or shutdown
-    logger.info(f"Running demo for {cfg.duration} seconds...")
+    logger.info(f"Running demo for {cfg.duration} seconds with VA State Feedback...")
     start_time = time.time()
+    step = 0
+    action_interval = 1.0 / cfg.fps
 
     while not shutdown_event.is_set() and (time.time() - start_time) < cfg.duration:
-        time.sleep(10)
+        loop_start = time.perf_counter()
 
-        # Log queue status periodically
-        if int(time.time() - start_time) % 5 == 0:
-            logger.info(f"[MAIN] Action queue size: {action_queue.qsize()}")
+        obs = robot_wrapper.get_observation()
+        action = policy.get_action(obs)
 
-        if time.time() - start_time > cfg.duration:
-            break
+        action_dict = {key: action[i].item() for i, key in enumerate(robot.action_features())}
+        action_processed = robot_action_processor((action_dict, None))
+        robot_wrapper.send_action(action_processed)
 
-    logger.info("Demo duration reached or shutdown requested")
+        step += 1
 
-    # Signal shutdown
-    shutdown_event.set()
+        elapsed = time.perf_counter() - loop_start
+        sleep_time = max(0, action_interval - elapsed - 0.001)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
-    # Wait for threads to finish
-    if get_actions_thread and get_actions_thread.is_alive():
-        logger.info("Waiting for chunk requester thread to finish...")
-        get_actions_thread.join()
+    logger.info("Demo finished, cleaning up...")
 
-    if actor_thread and actor_thread.is_alive():
-        logger.info("Waiting for action executor thread to finish...")
-        actor_thread.join()
+    policy.reset()
+    policy.close()
 
     # Cleanup robot
     if robot:

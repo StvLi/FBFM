@@ -37,6 +37,8 @@ from utils import (
     save_async,
 )
 
+# FBFM
+import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 
 class VA_Server:
 
@@ -513,6 +515,7 @@ class VA_Server:
                     cache_name=self.cache_name,
                     action_mode=False)
 
+                # TODO: 在以下流匹配的过程中加入FBFM核心逻辑
                 if not last_step or video_step != -1:
                     video_noise_pred = data_seq_to_patch(
                         self.job_config.patch_size, video_noise_pred,
@@ -577,6 +580,13 @@ class VA_Server:
         torch.cuda.empty_cache()
         return actions, latents
 
+    def _feedback(self, obs):
+        # 1. 将obs转换成latent
+        latent_model_input = self._encode_obs(obs)
+        # 2. 将latent输入加入反馈队列
+        self.left_over.append_state_latent(latent_model_input)
+        # 3. 维护掩码W(RTCPrevChunk自动实现)
+
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
@@ -616,18 +626,30 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        feedback = obs.get('feedback', False)    # 状态反馈标志
 
         if reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
             return dict()
+        elif feedback:
+            # FBFM 处理中间帧逻辑
+            logger.info(f"################# Feedback #################")
+            self._feedback(obs=obs)
+            return dict()
         elif compute_kv_cache:
-            logger.info(
-                f"################# Compute KV Cache #################")
+            logger.info(f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            if action is not None:
+                self.left_over = FBFM.prepare_prev_chunk_left_over(
+                    observed_state_latents = action,
+                    inference_delay = 4,            # TODO:推理延迟
+                    execution_horizon = 4,          # TODO:执行时间
+                    state_execution_horizon = 4,    # TODO:状态执行时间
+                )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
