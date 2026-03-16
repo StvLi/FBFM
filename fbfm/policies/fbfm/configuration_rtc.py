@@ -45,7 +45,7 @@ class RTCConfig:
 
     # State feedback (state = VAE-encoded image latent, not joint angles)
     state_feedback_enabled: bool = False
-    state_execution_horizon: int = 10
+    state_observed_horizon: int = 10
     state_max_guidance_weight: float = 10.0
     """Fixed state dimension per timestep in the chunk (not tied to VAE latent dim). Required when state_feedback_enabled."""
     chunk_state_dim: int | None = None

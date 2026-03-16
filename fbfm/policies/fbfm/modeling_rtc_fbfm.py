@@ -66,7 +66,7 @@ class RTCPrevChunk:
     execution_horizon: int | None = None
     """Optional horizon for action prefix weights (falls back to config if None)."""
 
-    state_execution_horizon: int | None = None
+    state_observed_horizon: int | None = None
     """Optional horizon for state prefix weights (falls back to execution_horizon if None)."""
 
     def append_state_latent(self, new_latent: Tensor) -> None:
@@ -116,6 +116,7 @@ class RTCPrevChunk:
             )
 
         self.state = torch.cat([self.state, new_latent], dim=0)
+        self.state_observed_horizon = self.state_observed_horizon + 1 # 维护接收到的状态的长度
 
 def prepare_prev_chunk_left_over(
     action_left_over: Tensor | None = None,
@@ -123,7 +124,7 @@ def prepare_prev_chunk_left_over(
     *,
     inference_delay: int = 0,
     execution_horizon: int | None = None,
-    state_execution_horizon: int | None = None,
+    state_observed_horizon: int | None = None,
 ) -> RTCPrevChunk | None:
     """Helper to build an ``RTCPrevChunk`` instance for extended RTC.
 
@@ -143,7 +144,7 @@ def prepare_prev_chunk_left_over(
         inference_delay: Number of timesteps of inference delay associated with
             this leftover. This will be stored in the resulting ``RTCPrevChunk``.
         execution_horizon: Optional action horizon override for this leftover.
-        state_execution_horizon: Optional state horizon override. If ``None``,
+        state_observed_horizon: Optional state horizon override. If ``None``,
             the extended RTC logic may fall back to ``execution_horizon`` or the
             config default.
 
@@ -161,7 +162,7 @@ def prepare_prev_chunk_left_over(
         state=None,
         inference_delay=inference_delay,
         execution_horizon=execution_horizon,
-        state_execution_horizon=state_execution_horizon,
+        state_observed_horizon=state_observed_horizon,
     )
 
     # If a pre-collected sequence of state latents is already available, we
@@ -430,9 +431,9 @@ class RTCProcessor:
             # W is (1, T, D): W[t, 0:state_dim]=1 for t in "当前已有状态" else 0;
             # W[t, state_dim:]=1 for t in "上个chunk遗留动作" else 0.
             state_exec_horizon = (
-                prev_chunk_left_over.state_execution_horizon
-                if prev_chunk_left_over.state_execution_horizon is not None
-                else self.rtc_config.state_execution_horizon    # weired but OK
+                prev_chunk_left_over.state_observed_horizon
+                if prev_chunk_left_over.state_observed_horizon is not None
+                else self.rtc_config.state_observed_horizon    # weired but OK
             )
             t_state_cap = min(t_state, state_exec_horizon, chunk_size)
             weights = torch.zeros(

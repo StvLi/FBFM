@@ -20,7 +20,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `state_feedback_enabled` | bool | 是否启用状态反馈，默认 False。 |
-| `state_execution_horizon` | int | 状态 prefix 的 horizon（参与权重有效长度上限）。 |
+| `state_observed_horizon` | int | 状态 prefix 的 horizon（参与权重有效长度上限）。 |
 | `state_max_guidance_weight` | float | 状态段 correction 的 guidance 上界。 |
 | `chunk_state_dim` | int \| None | **每个 chunk 时间步内 state 的固定维度**，启用 state feedback 时必填。 |
 | `chunk_action_dim` | int \| None | **每个 chunk 时间步内 action 的固定维度**，启用 state feedback 时必填；须满足 `chunk_state_dim + chunk_action_dim == x_t.shape[-1]`。 |
@@ -44,7 +44,7 @@
 | `state` | Tensor \| None | 执行上一 chunk 剩余时观测到的 state latent（VAE 编码），**初始为空**，随执行逐步追加。 |
 | `inference_delay` | int | 推理延迟步数。 |
 | `execution_horizon` | int \| None | action 的 horizon 覆盖。 |
-| `state_execution_horizon` | int \| None | state 的 horizon 覆盖。 |
+| `state_observed_horizon` | int \| None | state 的 horizon 覆盖。 |
 
 **方法**
 
@@ -55,7 +55,7 @@
 
 在**执行侧**构造下一次 RTC 所需的 `prev_chunk_left_over`，便于与动作执行对齐。
 
-- **参数**：`action_left_over`、`observed_state_latents`（可选）、`inference_delay`、`execution_horizon`、`state_execution_horizon`。
+- **参数**：`action_left_over`、`observed_state_latents`（可选）、`inference_delay`、`execution_horizon`、`state_observed_horizon`。
 - **行为**：  
   - 用 `action_left_over` 实例化 `RTCPrevChunk`，**state 初始为 None**。  
   - 若调用方已有一段 `observed_state_latents`，则通过 `append_state_latent` 一次性写入，与「执行中逐帧 append」的布局一致。  
@@ -92,7 +92,7 @@
 - **结构**（与示意图一致）：  
   **[当前已有状态数个 1；补全状态维数用 0；上个 chunk 遗留动作数个 1；补全动作维数用 0]**  
   即按 (t, dim) 的 block-diagonal，每步内：  
-  - state 维：`t < t_state_cap` 为 1，否则 0（`t_state_cap` 由已收集的 state 步数与 `state_execution_horizon` 取 min）；  
+  - state 维：`t < t_state_cap` 为 1，否则 0（`t_state_cap` 由已收集的 state 步数与 `state_observed_horizon` 取 min）；  
   - action 维：`t < t_act` 为 1，否则 0。
 - **实现**：  
   `weights` 形状 `(1, T, D)`，  
@@ -128,7 +128,7 @@
 1. 在请求下一 chunk 前，用 `prepare_prev_chunk_left_over(action_left_over=..., observed_state_latents=None, ...)` 得到 `RTCPrevChunk`（此时 `state=None`）。
 2. 在执行上一 chunk 剩余动作的过程中，每得到一帧图像的 VAE 编码，调用 `rtc_prev_chunk.append_state_latent(latent)`。
 3. 将 `rtc_prev_chunk` 作为 `prev_chunk_left_over` 传入策略的 `predict_action_chunk(..., prev_chunk_left_over=rtc_prev_chunk, ...)`；策略内部再传给 `RTCProcessor.denoise_step`。
-4. 配置中设置 `state_feedback_enabled=True`，并正确设置 `chunk_state_dim`、`chunk_action_dim`（及可选 `state_execution_horizon`、`state_max_guidance_weight`）。
+4. 配置中设置 `state_feedback_enabled=True`，并正确设置 `chunk_state_dim`、`chunk_action_dim`（及可选 `state_observed_horizon`、`state_max_guidance_weight`）。
 
 ---
 

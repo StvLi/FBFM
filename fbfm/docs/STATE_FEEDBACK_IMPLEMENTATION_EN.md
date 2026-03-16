@@ -20,7 +20,7 @@ This document describes the **VA State Feedback** extension built on top of the 
 | Field | Type | Description |
 |-------|------|-------------|
 | `state_feedback_enabled` | bool | Enable state feedback. Default: `False`. |
-| `state_execution_horizon` | int | Horizon cap for the state prefix weights. |
+| `state_observed_horizon` | int | Horizon cap for the state prefix weights. |
 | `state_max_guidance_weight` | float | Upper bound on the guidance scale applied to the state segment's correction. |
 | `chunk_state_dim` | int \| None | **Fixed state dimensionality per timestep** inside a chunk (independent of the VAE latent dim). Required when `state_feedback_enabled`. |
 | `chunk_action_dim` | int \| None | **Fixed action dimensionality per timestep** inside a chunk. Required when `state_feedback_enabled`. Must satisfy `chunk_state_dim + chunk_action_dim == x_t.shape[-1]`. |
@@ -44,7 +44,7 @@ A typed container for the previous chunk's leftovers and execution-time observat
 | `state` | Tensor \| None | State latents (VAE-encoded images) observed while executing the previous chunk's remainder. **Starts as `None`**; filled incrementally during execution. |
 | `inference_delay` | int | Number of inference-delay timesteps. |
 | `execution_horizon` | int \| None | Per-instance action horizon override. |
-| `state_execution_horizon` | int \| None | Per-instance state horizon override. |
+| `state_observed_horizon` | int \| None | Per-instance state horizon override. |
 
 **Method**
 
@@ -55,7 +55,7 @@ A typed container for the previous chunk's leftovers and execution-time observat
 
 A helper to construct the `RTCPrevChunk` on the **execution side**, aligned with the ongoing action execution.
 
-- **Arguments**: `action_left_over`, `observed_state_latents` (optional), `inference_delay`, `execution_horizon`, `state_execution_horizon`.
+- **Arguments**: `action_left_over`, `observed_state_latents` (optional), `inference_delay`, `execution_horizon`, `state_observed_horizon`.
 - **Behavior**:
   - Instantiates `RTCPrevChunk` with the given `action_left_over`; **`state` starts as `None`**.
   - If `observed_state_latents` is provided (pre-collected sequence), it is written via `append_state_latent` for consistency with the incremental path.
@@ -96,7 +96,7 @@ A `combined_prefix` of shape `(B, T, D)` is built with state and action segments
 
 Per `(t, dim)`:
 - State dims: `1` if `t < t_state_cap`, else `0`.  
-  `t_state_cap = min(t_state, state_execution_horizon, T)`; grows as `append_state_latent` is called.
+  `t_state_cap = min(t_state, state_observed_horizon, T)`; grows as `append_state_latent` is called.
 - Action dims: `1` if `t < t_act`, else `0`.
 
 **Implementation** — `weights` shape `(1, T, D)`:
@@ -141,7 +141,7 @@ State and action errors are merged in one `err` tensor; a **single** `autograd.g
 3. Pass `rtc_prev_chunk` to the policy:  
    `policy.predict_action_chunk(..., prev_chunk_left_over=rtc_prev_chunk, ...)`.  
    The policy forwards it to `RTCProcessor.denoise_step` internally.
-4. Set `state_feedback_enabled=True` in `RTCConfig` and configure `chunk_state_dim`, `chunk_action_dim` (plus optional `state_execution_horizon`, `state_max_guidance_weight`).
+4. Set `state_feedback_enabled=True` in `RTCConfig` and configure `chunk_state_dim`, `chunk_action_dim` (plus optional `state_observed_horizon`, `state_max_guidance_weight`).
 
 ---
 

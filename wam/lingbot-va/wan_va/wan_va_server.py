@@ -163,9 +163,6 @@ class VA_Server:
         device=None,
         dtype=None,
     ):
-        r"""
-        TODO
-        """
         device = device or self.device
         dtype = dtype or self.dtype
 
@@ -645,10 +642,10 @@ class VA_Server:
             logger.info(f"################# Infer One Chunk #################")
             if action is not None:
                 self.left_over = FBFM.prepare_prev_chunk_left_over(
-                    observed_state_latents = action,
-                    inference_delay = 4,            # TODO:推理延迟
-                    execution_horizon = 4,          # TODO:执行时间
-                    state_execution_horizon = 4,    # TODO:状态执行时间
+                    action_left_over = action,
+                    inference_delay = 4,            # TODO:推理延迟 应该通过维护延迟队列获得
+                    execution_horizon = 4,          # TODO:hard之后就没啥用的量
+                    state_observed_horizon = 0,     # TODO:观测到的状态
                 )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
@@ -728,9 +725,6 @@ def run(args):
         raise ValueError(f"Unknown infer mode: {config.infer_mode}")
 
 def main():
-    """
-    TODO
-    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config-name",
