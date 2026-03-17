@@ -40,6 +40,49 @@ from utils import (
 # FBFM
 import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 
+class WrapperedFlowMatchScheduler(FlowMatchScheduler):
+    def step(self,
+             
+             model_output, 
+             timestep, 
+             sample, 
+             to_final=False, 
+             constrain:FBFM.PrevChunk = None, 
+             device = None, 
+             **kwargs
+             ):
+        if constrain is not None and device is not None:
+            constrained_states = constrain.get_constrained_states()
+            state_weights = (
+                constrain.get_prefix_weights()
+                .to(device)
+                .unsqueeze(0)
+                .unsqueeze(-1)
+            )
+            constrained_actions = constrain.get_constrained_actions()
+            action_weights = (
+                constrain.get_action_prefix_weights()
+                .to(device)
+                .unsqueeze(0)
+                .unsqueeze(-1)
+            )
+        # TODO:FBFM
+        
+
+        # 原step函数
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.cpu()
+        timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        sigma = self.sigmas[timestep_id]
+        if to_final or timestep_id + 1 >= len(self.timesteps):
+            sigma_ = 1 if (self.inverse_timesteps
+                           or self.reverse_sigmas) else 0
+        else:
+            sigma_ = self.sigmas[timestep_id + 1]
+        prev_sample = sample + model_output * (sigma_ - sigma)
+
+        return prev_sample
+
 class VA_Server:
 
     def __init__(self, job_config):
@@ -50,10 +93,17 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
-        self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
+        # self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
+        #                                     sigma_min=0.0,
+        #                                     extra_one_step=True)
+        self.scheduler = WrapperedFlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
                                             extra_one_step=True)
-        self.action_scheduler = FlowMatchScheduler(
+        # self.action_scheduler = FlowMatchScheduler(
+        #     shift=self.job_config.action_snr_shift,
+        #     sigma_min=0.0,
+        #     extra_one_step=True)
+        self.action_scheduler = WrapperedFlowMatchScheduler(
             shift=self.job_config.action_snr_shift,
             sigma_min=0.0,
             extra_one_step=True)
@@ -513,6 +563,7 @@ class VA_Server:
                     action_mode=False)
 
                 # TODO: 在以下流匹配的过程中加入FBFM核心逻辑
+                # 需要单独起Thread
                 if not last_step or video_step != -1:
                     video_noise_pred = data_seq_to_patch(
                         self.job_config.patch_size, video_noise_pred,
@@ -522,6 +573,8 @@ class VA_Server:
                         video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
                     else:
                         video_noise_pred = video_noise_pred[:1]
+
+                    # TODO: 继承FlowMatchScheduler 构建一个step_with_constrain方法
                     latents = self.scheduler.step(video_noise_pred,
                                                   t,
                                                   latents,
@@ -561,6 +614,7 @@ class VA_Server:
                         action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
                     else:
                         action_noise_pred = action_noise_pred[:1]
+                    # TODO: 继承FlowMatchScheduler 构建一个step_with_constrain方法
                     actions = self.action_scheduler.step(action_noise_pred,
                                                          t,
                                                          actions,
@@ -580,9 +634,8 @@ class VA_Server:
     def _feedback(self, obs):
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
-        # 2. TODO:将latent输入加入反馈队列
-
-        # 3. TODO:获取自动维护权重
+        # 2. 将latent输入加入反馈队列（权重自主维护）
+        self.prev_chunk_left_over.append_new_state(latent_model_input)
         
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
@@ -640,7 +693,17 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            # TODO: 在此初始化leftover
+            self.prev_chunk_left_over = FBFM.PrevChunk(
+                # TODO: 初始化参数配置
+                constrain_mode = "Feedback",
+                # actions = ,                   # 来自上个chunk
+                # action_constrained_num = ,    # 来自config
+                # action_num = ,                # 来自config
+                # action_dim = ,                # 来自config
+                # state_num = ,                 # 来自config
+                # state_dim = ,                 # 来自config
+                # inference_delay = ,           # 来自延迟实测
+            )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
