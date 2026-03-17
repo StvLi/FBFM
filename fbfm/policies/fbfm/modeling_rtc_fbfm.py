@@ -129,8 +129,11 @@ class PrevChunk:
 
         This is intended to be used as a guide for the next chunk generation.
         """
-        state_prefix_weights = torch.zeros(self.state_num)
-        state_prefix_weights[:(self.state_constrained_num)] = 1
+        if self.constrain_mode == "Feedback":
+            state_prefix_weights = torch.zeros(self.state_num)
+            state_prefix_weights[:(self.state_constrained_num)] = 1
+        elif self.constrain_mode == "RTC":
+            state_prefix_weights = torch.zeros(self.state_num)
         return state_prefix_weights
 
     def get_prefix_weights(self) -> Tensor:
