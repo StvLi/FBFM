@@ -580,10 +580,10 @@ class VA_Server:
     def _feedback(self, obs):
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
-        # 2. 将latent输入加入反馈队列
-        self.left_over.append_state_latent(latent_model_input)
-        # 3. 维护掩码W(RTCPrevChunk自动实现)
+        # 2. TODO:将latent输入加入反馈队列
 
+        # 3. TODO:获取自动维护权重
+        
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
@@ -640,13 +640,7 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            if action is not None:
-                self.left_over = FBFM.prepare_prev_chunk_left_over(
-                    action_left_over = action,
-                    inference_delay = 4,            # TODO:推理延迟 应该通过维护延迟队列获得
-                    execution_horizon = 4,          # TODO:hard之后就没啥用的量
-                    state_observed_horizon = 0,     # TODO:观测到的状态
-                )
+            # TODO: 在此初始化leftover
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
