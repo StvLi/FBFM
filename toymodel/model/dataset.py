@@ -4,15 +4,19 @@ model/dataset.py — Flow Matching Dataset
 Loads expert_dataset.npz and prepares (X0, X1, obs) triples for FM training.
 
 Flow Matching training setup:
-    - X1: (H, action_dim) = (16, 1)  — clean action chunk (target)
-    - X0: (H, action_dim) = (16, 1)  — noise sample ~ N(0, I)
-    - obs: (obs_dim,)     = (2,)      — conditioning observation (first state of chunk)
+    - X1: (H, token_dim) = (16, 3)  — clean token chunk (target)
+    - X0: (H, token_dim) = (16, 3)  — noise sample ~ N(0, I)
+    - obs: (obs_dim,)    = (2,)     — conditioning observation (first state of chunk)
     - X_tau = tau * X1 + (1 - tau) * X0   — linear interpolation
     - target velocity: v_target = X1 - X0
 
+Token format:
+    Token[h] = [state_{h+1}, action_h] = [x_{h+1}, x_dot_{h+1}, u_h]
+    Constructed as: cat(states[:, 1:H+1, :], actions, dim=-1) → (N, H, 3)
+
 Normalization:
-    Actions are normalized to zero mean, unit std across the training set.
-    Stats are saved alongside the dataset for use at inference time.
+    Per-dimension stats: mean and std are (token_dim,) = (3,) vectors.
+    Each dimension (x, x_dot, u) normalized independently to zero-mean unit-std.
 """
 
 import numpy as np
@@ -25,16 +29,16 @@ class FlowMatchingDataset(Dataset):
     PyTorch Dataset wrapping the PID expert dataset.
 
     Each item returns:
-        X1:  (H, action_dim)  — clean action chunk, normalized
-        obs: (obs_dim,)       — conditioning state (first state of chunk)
+        X1:  (H, token_dim)  — clean token chunk, normalized
+        obs: (obs_dim,)      — conditioning state (first state of chunk)
 
     X0 (noise) and tau are sampled fresh each call in the training loop,
     not stored here, to avoid overfitting to fixed noise.
 
     Shapes:
-        H          = 16   (prediction horizon)
-        action_dim = 1
-        obs_dim    = 2    ([x, x_dot])
+        H         = 16   (prediction horizon)
+        token_dim = 3    ([x, x_dot, u])
+        obs_dim   = 2    ([x, x_dot])
     """
 
     def __init__(
@@ -46,35 +50,51 @@ class FlowMatchingDataset(Dataset):
         """
         Args:
             npz_path:  path to expert_dataset.npz
-            normalize: whether to normalize actions to N(0,1)
-            stats:     pre-computed {'mean': ..., 'std': ...} — if None, computed from data
+            normalize: whether to normalize tokens per-dim to N(0,1)
+            stats:     pre-computed {'mean': np.array(3,), 'std': np.array(3,)}
+                       — if None, computed from data
         """
         data = np.load(npz_path)
 
         # states:  (N, H+1, 2)
         # actions: (N, H, 1)
-        # refs:    (N, H, 1)
-        self.states  = torch.from_numpy(data["states"]).float()   # (N, H+1, 2)
-        self.actions = torch.from_numpy(data["actions"]).float()  # (N, H, 1)
+        states  = torch.from_numpy(data["states"]).float()   # (N, H+1, 2)
+        actions = torch.from_numpy(data["actions"]).float()   # (N, H, 1)
 
-        self.N, self.H, self.action_dim = self.actions.shape
-        self.obs_dim = self.states.shape[-1]  # 2
+        N, H_plus1, state_dim = states.shape
+        H = H_plus1 - 1
+        self.N   = N
+        self.H   = H
 
-        # Normalization stats (computed over all actions in dataset)
+        # Token[h] = [state_{h+1}, action_h] → cat along last dim
+        # states[:, 1:H+1, :]: (N, H, 2) — state AFTER executing action h
+        # actions:              (N, H, 1)
+        self.tokens = torch.cat([states[:, 1:H+1, :], actions], dim=-1)  # (N, H, 3)
+        self.token_dim = self.tokens.shape[-1]  # 3
+
+        # obs = initial state of the chunk (before any action)
+        self.obs = states[:, 0, :]  # (N, 2)
+        self.obs_dim = self.obs.shape[-1]  # 2
+
+        # Per-dimension normalization stats
         if normalize:
             if stats is None:
-                # actions: (N, H, 1) → flatten to (N*H,) for stats
-                flat = self.actions.reshape(-1)
+                flat = self.tokens.reshape(-1, self.token_dim)  # (N*H, 3)
                 self.stats = {
-                    "mean": flat.mean().item(),
-                    "std":  flat.std().item() + 1e-8,
+                    "mean": flat.mean(dim=0).numpy(),            # (3,)
+                    "std":  (flat.std(dim=0) + 1e-8).numpy(),    # (3,)
                 }
             else:
                 self.stats = stats
 
-            self.actions = (self.actions - self.stats["mean"]) / self.stats["std"]
+            mean_t = torch.from_numpy(self.stats["mean"]).float()  # (3,)
+            std_t  = torch.from_numpy(self.stats["std"]).float()   # (3,)
+            self.tokens = (self.tokens - mean_t) / std_t
         else:
-            self.stats = {"mean": 0.0, "std": 1.0}
+            self.stats = {
+                "mean": np.zeros(self.token_dim, dtype=np.float32),
+                "std":  np.ones(self.token_dim, dtype=np.float32),
+            }
 
     def __len__(self) -> int:
         return self.N
@@ -82,17 +102,13 @@ class FlowMatchingDataset(Dataset):
     def __getitem__(self, idx: int):
         """
         Returns:
-            X1:  (H, action_dim) — clean action chunk (normalized)
-            obs: (obs_dim,)      — first state of chunk as conditioning
+            X1:  (H, token_dim) — clean token chunk (normalized)
+            obs: (obs_dim,)     — first state of chunk as conditioning
         """
-        # X1: (H, action_dim) = (16, 1)
-        X1 = self.actions[idx]
-
-        # obs: (obs_dim,) = (2,) — use the first state of the chunk
-        obs = self.states[idx, 0]  # (2,)
-
-        return X1, obs
+        return self.tokens[idx], self.obs[idx]
 
     def denormalize(self, X: torch.Tensor) -> torch.Tensor:
-        """Undo normalization. X: (..., action_dim) → original scale."""
-        return X * self.stats["std"] + self.stats["mean"]
+        """Undo normalization. X: (..., token_dim) → original scale."""
+        mean = torch.tensor(self.stats["mean"], dtype=X.dtype, device=X.device)
+        std  = torch.tensor(self.stats["std"],  dtype=X.dtype, device=X.device)
+        return X * std + mean

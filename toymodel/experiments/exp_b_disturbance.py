@@ -16,7 +16,8 @@ import os
 import json
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+TOYMODEL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, TOYMODEL_ROOT)
 
 from experiments.runner import load_policy, run_three_algos, make_test_refs
 
@@ -40,14 +41,18 @@ def make_disturbance_fn(f_impulse: float, impulse_at: int, s_chunk: int):
 
 
 def run_exp_b(
-    ckpt_path: str = "checkpoints/fm_best.pt",
+    ckpt_path: str = None,
     device: str = "cpu",
-    save_dir: str = "results/exp_b_disturbance",
+    save_dir: str = None,
     seed: int = 42,
 ):
+    if ckpt_path is None:
+        ckpt_path = os.path.join(TOYMODEL_ROOT, "checkpoints", "fm_best.pt")
+    if save_dir is None:
+        save_dir = os.path.join(TOYMODEL_ROOT, "results", "exp_b_disturbance")
     os.makedirs(save_dir, exist_ok=True)
 
-    policy, action_stats, _ = load_policy(ckpt_path, device)
+    policy, token_stats, _ = load_policy(ckpt_path, device)
     refs = make_test_refs(T=T_TEST, dt=DT)
 
     disturbance_fn = make_disturbance_fn(F_IMPULSE, IMPULSE_AT, S_CHUNK)
@@ -68,7 +73,7 @@ def run_exp_b(
             print(f"  Condition: {cond_name}")
 
             results = run_three_algos(
-                policy, action_stats, env_cfg, ref_seq,
+                policy, token_stats, env_cfg, ref_seq,
                 disturbance_fn=disturbance_fn,
                 seed=seed, device=device,
             )

@@ -89,12 +89,87 @@
 
 ---
 
+## Module 6 — token_dim=3 统一架构重构（当前进行中）
+
+> **背景**: 用户确认 FBFM 的 X^τ = [state, action]，所有算法共享 token_dim=3 的模型。
+> 已完成全部设计决策确认（D/E/F/G/H），计划已创建，**代码修改尚未开始**。
+
+### 6.0 已确认的设计决策
+
+| 代号 | 决策 | 细节 |
+|------|------|------|
+| D | 归一化 | per-dim 向量: `mean: (3,), std: (3,)`, 分维度独立统计 |
+| E | dim_mask | FM: 无引导; RTC: `[0,0,1]` 只引导 action; FBFM: `[1,1,1]` 全维度引导 |
+| F | Y 固定 | Y 在 FBFM 推理过程中不变，只有 obs 随 feedback 更新 |
+| G | Token 构造 | `Token[h] = [state_{h+1}, action_h]` = state 是执行 action 后的结果 + 该 action |
+| | | `tokens = cat(states[:, 1:H+1, :], actions, dim=-1)` → `(N, H, 3)` |
+| | | obs = states[:, 0, :] → `(N, 2)` 不变 |
+| H | n_steps | FM 和 RTC 的去噪步数也从 16 → 20 |
+
+### 6.1 文件修改清单（按依赖顺序执行）
+
+| # | Task | File | Status | Notes |
+|---|------|------|--------|-------|
+| 6.1 | `action_dim` → `token_dim=3`, 更新 proj 层和 docstring | `model/dit.py` | ✅ | |
+| 6.2 | Token 构造 `cat(states[:,1:H+1,:], actions)`, per-dim 归一化 | `model/dataset.py` | ✅ | |
+| 6.3 | CFG `token_dim=3`, checkpoint 存 `token_stats` | `train/train_fm.py` | ✅ | |
+| 6.4 | `sample_fm` 适配 token_dim + 向量 denorm + n_steps=20 | `model/inference.py` | ✅ | |
+| 6.5 | chunk `(H,3)`, 提取 `action=col2`, n_steps=20, token_stats | `algo/fm.py` | ✅ | |
+| 6.6 | token_dim=3, `dim_mask=[0,0,1]`, n_steps=20, token_stats | `algo/rtc.py` | ✅ | |
+| 6.7 | **实现 `guided_inference_fbfm`** (5 blocks × 4, interleaved) + 重写 `rollout_fbfm` | `algo/fbfm.py` | ✅ | |
+| 6.8 | `load_policy` + `run_three_algos` 适配 token_dim/token_stats/n_steps=20 | `experiments/runner.py` | ✅ | |
+| 6.9 | `action_stats` → `token_stats` 变量名 | `exp_a/b/c/d.py` | ✅ | |
+| 6.10 | 更新 CLAUDE.md 规范文档 | `CLAUDE.md` | ✅ | |
+
+### 6.2 FBFM 推理节奏详述（n_steps=20, n_inner=4, d=4, s_chunk=5）
+
+```
+rollout_fbfm 每个大周期:
+  ① Build Y from chunk[chunk_ptr:] → (H, 3), right-padded
+  ② Trigger: execute Y[0].action(=col2) → capture obs
+
+  ③ guided_inference_fbfm(obs, Y, W, env_feedback_fn):
+     Block 0 (τ steps 0-3):  guidance with Y + obs
+       → env_feedback_fn() → execute Y[1].action → update obs
+     Block 1 (τ steps 4-7):  guidance with Y + updated obs
+       → env_feedback_fn() → execute Y[2].action → update obs
+     Block 2 (τ steps 8-11): guidance with Y + updated obs
+       → env_feedback_fn() → execute Y[3].action → update obs
+     Block 3 (τ steps 12-15): guidance with Y + updated obs
+       → env_feedback_fn() → execute Y[4].action → update obs
+     Block 4 (τ steps 16-19): final output, NO feedback after
+
+  ④ New chunk → chunk_ptr = d = 4 (skip first 4 tokens)
+
+  Total: 1(trigger) + 4(feedback) = 5 = s_chunk
+  Total denoising: 5 blocks × 4 = 20 steps
+```
+
+### 6.3 Token 格式约定
+
+```
+Token[h] = [x_{h+1}, x_dot_{h+1}, u_h]
+            ^^^^^^^^^^^^^^^^^^^^^^^^  ^^
+            state AFTER executing     action at
+            action_h                  step h
+
+Index 0: position x
+Index 1: velocity x_dot
+Index 2: action u (force)
+ACTION_IDX = 2
+STATE_SLICE = slice(0, 2)
+```
+
+---
+
 ## Cross-Cutting Tasks
 
 | Task | Status | Notes |
 |------|--------|-------|
 | Write `requirements.txt` | ✅ | See below |
 | Final end-to-end smoke test (collect → train → eval → plot) | ⬜ | Run after GPU training completes |
+| device 默认值改为优先 CUDA | ✅ | 所有 `toymodel/` 下的 device 默认值已改 |
+| 工作范围约束写入 CLAUDE.md | ✅ | 只操作 `toymodel/` 子文件夹 |
 
 ---
 
@@ -106,6 +181,7 @@ Module 2  PID Expert Dataset    ████████████  100%  ✅ 
 Module 3  DiT FM Model          ████████░░░░   80%  🔄  (code done, training pending on GPU)
 Module 4  Algorithm Comparison  ██████████░░   90%  🔄  (harness + experiments done; user implements RTC/FBFM core)
 Module 5  Visualization         ████████████  100%  ✅  (pending results data to render)
+Module 6  token_dim=3 重构     ████████████  100%  ✅  (13 文件全部修改完成)
 ```
 
-_Last updated: 2026-03-17_
+_Last updated: 2026-03-17 — token_dim=3 重构计划已确认, 待执行_

@@ -2,21 +2,21 @@
 model/dit.py — Lightweight DiT (Diffusion Transformer) for Flow Matching
 
 Architecture overview:
-    Input:  X^tau (noisy action chunk) + obs (conditioning state) + tau (noise level)
+    Input:  X^tau (noisy token chunk) + obs (conditioning state) + tau (noise level)
     Output: v (velocity field)  — same shape as X^tau
 
-    X^tau: (B, H, action_dim) = (B, 16, 1)
-    obs:   (B, obs_dim)       = (B, 2)
-    tau:   (B,)               scalar in [0, 1]
+    X^tau: (B, H, token_dim) = (B, 16, 3)  — each token is [x, x_dot, u]
+    obs:   (B, obs_dim)      = (B, 2)
+    tau:   (B,)              scalar in [0, 1]
 
-    v:     (B, H, action_dim) = (B, 16, 1)
+    v:     (B, H, token_dim) = (B, 16, 3)
 
 Design choices (lightweight for MSD toy problem):
-    - Flatten X^tau to (B, H*action_dim) = (B, 16) for simplicity
+    - Each timestep token (token_dim,) projected to (d_model,) as one sequence token
     - Sinusoidal tau embedding → projected to d_model
     - obs linearly projected to d_model
     - N_layers transformer blocks with cross-attention (obs as key/value)
-    - Final linear head → (B, H*action_dim), reshaped to (B, H, action_dim)
+    - Final linear head → (B, H, token_dim)
 
 This is intentionally small (d_model=128, N_layers=4) to train fast on CPU.
 """
@@ -116,38 +116,39 @@ class DiTBlock(nn.Module):
 
 class FlowMatchingDiT(nn.Module):
     """
-    Lightweight DiT policy for Flow Matching on MSD action chunks.
+    Lightweight DiT policy for Flow Matching on MSD token chunks.
+
+    Each token represents [x, x_dot, u] (state after action + action).
 
     Forward pass:
         v = model(X_tau, obs, tau)
 
     Shapes:
-        X_tau: (B, H, action_dim) = (B, 16, 1)  — noisy action chunk
-        obs:   (B, obs_dim)       = (B, 2)       — conditioning state
-        tau:   (B,)               scalar ∈ [0,1] — noise level
+        X_tau: (B, H, token_dim) = (B, 16, 3)  — noisy token chunk
+        obs:   (B, obs_dim)      = (B, 2)       — conditioning state
+        tau:   (B,)              scalar ∈ [0,1]  — noise level
 
-        v:     (B, H, action_dim) = (B, 16, 1)  — predicted velocity field
+        v:     (B, H, token_dim) = (B, 16, 3)  — predicted velocity field
     """
 
     def __init__(
         self,
-        H: int          = 16,
-        action_dim: int = 1,
-        obs_dim: int    = 2,
-        d_model: int    = 128,
-        n_heads: int    = 4,
-        n_layers: int   = 4,
-        ffn_mult: int   = 4,
+        H: int         = 16,
+        token_dim: int = 3,
+        obs_dim: int   = 2,
+        d_model: int   = 128,
+        n_heads: int   = 4,
+        n_layers: int  = 4,
+        ffn_mult: int  = 4,
     ):
         super().__init__()
-        self.H          = H
-        self.action_dim = action_dim
-        self.obs_dim    = obs_dim
-        self.d_model    = d_model
+        self.H         = H
+        self.token_dim = token_dim
+        self.obs_dim   = obs_dim
+        self.d_model   = d_model
 
-        # --- Input projection: each action token (action_dim,) → (d_model,) ---
-        # Treats each timestep in the chunk as one sequence token
-        self.token_proj = nn.Linear(action_dim, d_model)
+        # --- Input projection: each token (token_dim,) → (d_model,) ---
+        self.token_proj = nn.Linear(token_dim, d_model)
 
         # --- Positional embedding for the H tokens ---
         # Learnable, shape: (1, H, d_model)
@@ -171,9 +172,9 @@ class FlowMatchingDiT(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # --- Output head: (B, H, d_model) → (B, H, action_dim) ---
+        # --- Output head: (B, H, d_model) → (B, H, token_dim) ---
         self.out_norm = nn.LayerNorm(d_model)
-        self.out_proj = nn.Linear(d_model, action_dim)
+        self.out_proj = nn.Linear(d_model, token_dim)
 
         # Zero-init output projection (standard for diffusion models)
         nn.init.zeros_(self.out_proj.weight)
@@ -181,21 +182,19 @@ class FlowMatchingDiT(nn.Module):
 
     def forward(
         self,
-        X_tau: torch.Tensor,  # (B, H, action_dim)
+        X_tau: torch.Tensor,  # (B, H, token_dim)
         obs:   torch.Tensor,  # (B, obs_dim)
         tau:   torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """
         Returns:
-            v: (B, H, action_dim) — predicted velocity field
+            v: (B, H, token_dim) — predicted velocity field
         """
         B = X_tau.shape[0]
 
-        # --- Tokenize action chunk ---
         # tokens: (B, H, d_model)
         tokens = self.token_proj(X_tau) + self.pos_emb
 
-        # --- Build context: [tau_emb, obs_emb] stacked as 2 tokens ---
         # tau_emb: (B, d_model)
         tau_emb = self.tau_proj(sinusoidal_embedding(tau, self.d_model))
         # obs_emb: (B, d_model)
@@ -203,12 +202,10 @@ class FlowMatchingDiT(nn.Module):
         # context: (B, 2, d_model)
         context = torch.stack([tau_emb, obs_emb], dim=1)
 
-        # --- DiT blocks ---
         for block in self.blocks:
             tokens = block(tokens, context)
 
-        # --- Output projection ---
-        # v: (B, H, action_dim)
+        # v: (B, H, token_dim)
         v = self.out_proj(self.out_norm(tokens))
         return v
 

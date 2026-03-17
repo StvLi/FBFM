@@ -16,7 +16,8 @@ import os
 import json
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+TOYMODEL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, TOYMODEL_ROOT)
 
 from experiments.runner import load_policy, run_three_algos, make_test_refs
 
@@ -32,14 +33,19 @@ TEST_CONDITIONS = {
 
 
 def run_exp_c(
-    ckpt_path: str = "checkpoints/fm_best.pt",
+    ckpt_path: str = None,
     device: str = "cpu",
-    save_dir: str = "results/exp_c_ablation",
+    save_dir: str = None,
     seed: int = 42,
 ):
+    if ckpt_path is None:
+        ckpt_path = os.path.join(TOYMODEL_ROOT, "checkpoints", "fm_best.pt")
+    if save_dir is None:
+        save_dir = os.path.join(TOYMODEL_ROOT, "results", "exp_c_ablation")
+    os.makedirs(save_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
 
-    policy, action_stats, _ = load_policy(ckpt_path, device)
+    policy, token_stats, _ = load_policy(ckpt_path, device)
     refs = make_test_refs(T=T_TEST, dt=DT)
 
     all_metrics = {}
@@ -53,14 +59,14 @@ def run_exp_c(
 
             # Full FBFM (beta=10)
             results_full = run_three_algos(
-                policy, action_stats, env_cfg, ref_seq,
+                policy, token_stats, env_cfg, ref_seq,
                 algo_cfg={"beta": 10.0},
                 seed=seed, device=device,
             )
 
             # Ablated FBFM (beta=0 → k_p=0, no feedback)
             results_ablated = run_three_algos(
-                policy, action_stats, env_cfg, ref_seq,
+                policy, token_stats, env_cfg, ref_seq,
                 algo_cfg={"beta": 0.0},
                 seed=seed, device=device,
             )

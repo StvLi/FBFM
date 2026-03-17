@@ -9,6 +9,7 @@ Usage:
 import sys
 import os
 import argparse
+import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -17,11 +18,13 @@ from experiments.exp_b_disturbance import run_exp_b
 from experiments.exp_c_ablation    import run_exp_c
 from experiments.exp_d_sensitivity import run_exp_d
 
+_DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt",   default="checkpoints/fm_best.pt")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default=_DEFAULT_DEVICE)
     parser.add_argument("--seed",   type=int, default=42)
     args = parser.parse_args()
 

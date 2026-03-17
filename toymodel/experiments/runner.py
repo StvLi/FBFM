@@ -9,7 +9,7 @@ Usage:
 
 Shapes:
     obs:      (obs_dim,)       = (2,)
-    chunk:    (H, action_dim)  = (16, 1)
+    chunk:    (H, token_dim)   = (16, 3)  — each token [x, x_dot, u]
     result:   dict with xs_true / xs_obs / actions / times / ref_seq  — all (T,)
 """
 
@@ -18,7 +18,8 @@ import os
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+TOYMODEL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, TOYMODEL_ROOT)
 
 from model.dit import FlowMatchingDiT
 from sim.msd_env import MSDEnv
@@ -39,27 +40,27 @@ def load_policy(
     Load trained FlowMatchingDiT from checkpoint.
 
     Returns:
-        policy:       FlowMatchingDiT (eval mode)
-        action_stats: {'mean': float, 'std': float}
-        cfg:          training config dict
+        policy:      FlowMatchingDiT (eval mode)
+        token_stats: {'mean': np.array(3,), 'std': np.array(3,)}
+        cfg:         training config dict
     """
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg  = ckpt.get("cfg", {})
 
     policy = FlowMatchingDiT(
-        H          = cfg.get("H",          16),
-        action_dim = cfg.get("action_dim",  1),
-        obs_dim    = cfg.get("obs_dim",     2),
-        d_model    = cfg.get("d_model",   128),
-        n_heads    = cfg.get("n_heads",     4),
-        n_layers   = cfg.get("n_layers",    4),
+        H         = cfg.get("H",         16),
+        token_dim = cfg.get("token_dim",  3),
+        obs_dim   = cfg.get("obs_dim",    2),
+        d_model   = cfg.get("d_model",  128),
+        n_heads   = cfg.get("n_heads",    4),
+        n_layers  = cfg.get("n_layers",   4),
     ).to(device)
 
     policy.load_state_dict(ckpt["model_state"])
     policy.eval()
 
-    action_stats = ckpt.get("action_stats", {"mean": 0.0, "std": 1.0})
-    return policy, action_stats, cfg
+    token_stats = ckpt.get("token_stats", {"mean": np.zeros(3), "std": np.ones(3)})
+    return policy, token_stats, cfg
 
 
 # -----------------------------------------------------------------------
@@ -68,7 +69,7 @@ def load_policy(
 
 def run_three_algos(
     policy: FlowMatchingDiT,
-    action_stats: dict,
+    token_stats: dict,
     env_cfg: dict,              # {'m', 'k', 'c', 'dt'} — test-time env params
     ref_seq: np.ndarray,        # (T,) reference trajectory
     disturbance_fn=None,        # Callable: (step: int) -> float  external force
@@ -81,11 +82,10 @@ def run_three_algos(
 
     Args:
         policy:          trained policy
-        action_stats:    normalization stats
+        token_stats:     per-dim normalization stats
         env_cfg:         test-time MSD parameters (may differ from training)
         ref_seq:         (T,) reference positions
         disturbance_fn:  optional Callable(step) -> float for Exp-B
-                         injected into env.step via a wrapper
         algo_cfg:        optional overrides for {s_chunk, n_steps, n_inner, beta}
         seed:            random seed for env noise
         device:          torch device
@@ -95,7 +95,7 @@ def run_three_algos(
     """
     cfg = {
         "s_chunk": 5,
-        "n_steps": 16,
+        "n_steps": 20,
         "n_inner": 4,
         "beta":    10.0,
     }
@@ -105,7 +105,6 @@ def run_three_algos(
     results = {}
 
     for algo_name in ["fm", "rtc", "fbfm"]:
-        # Fresh env with identical seed for fair comparison
         env = MSDEnv(
             m=env_cfg.get("m", 1.0),
             k=env_cfg.get("k", 2.0),
@@ -114,7 +113,6 @@ def run_three_algos(
             seed=seed,
         )
 
-        # Wrap env.step to inject disturbance if provided
         if disturbance_fn is not None:
             _original_step = env.step
             _step_counter  = [0]
@@ -133,7 +131,7 @@ def run_three_algos(
                 policy, env, ref_seq,
                 s_chunk=cfg["s_chunk"],
                 n_steps=cfg["n_steps"],
-                action_stats=action_stats,
+                token_stats=token_stats,
                 device=device,
             )
         elif algo_name == "rtc":
@@ -142,7 +140,7 @@ def run_three_algos(
                 s_chunk=cfg["s_chunk"],
                 n_steps=cfg["n_steps"],
                 beta=cfg["beta"],
-                action_stats=action_stats,
+                token_stats=token_stats,
                 device=device,
             )
         else:  # fbfm
@@ -151,11 +149,10 @@ def run_three_algos(
                 n_steps=cfg["n_steps"],
                 n_inner=cfg["n_inner"],
                 beta=cfg["beta"],
-                action_stats=action_stats,
+                token_stats=token_stats,
                 device=device,
             )
 
-        # Compute tracking metrics
         err = ref_seq - result["xs_true"]
         result["rmse"]    = float(np.sqrt((err**2).mean()))
         result["mae"]     = float(np.abs(err).mean())

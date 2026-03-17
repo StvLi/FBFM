@@ -17,7 +17,8 @@ import os
 import json
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+TOYMODEL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, TOYMODEL_ROOT)
 
 from experiments.runner import load_policy, run_three_algos, make_test_refs
 
@@ -39,14 +40,18 @@ DT      = 0.05  # must match training
 
 
 def run_exp_a(
-    ckpt_path: str = "checkpoints/fm_best.pt",
+    ckpt_path: str = None,
     device: str = "cpu",
-    save_dir: str = "results/exp_a_mismatch",
+    save_dir: str = None,
     seed: int = 42,
 ):
+    if ckpt_path is None:
+        ckpt_path = os.path.join(TOYMODEL_ROOT, "checkpoints", "fm_best.pt")
+    if save_dir is None:
+        save_dir = os.path.join(TOYMODEL_ROOT, "results", "exp_a_mismatch")
     os.makedirs(save_dir, exist_ok=True)
 
-    policy, action_stats, _ = load_policy(ckpt_path, device)
+    policy, token_stats, _ = load_policy(ckpt_path, device)
     refs = make_test_refs(T=T_TEST, dt=DT)
 
     all_metrics = {}
@@ -60,7 +65,7 @@ def run_exp_a(
             env_cfg = {**env_params, "dt": DT}
 
             results = run_three_algos(
-                policy, action_stats, env_cfg, ref_seq,
+                policy, token_stats, env_cfg, ref_seq,
                 seed=seed, device=device,
             )
 

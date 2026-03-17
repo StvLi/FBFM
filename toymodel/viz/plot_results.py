@@ -23,7 +23,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+TOYMODEL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, TOYMODEL_ROOT)
 
 # -----------------------------------------------------------------------
 # Global style
@@ -74,9 +75,13 @@ def savefig(fig, path_no_ext: str, dpi: int = 300):
 # -----------------------------------------------------------------------
 
 def plot_exp_a_bar(
-    metrics_path: str = "results/exp_a_mismatch/metrics.json",
-    save_dir: str = "results/exp_a_mismatch",
+    metrics_path: str = None,
+    save_dir: str = None,
 ):
+    if metrics_path is None:
+        metrics_path = os.path.join(TOYMODEL_ROOT, "results", "exp_a_mismatch", "metrics.json")
+    if save_dir is None:
+        save_dir = os.path.join(TOYMODEL_ROOT, "results", "exp_a_mismatch")
     set_style()
     with open(metrics_path) as f:
         metrics = json.load(f)

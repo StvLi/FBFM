@@ -5,11 +5,13 @@ Loss:
     L = E_{tau, X0, X1} [ || v_theta(X^tau, obs, tau) - (X1 - X0) ||^2 ]
 
     where:
-        X0    ~ N(0, I)                          (B, H, action_dim)
-        X1    = clean action chunk from dataset  (B, H, action_dim)
+        X0    ~ N(0, I)                          (B, H, token_dim)
+        X1    = clean token chunk from dataset   (B, H, token_dim)
         tau   ~ Uniform(0, 1)                    (B,)
-        X^tau = tau * X1 + (1 - tau) * X0        (B, H, action_dim)  — linear interpolation
-        target velocity = X1 - X0               (B, H, action_dim)
+        X^tau = tau * X1 + (1 - tau) * X0        (B, H, token_dim)  — linear interpolation
+        target velocity = X1 - X0               (B, H, token_dim)
+
+    token_dim = 3: each token is [x, x_dot, u]
 
 Usage:
     python train/train_fm.py
@@ -23,7 +25,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# All output paths are anchored to the toymodel/ root, regardless of CWD
+TOYMODEL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, TOYMODEL_ROOT)
 
 from model.dit import FlowMatchingDiT
 from model.dataset import FlowMatchingDataset
@@ -35,13 +39,13 @@ from model.dataset import FlowMatchingDataset
 
 CFG = {
     # Data
-    "data_path":    "data/expert_dataset.npz",
+    "data_path":    os.path.join(TOYMODEL_ROOT, "data", "expert_dataset.npz"),
     "val_fraction": 0.1,
 
     # Model
-    "H":          16,
-    "action_dim": 1,
-    "obs_dim":    2,
+    "H":         16,
+    "token_dim": 3,
+    "obs_dim":   2,
     "d_model":    128,
     "n_heads":    4,
     "n_layers":   4,
@@ -54,7 +58,7 @@ CFG = {
     "lr_warmup_epochs": 10,
 
     # Checkpointing
-    "ckpt_dir":   "checkpoints",
+    "ckpt_dir":   os.path.join(TOYMODEL_ROOT, "checkpoints"),
     "ckpt_name":  "fm_best.pt",
     "save_every": 50,
 
@@ -75,7 +79,7 @@ def set_seed(seed: int):
 
 def fm_loss(
     policy: FlowMatchingDiT,
-    X1: torch.Tensor,    # (B, H, action_dim) — clean chunk
+    X1: torch.Tensor,    # (B, H, token_dim) — clean chunk
     obs: torch.Tensor,   # (B, obs_dim)
     device: str,
 ) -> torch.Tensor:
@@ -87,24 +91,22 @@ def fm_loss(
     """
     B = X1.shape[0]
 
-    # X0 ~ N(0, I),  shape: (B, H, action_dim)
+    # X0 ~ N(0, I),  shape: (B, H, token_dim)
     X0 = torch.randn_like(X1)
 
     # tau ~ Uniform(0, 1),  shape: (B,)
     tau = torch.rand(B, device=device)
 
     # Linear interpolation: X^tau = tau * X1 + (1 - tau) * X0
-    # tau reshaped to (B, 1, 1) for broadcasting
-    tau_bc = tau[:, None, None]
-    X_tau = tau_bc * X1 + (1.0 - tau_bc) * X0  # (B, H, action_dim)
+    tau_bc = tau[:, None, None]  # (B, 1, 1) for broadcasting
+    X_tau = tau_bc * X1 + (1.0 - tau_bc) * X0  # (B, H, token_dim)
 
     # Target velocity: v_target = X1 - X0
-    v_target = X1 - X0  # (B, H, action_dim)
+    v_target = X1 - X0  # (B, H, token_dim)
 
     # Predicted velocity
-    v_pred = policy(X_tau, obs, tau)  # (B, H, action_dim)
+    v_pred = policy(X_tau, obs, tau)  # (B, H, token_dim)
 
-    # MSE loss
     loss = nn.functional.mse_loss(v_pred, v_target)
     return loss
 
@@ -132,8 +134,9 @@ def train(cfg: dict = CFG):
 
     # --- Dataset ---
     dataset = FlowMatchingDataset(cfg["data_path"], normalize=True)
+    s = dataset.stats
     print(f"Dataset: {len(dataset)} chunks  |  "
-          f"action stats: mean={dataset.stats['mean']:.4f}, std={dataset.stats['std']:.4f}")
+          f"token stats: mean={s['mean']}, std={s['std']}")
 
     n_val  = max(1, int(len(dataset) * cfg["val_fraction"]))
     n_train = len(dataset) - n_val
@@ -149,7 +152,7 @@ def train(cfg: dict = CFG):
 
     # --- Model ---
     policy = FlowMatchingDiT(
-        H=cfg["H"], action_dim=cfg["action_dim"], obs_dim=cfg["obs_dim"],
+        H=cfg["H"], token_dim=cfg["token_dim"], obs_dim=cfg["obs_dim"],
         d_model=cfg["d_model"], n_heads=cfg["n_heads"], n_layers=cfg["n_layers"],
     ).to(device)
     print(f"Model params: {policy.count_params():,}")
@@ -172,7 +175,7 @@ def train(cfg: dict = CFG):
         policy.train()
         train_losses = []
         for X1, obs in train_loader:
-            # X1:  (B, H, action_dim)
+            # X1:  (B, H, token_dim)
             # obs: (B, obs_dim)
             X1  = X1.to(device)
             obs = obs.to(device)
@@ -216,14 +219,14 @@ def train(cfg: dict = CFG):
                 "optimizer_state": optimizer.state_dict(),
                 "val_loss":     val_loss,
                 "cfg":          cfg,
-                "action_stats": dataset.stats,
+                "token_stats":  dataset.stats,
             }, ckpt_path)
 
         # Periodic checkpoint
         if epoch % cfg["save_every"] == 0:
             periodic_path = os.path.join(cfg["ckpt_dir"], f"fm_epoch{epoch}.pt")
             torch.save({"epoch": epoch, "model_state": policy.state_dict(),
-                        "action_stats": dataset.stats}, periodic_path)
+                        "token_stats": dataset.stats}, periodic_path)
 
     print(f"\nTraining complete. Best val loss: {best_val_loss:.5f}")
     print(f"Best checkpoint saved to: {os.path.join(cfg['ckpt_dir'], cfg['ckpt_name'])}")
@@ -240,7 +243,9 @@ def train(cfg: dict = CFG):
 # Loss curve plot
 # -----------------------------------------------------------------------
 
-def plot_loss_curve(history: dict, save_path: str = "checkpoints/loss_curve.png"):
+def plot_loss_curve(history: dict, save_path: str = None):
+    if save_path is None:
+        save_path = os.path.join(TOYMODEL_ROOT, "checkpoints", "loss_curve.png")
     import matplotlib.pyplot as plt
     import matplotlib as mpl
 
@@ -283,5 +288,5 @@ if __name__ == "__main__":
         collect_dataset(n_trajs=200, T_per_traj=200, H=16,
                         save_path=CFG["data_path"])
 
-    policy, history, action_stats = train()
+    policy, history, token_stats = train()
     plot_loss_curve(history)

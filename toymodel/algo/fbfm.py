@@ -1,172 +1,184 @@
 """
 algo/fbfm.py — Feed-Back Flow Matching (FBFM) rollout
 
-FBFM rollout rhythm (single-thread simulation of async dual-thread):
-    Large cycle (fine-grained interleaving):
-        for each denoising "inner block" of n_inner steps:
-            [Inference chain]  Run n_inner denoising steps with current feedback
-            [Execution chain]  Execute 1 action, read back (state, action)
-                               → feed (state, action) back to inference chain
-        → next large cycle
+FBFM mask policy (W is per-element, shape (H, token_dim)):
+    State dims  (col 0-1):  1 ONLY at positions with real observed state.
+                             Predictions are ignored — "预测的都不做数".
+                             The count of real states grows as feedback arrives.
+    Action dims (col 2):    Same as RTC — 1 for non-padded (old-chunk tail), 0 for padding.
 
-Key innovation over RTC: the execution chain and inference chain interact
-at every single action step. Each executed action immediately updates the
-flow field, enabling within-chunk correction when the environment changes.
+FBFM rollout rhythm (single-thread simulation, n_steps=20, n_inner=4):
 
-Reference: Thoughts.md §实验组, Algorithm: FBFM pseudo-code
+    Build Y from old chunk's unexecuted tail → (H, token_dim), right-padded
+    Trigger: execute Y[0].action → capture obs   (1 execution step)
 
-Shapes throughout:
-    obs:     (obs_dim,)          = (2,)     — [x, x_dot]
-    X^τ:     (H, state_dim + action_dim) or (H, action_dim)
-             — see note below on X definition
-    W:       (H,)                           — mask weights
-    chunk:   (H, action_dim)     = (16, 1)  — output action sequence
+    guided_inference_fbfm (5 blocks × 4 denoising steps = 20 total):
+        Block 0 (τ steps 0-3):   guidance with W_state=[1,0,...], W_action=[1,..,1,0,..]
+          → env_feedback_fn() → execute Y[1].action → update obs
+          → W_state grows: [1,1,0,...]
+        Block 1 (τ steps 4-7):
+          → env_feedback_fn() → W_state grows: [1,1,1,0,...]
+        Block 2 (τ steps 8-11):
+          → env_feedback_fn() → W_state grows: [1,1,1,1,0,...]
+        Block 3 (τ steps 12-15):
+          → env_feedback_fn() → W_state grows: [1,1,1,1,1,0,...]
+        Block 4 (τ steps 16-19):  final output, NO feedback after
 
-NOTE on X definition in FBFM:
-    Thoughts.md §FBFM says X^τ_t = [Z^τ_t, A^τ_t], i.e. the state latent
-    and action are concatenated. For this MSD toy model we simplify:
-        X^τ = A^τ  (action chunk only, shape (H, action_dim))
-    because the state is directly observable (no VAE encoder needed).
-    The obs conditioning already carries the state information.
-    If you want to extend to the full formulation, change action_dim to
-    state_dim + action_dim and adjust the output head in dit.py accordingly.
+    New chunk → chunk_ptr = d = 4 (skip first 4 tokens)
+    s_chunk = 1(trigger) + 4(feedback) = 5
+
+    Y stays FIXED throughout inference; only obs and W_state are updated.
+
+Reference: Thoughts.md §实验组, modeling_rtc.py (state_feedback path)
+
+Shapes:
+    obs:   (obs_dim,)     = (2,)
+    X^τ:   (H, token_dim) = (16, 3)
+    Y:     (H, token_dim) = (16, 3)   guidance target (fixed)
+    W:     (H, token_dim)             per-element mask (mutable for state dims)
+    chunk: (H, token_dim) = (16, 3)
 """
 
 import numpy as np
 import torch
 from model.dit import FlowMatchingDiT
 
+ACTION_IDX = 2
+STATE_DIM  = 2
+
+
+def build_fbfm_W(
+    n_remaining: int,
+    n_real_states: int,
+    H: int,
+    token_dim: int,
+) -> np.ndarray:
+    """Build per-element mask for FBFM.
+
+    Args:
+        n_remaining:   number of non-padded positions (from old chunk tail)
+        n_real_states: number of positions with real observed state so far
+        H:             sequence length
+        token_dim:     token dimension (3)
+
+    Returns:
+        W: (H, token_dim)
+            W[:n_real_states, :STATE_DIM] = 1   (real state feedback)
+            W[:n_remaining,   ACTION_IDX] = 1   (non-padded action, same as RTC)
+    """
+    W = np.zeros((H, token_dim), dtype=np.float32)
+    W[:n_real_states, :STATE_DIM] = 1.0
+    W[:n_remaining,   ACTION_IDX] = 1.0
+    return W
+
 
 # -----------------------------------------------------------------------
-# [USER IMPLEMENTS] Core FBFM guided inference
+# Helpers
+# -----------------------------------------------------------------------
+
+def _normalize(arr, stats):
+    return (arr - stats["mean"]) / stats["std"]
+
+def _denormalize(arr, stats):
+    return arr * stats["std"] + stats["mean"]
+
+
+# -----------------------------------------------------------------------
+# Core FBFM guided inference
 # -----------------------------------------------------------------------
 
 def guided_inference_fbfm(
     policy: FlowMatchingDiT,
-    obs: np.ndarray,            # (obs_dim,) = (2,)  current observation
-    X_prev: np.ndarray,         # (H, action_dim) = (16, 1)  previous chunk,
-                                #   right-padded with zeros to length H
-    W: np.ndarray,              # (H,)  mask weights: 1.0 for real, 0.0 for padding
-    n_steps: int = 16,          # total denoising steps
-    n_inner: int = 4,           # denoising steps per interleave block
-    beta: float = 10.0,         # max guidance weight β
-    env_feedback_fn=None,       # Callable: () -> (obs_new, action_executed)
-                                #   called once per interleave block (after n_inner steps)
-                                #   returns the latest env observation and the action just executed
-    device: str = "cpu",
-) -> np.ndarray:                # (H, action_dim) = (16, 1)  new action chunk
+    obs: np.ndarray,            # (obs_dim,) post-trigger observation
+    X_prev: np.ndarray,         # (H, token_dim) guidance target Y (normalised)
+    W: np.ndarray,              # (H, token_dim) initial per-element mask
+    n_steps: int = 20,
+    n_inner: int = 4,
+    beta: float = 10.0,
+    env_feedback_fn=None,       # () -> (obs_new, u_exec)
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> np.ndarray:                # (H, token_dim) normalised
     """
-    FBFM guided Flow Matching inference with real-time execution feedback.
+    FBFM guided inference with real-time feedback.
 
-    The denoising loop is interleaved with execution:
-        for block in range(n_steps // n_inner):
-            run n_inner denoising steps  (inference chain)
-            call env_feedback_fn()       (execution chain: execute 1 action)
-            update Y and obs from feedback
+    W is (H, token_dim) and is MUTATED during inference:
+        After each feedback call, state mask gains 1 more position.
+        Action mask stays fixed.
 
-    ── Algorithm (one denoising step at noise level τ) ──────────────────
-    Given:
-        X^τ  : (H, action_dim)  current noisy sample
-        obs  : (obs_dim,)       conditioning observation (updated each block)
-        τ    : scalar           current noise level ∈ [0, 1]
-        Y    : (H, action_dim)  target = X_prev (right-padded, masked by W)
-                                updated after each execution step
-
-    1. Predict velocity:
-           v = policy(X^τ, obs, τ)          # (H, action_dim)
-
-    2. Predict clean sample:
-           X̂¹_t = X^τ + (1 - τ) * v         # (H, action_dim)
-
-    3. Compute guidance gain:
-           r²_τ = (1-τ)² / (τ² + (1-τ)²)
-           k_p  = min(β, (1-τ) / (τ * r²_τ))   # clamp τ away from 0
-
-    4. Compute guidance gradient (Jacobian of X̂¹ w.r.t. X^τ):
-           ∂X̂¹/∂X^τ ≈ I + (1-τ) * ∂v/∂X^τ    # requires torch.autograd
-
-    5. Compute error weighted by mask:
-           e = (Y - X̂¹)^T diag(W)             # (H, action_dim), masked
-
-    6. Guided velocity:
-           v_FBFM = v + k_p * e * (∂X̂¹/∂X^τ)
-
-    7. Euler step:
-           X^{τ+1/n} = X^τ + (1/n) * v_FBFM
-
-    After every n_inner steps (one interleave block):
-        - Call env_feedback_fn() to get (obs_new, action_executed)
-        - Append action_executed to Y (shift window or update the target)
-        - Update obs ← obs_new for the next block's conditioning
-
-    ── Difference from RTC ──────────────────────────────────────────────
-    RTC:  Y is fixed throughout inference (set once from A_prev before loop)
-    FBFM: Y is updated after each execution step using real env feedback,
-          so the guidance target tracks the actual trajectory in real time.
-
-    ── Interface notes ──────────────────────────────────────────────────
-    - env_feedback_fn() signature: () -> (obs: np.ndarray (2,), u: float)
-      It should execute one action from the current chunk and return the
-      resulting observation and the action value used.
-    - The rollout harness (rollout_fbfm below) manages the action chunk
-      pointer and passes the correct env_feedback_fn closure each cycle.
-    - policy.forward(X_tau, obs_t, tau_t) returns v: (B, H, action_dim)
-      Use B=1 and squeeze/unsqueeze as needed.
-    - To compute ∂X̂¹/∂X^τ, use torch.autograd.grad with retain_graph=True.
-    - W is (H,) numpy; convert to torch and reshape to (H, 1) for broadcasting.
-    - Clamp τ away from 0 (e.g., max(τ, 1e-4)) to avoid division by zero.
-
-    ── Related code locations ───────────────────────────────────────────
-    - policy definition:    model/dit.py  FlowMatchingDiT.forward()
-    - vanilla FM inference: model/inference.py  sample_fm()
-    - RTC counterpart:      algo/rtc.py   guided_inference_rtc()
-    - rollout harness:      algo/fbfm.py  rollout_fbfm()  (below)
-    - experiment runner:    experiments/runner.py
+    Structure (n_steps=20, n_inner=4 → n_blocks=5):
+        for block in range(5):
+            for inner in range(4):
+                denoising step with current W
+            if block < 4:
+                env_feedback_fn() → update obs
+                W[:, :STATE_DIM] expands by 1 position
 
     Args:
-        policy:          FlowMatchingDiT (eval mode, on `device`)
-        obs:             (obs_dim,) initial observation for this cycle
-        X_prev:          (H, action_dim) previous chunk, right-padded
-        W:               (H,) mask weights
+        policy:          FlowMatchingDiT (eval, on device)
+        obs:             (obs_dim,) post-trigger
+        X_prev:          (H, token_dim) normalised, right-padded
+        W:               (H, token_dim) initial per-element mask
         n_steps:         total denoising steps
-        n_inner:         denoising steps per interleave block
-        beta:            max guidance weight β
-        env_feedback_fn: Callable () -> (obs_new (2,), u_executed float)
-                         Called once per interleave block.
-                         If None, falls back to RTC-style (no live feedback).
-        device:          torch device string
+        n_inner:         steps per block
+        beta:            max guidance weight
+        env_feedback_fn: () -> (obs_new, u_exec); called d times
+        device:          torch device
 
     Returns:
-        actions: (H, action_dim) new action chunk (numpy, original scale)
+        (H, token_dim) normalised numpy
     """
-    # ── TODO: implement FBFM guided inference here ─────────────────────
-    # Suggested structure:
-    #
-    #   X = torch.randn(1, H, action_dim).to(device)
-    #   dt = 1.0 / n_steps
-    #   n_blocks = n_steps // n_inner
-    #   Y = torch.from_numpy(X_prev).float().to(device).unsqueeze(0)  # (1,H,1)
-    #   W_t = torch.from_numpy(W).float().to(device).unsqueeze(-1)    # (H,1)
-    #   obs_t = torch.from_numpy(obs).float().to(device).unsqueeze(0) # (1,2)
-    #
-    #   for block in range(n_blocks):
-    #       for inner in range(n_inner):
-    #           tau = (block * n_inner + inner) * dt
-    #           ... (steps 1-7 above, with autograd for Jacobian)
-    #           X = X + dt * v_FBFM
-    #
-    #       # Execution feedback
-    #       if env_feedback_fn is not None:
-    #           obs_new, u_exec = env_feedback_fn()
-    #           obs_t = torch.from_numpy(obs_new).float().to(device).unsqueeze(0)
-    #           # Update Y: shift window and append u_exec
-    #           # (implementation detail: how you update Y is part of your design)
-    #
-    #   return X[0].detach().cpu().numpy()
-    raise NotImplementedError(
-        "guided_inference_fbfm is not yet implemented. "
-        "See the docstring above for the full algorithm and interface notes."
-    )
+    policy.eval()
+    H = policy.H
+    token_dim = policy.token_dim
+    n_blocks = n_steps // n_inner
+
+    obs_t = torch.from_numpy(obs.astype(np.float32)).to(device).unsqueeze(0)
+    Y     = torch.from_numpy(X_prev.astype(np.float32)).to(device).unsqueeze(0)
+    W_t   = torch.from_numpy(W.copy().astype(np.float32)).to(device).unsqueeze(0)  # (1,H,D), mutable
+
+    X = torch.randn(1, H, token_dim, device=device)
+    dt = 1.0 / n_steps
+
+    # Track how many real state positions exist for progressive expansion
+    n_real_states = int(W[:, 0].sum())  # derive from initial mask
+
+    for block in range(n_blocks):
+        for inner in range(n_inner):
+            step_idx = block * n_inner + inner
+            tau_val = max(step_idx * dt, 1e-4)
+            tau_t = torch.full((1,), tau_val, dtype=torch.float32, device=device)
+
+            X = X.detach().requires_grad_(True)
+            v = policy(X, obs_t, tau_t)
+
+            one_minus_tau = 1.0 - tau_val
+            X_hat1 = X + one_minus_tau * v
+
+            r_sq = one_minus_tau ** 2 / (tau_val ** 2 + one_minus_tau ** 2)
+            k_p = min(beta, one_minus_tau / (tau_val * r_sq))
+
+            e = (Y - X_hat1) * W_t
+
+            g = torch.autograd.grad(
+                outputs=X_hat1, inputs=X,
+                grad_outputs=e.detach(),
+                retain_graph=False, create_graph=False,
+            )[0]
+
+            v_guided = v.detach() + k_p * g
+            X = X.detach() + dt * v_guided
+
+        # Feedback after every block except the last
+        if block < n_blocks - 1 and env_feedback_fn is not None:
+            obs_new, _u_exec = env_feedback_fn()
+            obs_t = torch.from_numpy(obs_new.astype(np.float32)).to(device).unsqueeze(0)
+
+            # Expand state mask by 1 position
+            n_real_states += 1
+            if n_real_states <= H:
+                W_t[0, n_real_states - 1, :STATE_DIM] = 1.0
+
+    return X[0].detach().cpu().numpy()
 
 
 # -----------------------------------------------------------------------
@@ -175,130 +187,114 @@ def guided_inference_fbfm(
 
 def rollout_fbfm(
     policy: FlowMatchingDiT,
-    env,                        # MSDEnv instance (already reset)
-    ref_seq: np.ndarray,        # (T_total,) reference position sequence
-    n_steps: int = 16,          # total FM denoising steps per cycle
-    n_inner: int = 4,           # denoising steps per interleave block
-    beta: float = 10.0,         # max guidance weight
-    action_stats: dict = None,  # {'mean': float, 'std': float} for denorm
-    device: str = "cpu",
+    env,
+    ref_seq: np.ndarray,
+    n_steps: int = 20,
+    n_inner: int = 4,
+    beta: float = 10.0,
+    token_stats: dict = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> dict:
-    """
-    FBFM rollout: fine-grained interleaving of inference and execution.
-
-    Each large cycle runs n_steps denoising steps total, interleaved with
-    (n_steps // n_inner) execution steps. The env_feedback_fn closure
-    captures the current chunk pointer and feeds back the executed action
-    and resulting observation to the inference loop.
-
-    Args:
-        policy:       trained FlowMatchingDiT
-        env:          MSDEnv (already reset)
-        ref_seq:      (T_total,) reference positions
-        n_steps:      total denoising steps per cycle
-        n_inner:      denoising steps per interleave block
-        beta:         max guidance weight
-        action_stats: normalization stats
-        device:       torch device
-
-    Returns:
-        dict with xs_true, xs_obs, actions, times, ref_seq  — all (T_total,)
-    """
+    """FBFM rollout — see module docstring for rhythm and mask policy."""
     T_total = len(ref_seq)
     H = policy.H
-    n_blocks = n_steps // n_inner  # execution steps per large cycle
+    token_dim = policy.token_dim
+    n_blocks = n_steps // n_inner
+    d = n_blocks - 1
+    s_chunk = 1 + d
 
-    xs_true  = np.zeros(T_total)
-    xs_obs   = np.zeros(T_total)
-    actions  = np.zeros(T_total)
-    times    = np.zeros(T_total)
+    xs_true = np.zeros(T_total)
+    xs_obs  = np.zeros(T_total)
+    actions = np.zeros(T_total)
+    times   = np.zeros(T_total)
 
-    # Current action chunk: (H, action_dim)
-    current_chunk = np.zeros((H, 1), dtype=np.float32)
-    chunk_ptr = H  # force re-inference on first step
+    obs = env.state.copy()
 
-    obs = env.state.copy()  # (2,)
+    # Bootstrap: unguided
+    A_init = np.zeros((H, token_dim), dtype=np.float32)
+    W_init = np.zeros((H, token_dim), dtype=np.float32)
+    if token_stats is not None:
+        A_init = _normalize(A_init, token_stats)
 
-    # Global time step counter
+    first_norm = guided_inference_fbfm(
+        policy, obs, A_init, W_init,
+        n_steps=n_steps, n_inner=n_inner, beta=beta,
+        env_feedback_fn=None, device=device,
+    )
+    current_chunk = _denormalize(first_norm, token_stats) if token_stats else first_norm
+    chunk_ptr = 0
+
     t_global = 0
-
     while t_global < T_total:
-        # --- Build A_prev from unexecuted tail of current chunk ---
+        # Build Y from unexecuted tail
         n_unexecuted = H - chunk_ptr
-        X_prev = np.zeros((H, 1), dtype=np.float32)
+        Y_raw = np.zeros((H, token_dim), dtype=np.float32)
         if n_unexecuted > 0:
-            X_prev[:n_unexecuted] = current_chunk[chunk_ptr:]
-        W = np.zeros(H, dtype=np.float32)
-        W[:n_unexecuted] = 1.0
+            Y_raw[:n_unexecuted] = current_chunk[chunk_ptr:]
 
-        if action_stats is not None:
-            X_prev = (X_prev - action_stats["mean"]) / action_stats["std"]
+        # Trigger: execute first action
+        u_trigger = float(Y_raw[0, ACTION_IDX]) if n_unexecuted > 0 else 0.0
+        chunk_ptr += 1
 
-        # --- Build env_feedback_fn closure ---
-        # This closure is called once per interleave block inside guided_inference_fbfm.
-        # It executes one action from the *current* chunk (before the new chunk is ready),
-        # records the result, and returns (obs_new, u_executed).
-        #
-        # We use a mutable container to share state between the closure and the outer loop.
-        feedback_state = {
-            "obs": obs.copy(),
-            "t_global": t_global,
-            "chunk": current_chunk.copy(),
-            "ptr": chunk_ptr,
-        }
-        recorded_steps = []  # list of (xs_true, xs_obs, u, time) per feedback call
+        obs_noisy, _, _, info = env.step(u_trigger, add_obs_noise=True)
+        if t_global < T_total:
+            xs_true[t_global] = info["true_state"][0]
+            xs_obs[t_global]  = obs_noisy[0]
+            actions[t_global] = u_trigger
+            times[t_global]   = info["t"]
+            t_global += 1
+
+        obs_for_inference = obs_noisy.copy()
+
+        # Initial W: 1 real state (trigger), action mask same as RTC
+        W = build_fbfm_W(n_unexecuted, n_real_states=1, H=H, token_dim=token_dim)
+
+        if token_stats is not None:
+            Y_norm = _normalize(Y_raw, token_stats)
+        else:
+            Y_norm = Y_raw
+
+        # env_feedback_fn closure
+        feedback_state = {"y_ptr": 1, "obs": obs_noisy.copy()}
+        recorded_steps = []
 
         def env_feedback_fn():
-            """Execute one action from the current chunk, record result."""
-            ptr = feedback_state["ptr"]
-            chunk = feedback_state["chunk"]
+            y_ptr = feedback_state["y_ptr"]
+            u = float(Y_raw[y_ptr, ACTION_IDX]) if y_ptr < n_unexecuted else 0.0
+            feedback_state["y_ptr"] = y_ptr + 1
 
-            # If chunk is exhausted, use zero action (shouldn't happen in normal flow)
-            u = float(chunk[ptr, 0]) if ptr < H else 0.0
-            feedback_state["ptr"] = min(ptr + 1, H)
-
-            obs_noisy, _, _, info = env.step(u, add_obs_noise=True)
-            feedback_state["obs"] = obs_noisy
-
+            obs_new, _, _, info_fb = env.step(u, add_obs_noise=True)
+            feedback_state["obs"] = obs_new
             recorded_steps.append({
-                "xs_true": info["true_state"][0],
-                "xs_obs":  obs_noisy[0],
+                "xs_true": info_fb["true_state"][0],
+                "xs_obs":  obs_new[0],
                 "u":       u,
-                "t":       info["t"],
+                "t":       info_fb["t"],
             })
-            return obs_noisy, u
+            return obs_new, u
 
-        # --- Run FBFM guided inference (interleaved with execution) ---
-        new_chunk_norm = guided_inference_fbfm(
-            policy, obs, X_prev, W,
+        # Guided inference (W will be mutated inside for state dims)
+        new_norm = guided_inference_fbfm(
+            policy, obs_for_inference, Y_norm, W,
             n_steps=n_steps, n_inner=n_inner, beta=beta,
-            env_feedback_fn=env_feedback_fn,
-            device=device,
-        )  # (H, 1) normalised
+            env_feedback_fn=env_feedback_fn, device=device,
+        )
+        current_chunk = _denormalize(new_norm, token_stats) if token_stats else new_norm
 
-        # Denormalise
-        if action_stats is not None:
-            current_chunk = new_chunk_norm * action_stats["std"] + action_stats["mean"]
-        else:
-            current_chunk = new_chunk_norm
-        chunk_ptr = 0
-
-        # --- Record the steps that were executed during inference ---
+        # Record feedback steps
         for step in recorded_steps:
             if t_global >= T_total:
                 break
-            xs_true[t_global]  = step["xs_true"]
-            xs_obs[t_global]   = step["xs_obs"]
-            actions[t_global]  = step["u"]
-            times[t_global]    = step["t"]
+            xs_true[t_global] = step["xs_true"]
+            xs_obs[t_global]  = step["xs_obs"]
+            actions[t_global] = step["u"]
+            times[t_global]   = step["t"]
             t_global += 1
 
+        chunk_ptr = d
         obs = feedback_state["obs"]
 
     return {
-        "xs_true":  xs_true,
-        "xs_obs":   xs_obs,
-        "actions":  actions,
-        "times":    times,
-        "ref_seq":  ref_seq,
+        "xs_true": xs_true, "xs_obs": xs_obs,
+        "actions": actions, "times": times, "ref_seq": ref_seq,
     }
