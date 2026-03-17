@@ -120,8 +120,13 @@ class PrevChunk:
 
         This is intended to be used as a guide for the next chunk generation.
         """
-        action_prefix_weights = torch.zeros(self.action_num)
-        action_prefix_weights[:(self.action_constrained_num)] = 1
+        if self.constrain_mode == "None":
+            action_prefix_weights = torch.zeros(self.action_num)
+        elif self.constrain_mode == "RTC" or self.constrain_mode == "Feedback":
+            action_prefix_weights = torch.zeros(self.action_num)
+            action_prefix_weights[:(self.action_constrained_num)] = 1
+        else:
+            raise ValueError(f"Unknown constrain mode: {self.constrain_mode}")
         return action_prefix_weights
     
     def get_state_prefix_weights(self) -> Tensor:
@@ -132,8 +137,10 @@ class PrevChunk:
         if self.constrain_mode == "Feedback":
             state_prefix_weights = torch.zeros(self.state_num)
             state_prefix_weights[:(self.state_constrained_num)] = 1
-        elif self.constrain_mode == "RTC":
+        elif self.constrain_mode == "RTC" or self.constrain_mode == "None":
             state_prefix_weights = torch.zeros(self.state_num)
+        else:
+            raise ValueError(f"Unknown constrain mode: {self.constrain_mode}")
         return state_prefix_weights
 
     def get_prefix_weights(self) -> Tensor:
