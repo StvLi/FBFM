@@ -22,6 +22,29 @@ https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/main/sr
 
 Based on LeRobot's RTC implementation:
 https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/rtc/modeling_rtc.py
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    FBFM.PrevChunk 状态管理                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Chunk N-1                    Chunk N                           │
+│  ┌──────────┐                ┌──────────┐                       │
+│  │ 生成动作  │ ──────────────▶│ 接收反馈  │                      │
+│  └──────────┘   (actions)    └──────────┘                       │
+│       │                          │                              │
+│       ▼                          ▼                              │
+│  ┌──────────┐                ┌──────────┐                       │
+│  │ 状态观测  │ ──────────────▶│ 约束注入  │                      │
+│  └──────────┘   (obs/latent) └──────────┘                       │
+│                                  │                              │
+│                                  ▼                              │
+│                          ┌──────────────┐                       │
+│                          │ Scheduler.step│                      │
+│                          │ constrained_y │                      │
+│                          │ weights       │                      │
+│                          └──────────────┘                       │
+└─────────────────────────────────────────────────────────────────┘
 """
 
 import logging
