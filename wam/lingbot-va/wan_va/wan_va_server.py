@@ -39,8 +39,39 @@ from utils import (
 
 # FBFM
 import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
+from fbfm.policies.fbfm.configuration_rtc import RTCConfig
+from torch import Tensor
 
 class WrapperedFlowMatchScheduler(FlowMatchScheduler):
+    def __init__(
+        self,
+        num_inference_steps=100,
+        num_train_timesteps=1000,
+        shift=3.0,
+        sigma_max=1.0,
+        sigma_min=0.003 / 1.002,
+        inverse_timesteps=False,
+        extra_one_step=False,
+        reverse_sigmas=False,
+        exponential_shift=False,
+        exponential_shift_mu=None,
+        shift_terminal=None,
+        rtc_config: RTCConfig = None,
+        ):
+        super().__init__(
+            num_inference_steps=num_inference_steps,
+            num_train_timesteps=num_train_timesteps,
+            shift=shift,
+            sigma_max=sigma_max,
+            sigma_min=sigma_min,
+            inverse_timesteps=inverse_timesteps,
+            extra_one_step=extra_one_step,
+            reverse_sigmas=reverse_sigmas,
+            exponential_shift=exponential_shift,
+            exponential_shift_mu=exponential_shift_mu,
+            shift_terminal=shift_terminal,
+            )
+        self.rtc_config = rtc_config
     @torch.enable_grad()
     def step(self,
              original_denoise_step_partial,
@@ -81,7 +112,7 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
                 v_t = original_denoise_step_partial(x_t)
                 x_t.requires_grad_(True)
 
-                x1_t = x_t - time * v_t  # noqa: N806
+                x1_t = x_t - sigma * v_t  # noqa: N806
                 err = (constrained_y - x1_t) * weights
                 grad_outputs = err.clone().detach()
                 correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
@@ -115,14 +146,20 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
+        self.rtc_config = RTCConfig(
+            # TODO: 暂时用这个，后面改成从job_config中读取
+        )
+
         # FBFM装饰后得Scheduler
         self.scheduler = WrapperedFlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
-                                            extra_one_step=True)
+                                            extra_one_step=True,
+                                            rtc_config=self.rtc_config)
         self.action_scheduler = WrapperedFlowMatchScheduler(
             shift=self.job_config.action_snr_shift,
             sigma_min=0.0,
-            extra_one_step=True)
+            extra_one_step=True,
+            rtc_config=self.rtc_config)
         
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
@@ -698,11 +735,11 @@ class VA_Server:
                 # TODO: 初始化参数配置
                 constrain_mode = "Feedback",
                 # actions = ,                   # 来自上个chunk
-                # action_constrained_num = ,    # 来自config
-                # action_num = ,                # 来自config
-                # action_dim = ,                # 来自config
-                # state_num = ,                 # 来自config
-                # state_dim = ,                 # 来自config
+                # action_constrained_num = ,    # 来自rtc_config
+                # action_num = ,                # 来自rtc_config
+                # action_dim = ,                # 来自rtc_config
+                # state_num = ,                 # 来自rtc_config
+                # state_dim = ,                 # 来自rtc_config
                 # inference_delay = ,           # 来自延迟实测
             )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
