@@ -42,44 +42,65 @@ import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 
 class WrapperedFlowMatchScheduler(FlowMatchScheduler):
     def step(self,
-             
-             model_output, 
+             original_denoise_step_partial,
+             x_t,
              timestep, 
              sample, 
              to_final=False, 
-             constrain:FBFM.PrevChunk = None, 
+             constrained_y : Tensor | None = None,
+             weights : Tensor | None = None, 
              device = None, 
              **kwargs
              ):
-        if constrain is not None and device is not None:
-            constrained_states = constrain.get_constrained_states()
-            state_weights = (
-                constrain.get_prefix_weights()
-                .to(device)
-                .unsqueeze(0)
-                .unsqueeze(-1)
-            )
-            constrained_actions = constrain.get_constrained_actions()
-            action_weights = (
-                constrain.get_action_prefix_weights()
-                .to(device)
-                .unsqueeze(0)
-                .unsqueeze(-1)
-            )
-        # TODO:FBFM
-        
-
         # 原step函数
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
         timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        
+        # 去噪时间方案
         sigma = self.sigmas[timestep_id]
         if to_final or timestep_id + 1 >= len(self.timesteps):
             sigma_ = 1 if (self.inverse_timesteps
                            or self.reverse_sigmas) else 0
         else:
             sigma_ = self.sigmas[timestep_id + 1]
-        prev_sample = sample + model_output * (sigma_ - sigma)
+
+        # 转换为RTC中 由1到0的虚时间轴 由tau表示
+        tau = 1 - sigma
+
+        if constrained_y is not None and weights is not None:
+            x_t = x_t.clone().detach()
+
+            # 疑似没有用 weights 已经自动生成过了
+            # batch_size = x_t.shape[0] # B
+            # chunk_size = x_t.shape[1] # T
+            # action_dim = x_t.shape[2] # N
+
+            with torch.enable_grad():
+                v_t = original_denoise_step_partial(x_t)
+                x_t.requires_grad_(True)
+
+                x1_t = x_t - time * v_t  # noqa: N806
+                err = (constrained_y - x1_t) * weights
+                grad_outputs = err.clone().detach()
+                correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+
+            max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
+            tau_tensor = torch.as_tensor(tau)
+            squared_one_minus_tau = (1 - tau_tensor) ** 2
+            inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
+            c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
+            guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+            guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+
+            v_result_t = v_t - guidance_weight * correction
+
+        else:
+            # First step, no guidance - return v_t
+            v_result_t = original_denoise_step_partial(x_t)
+
+        
+        prev_sample = sample + v_result_t * (sigma_ - sigma)
 
         return prev_sample
 
@@ -93,21 +114,21 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
-        # self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
-        #                                     sigma_min=0.0,
-        #                                     extra_one_step=True)
-        self.scheduler = WrapperedFlowMatchScheduler(shift=self.job_config.snr_shift,
+        self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
                                             extra_one_step=True)
-        # self.action_scheduler = FlowMatchScheduler(
-        #     shift=self.job_config.action_snr_shift,
-        #     sigma_min=0.0,
-        #     extra_one_step=True)
-        self.action_scheduler = WrapperedFlowMatchScheduler(
+        # self.scheduler = WrapperedFlowMatchScheduler(shift=self.job_config.snr_shift,
+        #                                     sigma_min=0.0,
+        #                                     extra_one_step=True)
+        self.action_scheduler = FlowMatchScheduler(
             shift=self.job_config.action_snr_shift,
             sigma_min=0.0,
             extra_one_step=True)
-        self.scheduler.set_timesteps(1000, training=True)
+        # self.action_scheduler = WrapperedFlowMatchScheduler(
+        #     shift=self.job_config.action_snr_shift,
+        #     sigma_min=0.0,
+        #     extra_one_step=True)
+        # self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
 
         self.vae = load_vae(
