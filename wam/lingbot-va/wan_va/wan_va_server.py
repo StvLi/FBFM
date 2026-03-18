@@ -41,6 +41,7 @@ from utils import (
 import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 
 class WrapperedFlowMatchScheduler(FlowMatchScheduler):
+    @torch.enable_grad()
     def step(self,
              original_denoise_step_partial,
              x_t,
