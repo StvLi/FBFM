@@ -57,10 +57,10 @@ def run_exp_c(
         for cond_name, env_cfg in TEST_CONDITIONS.items():
             print(f"  Condition: {cond_name}")
 
-            # Full FBFM (beta=10)
+            # Full FBFM (beta=3)
             results_full = run_three_algos(
                 policy, token_stats, env_cfg, ref_seq,
-                algo_cfg={"beta": 10.0},
+                algo_cfg={"beta": 3.0},
                 seed=seed, device=device,
             )
 

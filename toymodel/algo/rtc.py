@@ -16,7 +16,7 @@ there is no within-chunk correction.
 Reference: RTC Paper.pdf, Thoughts.md §对照二
 
 Shapes throughout:
-    obs:     (obs_dim,)          = (2,)     — [x, x_dot]
+    obs:     (obs_dim,)          = (3,)     — [x, x_dot, x_ref]
     A_prev:  (H, token_dim)      = (16, 3)  — previous chunk (right-padded with zeros)
     W:       (H, token_dim)                 — per-element mask (see build_rtc_W)
     chunk:   (H, token_dim)      = (16, 3)  — token sequence [x, x_dot, u]
@@ -34,14 +34,41 @@ ACTION_IDX = 2
 STATE_DIM  = 2
 
 
-def build_rtc_W(n_remaining: int, H: int, token_dim: int) -> np.ndarray:
-    """Build per-element mask for RTC: action only, no state guidance.
+def build_rtc_W(n_remaining: int, H: int, token_dim: int,
+                d: int = 0, s: int = 5) -> np.ndarray:
+    """Build per-element soft mask for RTC (Paper Eq.5).
+
+    Three-region mask on the action dimension:
+        W[i<d]       = 1          (frozen, will be executed during inference)
+        W[d<=i<H-s]  = exp decay  (intermediate, can be updated)
+        W[i>=H-s]    = 0          (beyond old chunk, freshly generated)
+
+    State dimensions are always 0 (RTC does not use state guidance).
+
+    Args:
+        n_remaining: non-padded positions from old chunk tail
+        H:           sequence length
+        token_dim:   token dimension (3)
+        d:           inference delay (frozen prefix length)
+        s:           execution horizon
 
     Returns:
-        W: (H, token_dim) — W[:, :STATE_DIM]=0; W[:n_remaining, ACTION_IDX]=1
+        W: (H, token_dim)
     """
     W = np.zeros((H, token_dim), dtype=np.float32)
-    W[:n_remaining, ACTION_IDX] = 1.0
+    for i in range(min(n_remaining, H)):
+        if i < d:
+            w = 1.0
+        elif i < H - s:
+            denom = H - s - d + 1
+            if denom > 0:
+                ci = (H - s - i) / denom
+                w = ci * (np.exp(ci) - 1) / (np.e - 1)
+            else:
+                w = 0.0
+        else:
+            w = 0.0
+        W[i, ACTION_IDX] = w
     return W
 
 
@@ -51,7 +78,7 @@ def build_rtc_W(n_remaining: int, H: int, token_dim: int) -> np.ndarray:
 
 def guided_inference_rtc(
     policy: FlowMatchingDiT,
-    obs: np.ndarray,            # (obs_dim,) = (2,)
+    obs: np.ndarray,            # (obs_dim,) = (3,) = [x, x_dot, x_ref]
     A_prev: np.ndarray,         # (H, token_dim) = (16, 3)  normalised, right-padded
     W: np.ndarray,              # (H, token_dim) per-element mask
     n_steps: int = 20,
@@ -158,7 +185,7 @@ def rollout_rtc(
     actions = np.zeros(T_total)
     times   = np.zeros(T_total)
 
-    obs = env.state.copy()
+    obs = np.append(env.state.copy(), ref_seq[0])  # (3,) = [x, x_dot, x_ref]
 
     # Bootstrap
     A_prev_init = np.zeros((H, token_dim), dtype=np.float32)
@@ -184,14 +211,14 @@ def rollout_rtc(
         actions[t_global] = u
         times[t_global]   = info["t"]
         t_global += 1
-        obs_for_inference = obs_noisy.copy()
+        obs_for_inference = np.append(obs_noisy, ref_seq[min(t_global, T_total - 1)])  # (3,)
 
         # Build A_prev + W
         n_remaining = H - chunk_ptr
         A_prev = np.zeros((H, token_dim), dtype=np.float32)
         if n_remaining > 0:
             A_prev[:n_remaining] = current_chunk[chunk_ptr:]
-        W = build_rtc_W(n_remaining, H, token_dim)
+        W = build_rtc_W(n_remaining, H, token_dim, d=d, s=s_chunk)
         if token_stats is not None:
             A_prev = _normalize(A_prev, token_stats)
 

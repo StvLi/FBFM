@@ -27,12 +27,12 @@ FBFM rollout rhythm (single-thread simulation, n_steps=20, n_inner=4):
     New chunk → chunk_ptr = d = 4 (skip first 4 tokens)
     s_chunk = 1(trigger) + 4(feedback) = 5
 
-    Y stays FIXED throughout inference; only obs and W_state are updated.
+    Y stays FIXED for action dims; state dims are replaced with real observations.
 
 Reference: Thoughts.md §实验组, modeling_rtc.py (state_feedback path)
 
 Shapes:
-    obs:   (obs_dim,)     = (2,)
+    obs:   (obs_dim,)     = (3,)    — [x, x_dot, x_ref]
     X^τ:   (H, token_dim) = (16, 3)
     Y:     (H, token_dim) = (16, 3)   guidance target (fixed)
     W:     (H, token_dim)             per-element mask (mutable for state dims)
@@ -52,23 +52,44 @@ def build_fbfm_W(
     n_real_states: int,
     H: int,
     token_dim: int,
+    d: int = 0,
+    s: int = 5,
 ) -> np.ndarray:
     """Build per-element mask for FBFM.
+
+    Action dims use the same soft mask as RTC (Paper Eq.5):
+        W[i<d]       = 1          (frozen)
+        W[d<=i<H-s]  = exp decay  (intermediate)
+        W[i>=H-s]    = 0          (fresh)
+    State dims: 1 only at positions with real observed state.
 
     Args:
         n_remaining:   number of non-padded positions (from old chunk tail)
         n_real_states: number of positions with real observed state so far
         H:             sequence length
         token_dim:     token dimension (3)
+        d:             inference delay (frozen prefix length)
+        s:             execution horizon
 
     Returns:
         W: (H, token_dim)
-            W[:n_real_states, :STATE_DIM] = 1   (real state feedback)
-            W[:n_remaining,   ACTION_IDX] = 1   (non-padded action, same as RTC)
     """
     W = np.zeros((H, token_dim), dtype=np.float32)
     W[:n_real_states, :STATE_DIM] = 1.0
-    W[:n_remaining,   ACTION_IDX] = 1.0
+    # Soft mask for action dim (same as RTC Paper Eq.5)
+    for i in range(min(n_remaining, H)):
+        if i < d:
+            w = 1.0
+        elif i < H - s:
+            denom = H - s - d + 1
+            if denom > 0:
+                ci = (H - s - i) / denom
+                w = ci * (np.exp(ci) - 1) / (np.e - 1)
+            else:
+                w = 0.0
+        else:
+            w = 0.0
+        W[i, ACTION_IDX] = w
     return W
 
 
@@ -95,7 +116,7 @@ def guided_inference_fbfm(
     n_steps: int = 20,
     n_inner: int = 4,
     beta: float = 10.0,
-    env_feedback_fn=None,       # () -> (obs_new, u_exec)
+    env_feedback_fn=None,       # () -> (obs_new, u_exec, state_norm_for_Y)
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> np.ndarray:                # (H, token_dim) normalised
     """
@@ -121,7 +142,8 @@ def guided_inference_fbfm(
         n_steps:         total denoising steps
         n_inner:         steps per block
         beta:            max guidance weight
-        env_feedback_fn: () -> (obs_new, u_exec); called d times
+        env_feedback_fn: () -> (obs_new, u_exec, state_norm); called d times
+                         state_norm: (STATE_DIM,) normalized real state for Y replacement
         device:          torch device
 
     Returns:
@@ -170,13 +192,17 @@ def guided_inference_fbfm(
 
         # Feedback after every block except the last
         if block < n_blocks - 1 and env_feedback_fn is not None:
-            obs_new, _u_exec = env_feedback_fn()
-            obs_t = torch.from_numpy(obs_new.astype(np.float32)).to(device).unsqueeze(0)
+            obs_new, _u_exec, state_norm = env_feedback_fn()
+            # NOTE: obs_t is NOT updated — ODE conditioning stays fixed at trigger obs.
+            # Feedback only adjusts the flow field via Y state replacement + W expansion.
 
             # Expand state mask by 1 position
             n_real_states += 1
             if n_real_states <= H:
                 W_t[0, n_real_states - 1, :STATE_DIM] = 1.0
+                # Replace Y state at this position with REAL observed state
+                state_t = torch.from_numpy(state_norm.astype(np.float32)).to(device)
+                Y[0, n_real_states - 1, :STATE_DIM] = state_t
 
     return X[0].detach().cpu().numpy()
 
@@ -208,7 +234,7 @@ def rollout_fbfm(
     actions = np.zeros(T_total)
     times   = np.zeros(T_total)
 
-    obs = env.state.copy()
+    obs = np.append(env.state.copy(), ref_seq[0])  # (3,) = [x, x_dot, x_ref]
 
     # Bootstrap: unguided
     A_init = np.zeros((H, token_dim), dtype=np.float32)
@@ -244,34 +270,50 @@ def rollout_fbfm(
             times[t_global]   = info["t"]
             t_global += 1
 
-        obs_for_inference = obs_noisy.copy()
+        obs_for_inference = np.append(obs_noisy, ref_seq[min(t_global, T_total - 1)])  # (3,)
+
+        # Replace Y_raw[0] state with REAL observed state from trigger
+        # Token[0] = [state_{after_trigger}, action_{trigger}]
+        # obs_noisy[:2] = real [x, x_dot] after executing trigger action
+        Y_raw[0, :STATE_DIM] = obs_noisy[:STATE_DIM]
 
         # Initial W: 1 real state (trigger), action mask same as RTC
-        W = build_fbfm_W(n_unexecuted, n_real_states=1, H=H, token_dim=token_dim)
+        W = build_fbfm_W(n_unexecuted, n_real_states=1, H=H, token_dim=token_dim,
+                         d=d, s=s_chunk)
 
         if token_stats is not None:
             Y_norm = _normalize(Y_raw, token_stats)
         else:
             Y_norm = Y_raw
 
-        # env_feedback_fn closure
-        feedback_state = {"y_ptr": 1, "obs": obs_noisy.copy()}
+        # env_feedback_fn closure — returns (obs_3d, u, state_norm) where
+        # state_norm is the normalized real state for replacing Y in guidance
+        feedback_state = {"y_ptr": 1, "obs": obs_noisy.copy(), "t_fb": t_global}
         recorded_steps = []
 
         def env_feedback_fn():
             y_ptr = feedback_state["y_ptr"]
+            t_fb  = feedback_state["t_fb"]
             u = float(Y_raw[y_ptr, ACTION_IDX]) if y_ptr < n_unexecuted else 0.0
             feedback_state["y_ptr"] = y_ptr + 1
 
             obs_new, _, _, info_fb = env.step(u, add_obs_noise=True)
             feedback_state["obs"] = obs_new
+            feedback_state["t_fb"] = t_fb + 1
             recorded_steps.append({
                 "xs_true": info_fb["true_state"][0],
                 "xs_obs":  obs_new[0],
                 "u":       u,
                 "t":       info_fb["t"],
             })
-            return obs_new, u
+            obs_new_3d = np.append(obs_new, ref_seq[min(t_fb, T_total - 1)])  # (3,)
+            # Normalize real state for Y replacement in guided_inference
+            if token_stats is not None:
+                state_norm = (obs_new[:STATE_DIM] - token_stats["mean"][:STATE_DIM]) \
+                           / token_stats["std"][:STATE_DIM]
+            else:
+                state_norm = obs_new[:STATE_DIM]
+            return obs_new_3d, u, state_norm
 
         # Guided inference (W will be mutated inside for state dims)
         new_norm = guided_inference_fbfm(

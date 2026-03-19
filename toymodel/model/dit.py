@@ -6,7 +6,7 @@ Architecture overview:
     Output: v (velocity field)  — same shape as X^tau
 
     X^tau: (B, H, token_dim) = (B, 16, 3)  — each token is [x, x_dot, u]
-    obs:   (B, obs_dim)      = (B, 2)
+    obs:   (B, obs_dim)      = (B, 3)       — [x, x_dot, x_ref]
     tau:   (B,)              scalar in [0, 1]
 
     v:     (B, H, token_dim) = (B, 16, 3)
@@ -125,7 +125,7 @@ class FlowMatchingDiT(nn.Module):
 
     Shapes:
         X_tau: (B, H, token_dim) = (B, 16, 3)  — noisy token chunk
-        obs:   (B, obs_dim)      = (B, 2)       — conditioning state
+        obs:   (B, obs_dim)      = (B, 3)       — conditioning [x, x_dot, x_ref]
         tau:   (B,)              scalar ∈ [0,1]  — noise level
 
         v:     (B, H, token_dim) = (B, 16, 3)  — predicted velocity field
@@ -135,7 +135,7 @@ class FlowMatchingDiT(nn.Module):
         self,
         H: int         = 16,
         token_dim: int = 3,
-        obs_dim: int   = 2,
+        obs_dim: int   = 3,
         d_model: int   = 128,
         n_heads: int   = 4,
         n_layers: int  = 4,

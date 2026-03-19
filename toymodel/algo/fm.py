@@ -1,16 +1,16 @@
 """
 algo/fm.py — Baseline Flow Matching rollout (no guidance)
 
-Rollout rhythm (every large cycle):
-    - Execute s_chunk steps with the current token chunk
-    - Re-infer a new token chunk from scratch (vanilla FM, no feedback)
-    - Repeat
-
-This is the simplest baseline: the policy is blind to what happened
-during execution and simply re-plans every s_chunk steps.
+Rollout rhythm (with simulated inference delay, same as RTC/FBFM):
+    Bootstrap: infer first chunk from initial obs (no delay)
+    Each large cycle:
+        1. Trigger: execute chunk[chunk_ptr], capture obs_for_inference
+        2. Blind execution: execute d more steps from current chunk
+        3. Inference: sample_fm(obs_for_inference) -> new chunk (no guidance)
+        4. chunk_ptr = d (skip first d tokens — they correspond to blind period)
 
 Shapes throughout:
-    obs:     (obs_dim,)        = (2,)    — [x, x_dot]
+    obs:     (obs_dim,)        = (3,)    — [x, x_dot, x_ref]
     chunk:   (H, token_dim)    = (16, 3) — token sequence [x, x_dot, u]
     action:  scalar                      — u extracted from chunk[:, 2]
 """
@@ -33,66 +33,63 @@ def rollout_fm(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> dict:
     """
-    Vanilla FM rollout: re-infer every s_chunk steps, no feedback.
+    Vanilla FM rollout with simulated inference delay (same timing as RTC/FBFM).
 
-    Args:
-        policy:       trained FlowMatchingDiT
-        env:          MSDEnv (already reset to desired initial state)
-        ref_seq:      (T_total,) reference positions
-        s_chunk:      execution steps per inference cycle
-        n_steps:      FM denoising steps (default 20)
-        token_stats:  per-dim normalization stats for denormalization
-        device:       torch device
-
-    Returns:
-        dict with:
-            xs_true:   (T_total,)  true position trajectory
-            xs_obs:    (T_total,)  observed (noisy) position
-            actions:   (T_total,)  executed actions
-            times:     (T_total,)  time stamps
+    Rhythm: trigger(1) + blind(d) + inference -> new chunk from chunk[d]
     """
     T_total = len(ref_seq)
-
-    xs_true  = np.zeros(T_total)
-    xs_obs   = np.zeros(T_total)
-    actions  = np.zeros(T_total)
-    times    = np.zeros(T_total)
-
     H = policy.H
     token_dim = policy.token_dim
-    # 当前 token 块: (H, token_dim) = (16, 3)
-    current_chunk = np.zeros((H, token_dim), dtype=np.float32)
+    d = s_chunk - 1  # inference delay = blind execution steps
 
-    # chunk_ptr=H 确保主循环第一步立刻推理
-    chunk_ptr = H
+    xs_true = np.zeros(T_total)
+    xs_obs  = np.zeros(T_total)
+    actions = np.zeros(T_total)
+    times   = np.zeros(T_total)
 
-    obs = env.state.copy()  # (2,)
+    obs = np.append(env.state.copy(), ref_seq[0])  # (3,)
 
-    for t in range(T_total):
-        if chunk_ptr >= s_chunk:
-            current_chunk = sample_fm(
-                policy, obs, n_steps=n_steps,
-                device=device, token_stats=token_stats,
-            )  # (H, token_dim) 原始尺度
-            chunk_ptr = 0
+    # Bootstrap: first chunk, no delay
+    current_chunk = sample_fm(
+        policy, obs, n_steps=n_steps,
+        device=device, token_stats=token_stats,
+    )  # (H, token_dim)
+    chunk_ptr = 0
 
-        # 提取 action = token 的第 2 列 (u)
-        u = float(current_chunk[chunk_ptr, ACTION_IDX])
+    t_global = 0
+    while t_global < T_total:
+        # Trigger: execute one action, capture obs for next inference
+        u = float(current_chunk[chunk_ptr, ACTION_IDX]) if chunk_ptr < H else 0.0
         chunk_ptr += 1
-
         obs_noisy, _, _, info = env.step(u, add_obs_noise=True)
+        xs_true[t_global] = info["true_state"][0]
+        xs_obs[t_global]  = obs_noisy[0]
+        actions[t_global] = u
+        times[t_global]   = info["t"]
+        t_global += 1
+        obs_for_inference = np.append(obs_noisy, ref_seq[min(t_global, T_total - 1)])
 
-        xs_true[t]  = info["true_state"][0]
-        xs_obs[t]   = obs_noisy[0]
-        actions[t]  = u
-        times[t]    = info["t"]
+        # Blind execution: d steps using current chunk
+        for _ in range(d):
+            if t_global >= T_total:
+                break
+            u = float(current_chunk[chunk_ptr, ACTION_IDX]) if chunk_ptr < H else 0.0
+            chunk_ptr += 1
+            obs_noisy, _, _, info = env.step(u, add_obs_noise=True)
+            xs_true[t_global] = info["true_state"][0]
+            xs_obs[t_global]  = obs_noisy[0]
+            actions[t_global] = u
+            times[t_global]   = info["t"]
+            t_global += 1
 
-        obs = obs_noisy
+        # Inference: vanilla FM, no guidance (uses trigger-time obs)
+        current_chunk = sample_fm(
+            policy, obs_for_inference, n_steps=n_steps,
+            device=device, token_stats=token_stats,
+        )
+        chunk_ptr = d  # skip first d tokens (correspond to blind period)
 
     return {
-        "xs_true":  xs_true,
-        "xs_obs":   xs_obs,
-        "actions":  actions,
-        "times":    times,
-        "ref_seq":  ref_seq,
+        "xs_true": xs_true, "xs_obs": xs_obs,
+        "actions": actions, "times": times, "ref_seq": ref_seq,
     }

@@ -45,22 +45,22 @@ CFG = {
     # Model
     "H":         16,
     "token_dim": 3,
-    "obs_dim":   2,
+    "obs_dim":   3,
     "d_model":    128,
     "n_heads":    4,
     "n_layers":   4,
 
     # Training
-    "epochs":     200,
-    "batch_size": 256,
+    "epochs":     800,
+    "batch_size": 512,
     "lr":         3e-4,
     "weight_decay": 1e-5,
-    "lr_warmup_epochs": 10,
+    "lr_warmup_epochs": 50,
 
     # Checkpointing
     "ckpt_dir":   os.path.join(TOYMODEL_ROOT, "checkpoints"),
     "ckpt_name":  "fm_best.pt",
-    "save_every": 50,
+    "save_every": 400,
 
     # Misc
     "seed":   42,

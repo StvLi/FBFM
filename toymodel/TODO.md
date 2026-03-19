@@ -41,8 +41,8 @@
 | 3.3 Implement FM training loss: `‖v_θ(X^τ, o, τ) − (X¹−X⁰)‖²` | `train/train_fm.py` | ✅ | Linear interp `X^τ = τX¹ + (1−τ)X⁰` |
 | 3.4 Implement training loop with Adam, LR scheduler | `train/train_fm.py` | ✅ | Warmup + cosine decay; saves `checkpoints/fm_best.pt` |
 | 3.5 Implement `sample_fm(policy, obs, n_steps)` baseline inference | `model/inference.py` | ✅ | Euler ODE, verified shape `(16, 1)` |
-| 3.6 Verify training convergence (loss curve plot) | `train/train_fm.py` | ⬜ | **Pending GPU training** — run on RTX 4080 |
-| 3.7 Verify FM rollout on MSD (step + sinusoidal reference) | `model/inference.py` | ⬜ | **Pending GPU training** |
+| 3.6 Verify training convergence (loss curve plot) | `train/train_fm.py` | ✅ | 2026-03-18: 400 epoch on CUDA; best val loss=0.08095; `checkpoints/loss_curve.png` generated |
+| 3.7 Verify FM rollout on MSD (step + sinusoidal reference) | `model/inference.py` | ✅ | 2026-03-18: validated in Exp-A/B/C/D runner rollouts with trained checkpoint |
 
 ---
 
@@ -162,12 +162,52 @@ STATE_SLICE = slice(0, 2)
 
 ---
 
+## Module 7 — obs_dim 2→3 修复（x_ref conditioning）
+
+> **根因**：模型 conditioning 只有 `[x, x_dot]`，缺少 `x_ref`，导致模型对同一状态平均所有参考轨迹，产生近零 action，控制完全失效。
+> **修复**：obs 扩展为 `[x, x_dot, x_ref]`（obs_dim=3），需重新训练模型并重跑实验。
+
+| # | Task | File | Status | Notes |
+|---|------|------|--------|-------|
+| 7.1 | obs 追加 x_ref：`cat(states[:,0,:], refs[:,0,:])` → `(N,3)` | `model/dataset.py` | ✅ | |
+| 7.2 | 默认 `obs_dim=2` → `obs_dim=3` | `model/dit.py` | ✅ | 构造函数默认值 + shape 注释 |
+| 7.3 | CFG `obs_dim` 2→3 | `train/train_fm.py` | ✅ | |
+| 7.4 | shape 注释 `(B,2)` → `(B,3)` | `model/inference.py` | ✅ | 无逻辑改动 |
+| 7.5 | rollout obs append `ref_seq[t]` | `algo/fm.py` | ✅ | 初始 obs + 循环内 obs |
+| 7.6 | rollout obs append `ref_seq[t]` | `algo/rtc.py` | ✅ | bootstrap obs + trigger obs |
+| 7.7 | rollout obs + feedback closure append `ref_seq[t]` | `algo/fbfm.py` | ✅ | bootstrap + trigger + closure 内 t_fb 追踪 |
+| 7.8 | `load_policy` 默认 obs_dim fallback 2→3 | `experiments/runner.py` | ✅ | |
+| 7.9 | 更新 CLAUDE.md obs_dim 相关段落 | `CLAUDE.md` | ✅ | §2.1, §4.2, §4.3, §六 |
+| 7.10 | 重新训练模型（obs_dim=3） | `train/train_fm.py` | ⬜ | 需在 GPU 上执行 |
+| 7.11 | 重跑全部实验 | `experiments/run_all.py` | ⬜ | 依赖 7.10 |
+| 7.12 | 重新生成可视化 | `viz/plot_results.py` | ⬜ | 依赖 7.11 |
+
+---
+
+## Module 8 — RTC/FBFM guidance bug 修复
+
+> **根因 1（FBFM）**：guidance target Y 的 state 维度用了旧 chunk 预测值，而非真实观测。导致 guidance 把模型拉向错误 state（fbfm_no_feedback RMSE=1.28 反而优于 fbfm_full RMSE=2.15）。
+> **根因 2（RTC/FBFM）**：action mask 是 hard mask（所有非填充位=1），Paper Eq.5 要求 soft mask（frozen/decay/zero 三段式）。15 个旧 action 全部权重=1，过度约束模型。
+> **根因 3**：beta=10.0 对 MSD 系统过强，降至 3.0。
+
+| # | Task | File | Status | Notes |
+|---|------|------|--------|-------|
+| 8.1 | FBFM: trigger 后 Y[0].state 替换为真实 obs | `algo/fbfm.py` | ✅ | rollout 中 Y_raw[0,:2]=obs_noisy[:2] |
+| 8.2 | FBFM: feedback 后 Y[n].state 替换为归一化真实 state | `algo/fbfm.py` | ✅ | closure 返回 state_norm, inference 内替换 Y |
+| 8.3 | RTC: build_rtc_W 实现 Paper Eq.5 soft mask | `algo/rtc.py` | ✅ | frozen/exp-decay/zero 三段式 |
+| 8.4 | FBFM: build_fbfm_W action 维度同步 soft mask | `algo/fbfm.py` | ✅ | 同 RTC |
+| 8.5 | beta 默认值 10.0 → 3.0 | `experiments/runner.py` | ✅ | |
+| 8.6 | 更新 CLAUDE.md W 掩码约定 + beta | `CLAUDE.md` | ✅ | |
+| 8.7 | 重跑全部实验 | `experiments/run_all.py` | ⬜ | 依赖 7.10 |
+
+---
+
 ## Cross-Cutting Tasks
 
 | Task | Status | Notes |
 |------|--------|-------|
 | Write `requirements.txt` | ✅ | See below |
-| Final end-to-end smoke test (collect → train → eval → plot) | ⬜ | Run after GPU training completes |
+| Final end-to-end smoke test (collect → train → eval → plot) | ✅ | 2026-03-18: train(400ep) → run_all (Exp-A/B/C/D) → viz/plot_results completed |
 | device 默认值改为优先 CUDA | ✅ | 所有 `toymodel/` 下的 device 默认值已改 |
 | 工作范围约束写入 CLAUDE.md | ✅ | 只操作 `toymodel/` 子文件夹 |
 
@@ -178,10 +218,12 @@ STATE_SLICE = slice(0, 2)
 ```
 Module 1  MSD Environment       ████████████  100%  ✅
 Module 2  PID Expert Dataset    ████████████  100%  ✅  (6000 chunks, data/expert_dataset.npz)
-Module 3  DiT FM Model          ████████░░░░   80%  🔄  (code done, training pending on GPU)
-Module 4  Algorithm Comparison  ██████████░░   90%  🔄  (harness + experiments done; user implements RTC/FBFM core)
-Module 5  Visualization         ████████████  100%  ✅  (pending results data to render)
+Module 3  DiT FM Model          ████████████  100%  ✅  (GPU training complete, best val=0.08095)
+Module 4  Algorithm Comparison  ████████████  100%  ✅  (Exp-A/B/C/D executed; metrics saved)
+Module 5  Visualization         ████████████  100%  ✅  (all experiment figures rendered, PDF+PNG)
 Module 6  token_dim=3 重构     ████████████  100%  ✅  (13 文件全部修改完成)
+Module 7  obs_dim 2→3 修复    ████████░░░░   70%  🔄  (代码完成, 待重训+重跑实验)
+Module 8  guidance bug 修复   ████████░░░░   70%  🔄  (代码完成, 待重训+重跑实验)
 ```
 
-_Last updated: 2026-03-17 — token_dim=3 重构计划已确认, 待执行_
+_Last updated: 2026-03-18 — obs_dim fix + guidance bug fix code complete, awaiting retrain_

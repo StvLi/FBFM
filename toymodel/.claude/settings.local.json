@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "WebSearch",
+      "Bash(conda run:*)",
+      "Read(//home/ubt2204/Desktop/FBFM/toymodel/**)",
+      "Read(//tmp/**)"
     ]
   }
 }

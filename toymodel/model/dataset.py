@@ -6,7 +6,7 @@ Loads expert_dataset.npz and prepares (X0, X1, obs) triples for FM training.
 Flow Matching training setup:
     - X1: (H, token_dim) = (16, 3)  — clean token chunk (target)
     - X0: (H, token_dim) = (16, 3)  — noise sample ~ N(0, I)
-    - obs: (obs_dim,)    = (2,)     — conditioning observation (first state of chunk)
+    - obs: (obs_dim,)    = (3,)     — conditioning observation [x, x_dot, x_ref]
     - X_tau = tau * X1 + (1 - tau) * X0   — linear interpolation
     - target velocity: v_target = X1 - X0
 
@@ -38,7 +38,7 @@ class FlowMatchingDataset(Dataset):
     Shapes:
         H         = 16   (prediction horizon)
         token_dim = 3    ([x, x_dot, u])
-        obs_dim   = 2    ([x, x_dot])
+        obs_dim   = 3    ([x, x_dot, x_ref])
     """
 
     def __init__(
@@ -72,9 +72,10 @@ class FlowMatchingDataset(Dataset):
         self.tokens = torch.cat([states[:, 1:H+1, :], actions], dim=-1)  # (N, H, 3)
         self.token_dim = self.tokens.shape[-1]  # 3
 
-        # obs = initial state of the chunk (before any action)
-        self.obs = states[:, 0, :]  # (N, 2)
-        self.obs_dim = self.obs.shape[-1]  # 2
+        # obs = initial state + reference position → [x, x_dot, x_ref]
+        refs = torch.from_numpy(data["refs"]).float()  # (N, H, 1)
+        self.obs = torch.cat([states[:, 0, :], refs[:, 0, :]], dim=-1)  # (N, 3)
+        self.obs_dim = self.obs.shape[-1]  # 3
 
         # Per-dimension normalization stats
         if normalize:

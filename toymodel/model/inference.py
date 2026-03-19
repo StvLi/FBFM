@@ -8,7 +8,7 @@ Starting from X^0 ~ N(0, I), integrating n_steps gives X^1 (clean token chunk).
 
 Shapes:
     X:   (B, H, token_dim) = (B, 16, 3)
-    obs: (B, obs_dim)      = (B, 2)
+    obs: (B, obs_dim)      = (B, 3)
     tau: (B,)              scalar in [0, 1]
     v:   (B, H, token_dim) = (B, 16, 3)
 """

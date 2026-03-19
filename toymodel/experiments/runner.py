@@ -8,7 +8,7 @@ Usage:
     from experiments.runner import load_policy, run_three_algos
 
 Shapes:
-    obs:      (obs_dim,)       = (2,)
+    obs:      (obs_dim,)       = (3,)
     chunk:    (H, token_dim)   = (16, 3)  — each token [x, x_dot, u]
     result:   dict with xs_true / xs_obs / actions / times / ref_seq  — all (T,)
 """
@@ -44,13 +44,16 @@ def load_policy(
         token_stats: {'mean': np.array(3,), 'std': np.array(3,)}
         cfg:         training config dict
     """
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # PyTorch 2.6+ defaults to weights_only=True, which can fail for
+    # checkpoints storing numpy scalars in cfg/stats. This project saves
+    # trusted local checkpoints with metadata, so we explicitly disable it.
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg  = ckpt.get("cfg", {})
 
     policy = FlowMatchingDiT(
         H         = cfg.get("H",         16),
         token_dim = cfg.get("token_dim",  3),
-        obs_dim   = cfg.get("obs_dim",    2),
+        obs_dim   = cfg.get("obs_dim",    3),
         d_model   = cfg.get("d_model",  128),
         n_heads   = cfg.get("n_heads",    4),
         n_layers  = cfg.get("n_layers",   4),
@@ -97,14 +100,24 @@ def run_three_algos(
         "s_chunk": 5,
         "n_steps": 20,
         "n_inner": 4,
-        "beta":    10.0,
+        "beta":    3.0,
     }
     if algo_cfg:
         cfg.update(algo_cfg)
 
     results = {}
 
-    for algo_name in ["fm", "rtc", "fbfm"]:
+    def _set_rollout_seed(s: int):
+        """Set deterministic seeds so cross-algorithm comparisons are reproducible."""
+        np.random.seed(s)
+        torch.manual_seed(s)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+
+    for algo_idx, algo_name in enumerate(["fm", "rtc", "fbfm"]):
+        # Keep each algorithm rollout reproducible across repeated experiment runs.
+        _set_rollout_seed(seed + algo_idx)
+
         env = MSDEnv(
             m=env_cfg.get("m", 1.0),
             k=env_cfg.get("k", 2.0),

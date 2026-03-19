@@ -22,14 +22,14 @@
 
 ```python
 # token:  (batch, H, token_dim)  = (B, 16, 3) — [x, x_dot, u]
-# obs:    (batch, obs_dim)       = (B, 2)      — [x, x_dot]
+# obs:    (batch, obs_dim)       = (B, 3)      — [x, x_dot, x_ref]
 # chunk:  (H, token_dim)         = (16, 3)     — 单条 token 序列
 ```
 
 - `B`：batch size
 - `H`：prediction horizon（默认 16）
 - `token_dim = 3`（每个 token = [position x, velocity x_dot, action u]）
-- `obs_dim = 2`（conditioning observation = [x, x_dot]）
+- `obs_dim = 3`（conditioning observation = [x, x_dot, x_ref]）
 - `ACTION_IDX = 2`：token 中 action 所在的列索引
 - `STATE_SLICE = slice(0, 2)`：token 中 state 所在的列切片
 
@@ -42,7 +42,7 @@ Token[h] = [state_{h+1}, action_h]
 含义：执行 action_h 后得到的 state，与该 action 配对。
 
 数据集构造：`tokens = cat(states[:, 1:H+1, :], actions, dim=-1)` → `(N, H, 3)`
-obs 不变：`obs = states[:, 0, :]` → `(N, 2)`
+obs：`obs = cat(states[:, 0, :], refs[:, 0, :])` → `(N, 3)` = [x, x_dot, x_ref]
 
 ### 2.1.2 归一化格式（已确认 2026-03-17）
 
@@ -61,13 +61,15 @@ token_stats = {
 | 算法 | W 形状 | state 维度 (col 0-1) | action 维度 (col 2) |
 |------|--------|---------------------|---------------------|
 | FM   | 无引导 | — | — |
-| RTC  | `(H, 3)` | 始终 = 0 | 非零填充位 = 1 |
-| FBFM | `(H, 3)` | 仅真实观测位 = 1（随 feedback 递增） | 非零填充位 = 1（同 RTC） |
+| RTC  | `(H, 3)` | 始终 = 0 | soft mask (Paper Eq.5): frozen/decay/zero 三段式 |
+| FBFM | `(H, 3)` | 仅真实观测位 = 1（随 feedback 递增） | soft mask（同 RTC） |
 
-**关键原则**：预测的 state 不做数——只有真实执行后获取的 state 才参与引导。
-Action 掩码与 RTC 一致，遮掩后补的零位。
+**关键原则**：
+- 预测的 state 不做数——只有真实执行后获取的 state 才参与引导。
+- FBFM 的 guidance target Y 的 state 维度必须用真实观测替换（不能用旧 chunk 的预测值）。
+- Action 掩码使用 Paper Eq.5 的 soft mask：frozen 区=1, 中间区 exp 衰减, 新生成区=0。
 
-构造函数：`build_rtc_W(n_remaining, H, token_dim)` / `build_fbfm_W(n_remaining, n_real_states, H, token_dim)`
+构造函数：`build_rtc_W(n_remaining, H, token_dim, d, s)` / `build_fbfm_W(n_remaining, n_real_states, H, token_dim, d, s)`
 
 FBFM 推理中 W_state 随 feedback 逐步扩展：
 ```
@@ -156,7 +158,7 @@ class MSDEnv:
 # 文件: algo/rtc.py
 def guided_inference_rtc(
     policy,          # FlowMatchingDiT
-    obs,             # (obs_dim,) = (2,)
+    obs,             # (obs_dim,) = (3,) = [x, x_dot, x_ref]
     A_prev,          # (H, token_dim) = (16, 3) 归一化空间, 右补零至 H
     W,               # (H, token_dim) per-element mask (state=0, action=non-padded)
     n_steps=20,      # 去噪步数
@@ -171,7 +173,7 @@ def guided_inference_rtc(
 # 文件: algo/fbfm.py
 def guided_inference_fbfm(
     policy,          # FlowMatchingDiT
-    obs,             # (obs_dim,) = (2,) trigger 后的观测
+    obs,             # (obs_dim,) = (3,) = [x, x_dot, x_ref] trigger 后的观测
     X_prev,          # (H, token_dim) = (16, 3) 归一化空间, 右补零至 H
     W,               # (H, token_dim) per-element mask (state 随 feedback 递增)
     n_steps=20,      # 总去噪步数
@@ -229,11 +231,12 @@ sin_freq_range = [0.05, 0.25]  # Hz，不超过系统固有频率 0.225 Hz
 # Flow Matching
 H           = 16    # prediction horizon
 token_dim   = 3     # 每个 token = [x, x_dot, u]
+obs_dim     = 3     # conditioning = [x, x_dot, x_ref]
 n_denoising = 20    # 去噪步数（所有算法统一, 原为 16）
 n_inner     = 4     # FBFM 每轮推理链去噪步数
 
 # RTC/FBFM
-beta        = 10.0  # 最大引导权重
+beta        = 3.0   # 最大引导权重（从 10.0 降至 3.0，避免过度约束）
 s_chunk     = 5     # 每大周期执行步数（RTC/FBFM）
                     # = 1(trigger) + d(blind/feedback), d = n_denoising/n_inner - 1 = 4
 
@@ -294,3 +297,94 @@ mpl.rcParams.update({
 - 2026-03-17：**W 掩码从 (H,) 升级为 (H, token_dim) per-element mask**：废弃 dim_mask 参数。State 维度和 action 维度独立管理——action 同 RTC（遮掩零填充），state 仅真实观测有效（FBFM 中随 feedback 递增）。参考 `fbfm/policies/fbfm/modeling_rtc.py` 的设计思路。
   - `runner.py`: load_policy/run_three_algos 适配 token_dim/token_stats/n_steps=20
   - `exp_a/b/c/d.py`: action_stats → token_stats
+- 2026-03-18：**checkpoint 兼容性修复**：`experiments/runner.py` 的 `torch.load` 改为 `weights_only=False`，修复 PyTorch 2.6+ 默认 `weights_only=True` 导致的本地 checkpoint 反序列化失败（`numpy._core.multiarray.scalar`）问题。
+- 2026-03-18：**FM 训练完成（toymodel 本地）**：在 `wd` 环境 + CUDA 上完成 400 epoch 训练，`best val loss = 0.08095`；checkpoint 保存到 `toymodel/checkpoints/fm_best.pt`，loss 曲线保存到 `toymodel/checkpoints/loss_curve.png`。
+- 2026-03-18：**Exp-A/B/C/D 全量实验已运行并落盘**：`python experiments/run_all.py --ckpt checkpoints/fm_best.pt --device cuda` 成功完成，指标写入：
+  - `results/exp_a_mismatch/metrics.json`
+  - `results/exp_b_disturbance/metrics.json`
+  - `results/exp_c_ablation/metrics.json`
+  - `results/exp_d_sensitivity/metrics.json`
+- 2026-03-18：**可视化已生成（PDF + PNG）**：执行 `python viz/plot_results.py` 成功输出 8 张核心图（Exp-A 4 张, Exp-B 2 张, Exp-C 1 张, Exp-D 1 张），位于各 `results/exp_*/` 子目录。
+- 2026-03-18：**obs_dim 2→3 修复（x_ref conditioning）**：根因——模型只以 `[x, x_dot]` 为 conditioning，缺少 `x_ref`，导致模型对同一状态平均所有参考轨迹，产生近零 action。修复：obs 扩展为 `[x, x_dot, x_ref]`（obs_dim=3），涉及 9 个文件：`dataset.py`（cat refs[:,0,:]）、`dit.py`（默认 obs_dim=3）、`train_fm.py`（CFG obs_dim=3）、`inference.py`（注释）、`fm.py`/`rtc.py`/`fbfm.py`（rollout 中 obs append ref_seq）、`runner.py`（默认值）。需重新训练模型。
+- 2026-03-18：**RTC/FBFM guidance bug 修复**：两个根因——(1) FBFM 的 guidance target Y 的 state 维度用了旧 chunk 预测值而非真实观测，导致 guidance 把模型拉向错误 state（fbfm_no_feedback 反而优于 fbfm_full）。修复：trigger 后替换 Y[0].state 为真实 obs，每次 feedback 后替换 Y[n].state 为归一化真实 state。(2) RTC/FBFM 的 action mask 是 hard mask（所有非填充位=1），而 Paper Eq.5 要求 soft mask（frozen/decay/zero 三段式）。修复：`build_rtc_W`/`build_fbfm_W` 实现 Paper Eq.5 的 exp 衰减。(3) beta 从 10.0 降至 3.0。
+- 2026-03-19：**FM baseline 发散根因分析完成**。核心发现：
+
+  **1) 问题定位：skip-d chunk 衔接导致发散，模型本身没问题**
+  ```
+  No-skip (无延迟):  RMSE = 0.199  ← 模型质量很好
+  FM skip-d (d=4):   RMSE = 1.014  ← 发散
+  RTC skip-d:        RMSE = 1.191  ← guidance 无效
+  FBFM skip-d:       RMSE = 1.249  ← feedback 无效
+  ```
+
+  **2) 精确隔离实验确认根因**
+  ```
+  A) 当前实现 (blind=old action, skip to new[d]):   RMSE = 1.014  ← 发散
+  B) blind=NEW action, skip to new[d]:               RMSE = 0.200  ← 正常
+  C) blind=old action, blind后用实际state重推不skip:  RMSE = 0.199  ← 正常
+  ```
+  A→B 证明：发散原因是 blind 期间执行了 old chunk 的 action（而非 new chunk 的）。
+  A→C 证明：如果 blind 后不 skip 而是用实际 state 重推，问题完全消失。
+
+  **3) 根因机制：时间语义错位**
+  - Old chunk action[5:9] 是一条轨迹的「中段急刹车」（知道前面加速了 5 步）
+  - New chunk action[0:4] 是一条新轨迹的「开头温和减速」（有 16 步 horizon）
+  - 两者意图完全不同，blind 期间执行 old 的急刹车，但 new chunk 以为执行的是自己的温和减速
+  - Blind 结束时 actual state ≠ new chunk predicted state[d]，从 chunk[d] 执行的 action 基于错误 state
+
+  **4) RMSE 随 delay 步数指数增长**
+  ```
+  d=0: 0.199 | d=1: 0.208 | d=2: 0.367 | d=3: 0.546 | d=4: 1.014 | d=7: 2.437
+  ```
+
+  **5) RTC/FBFM guidance 无效的原因**
+  - RTC guidance 只修正 action 维度（W[:,:2]=0），state 预测仍基于 trigger obs 的 flow field
+  - beta 从 0 到 100，RMSE 几乎不变（1.01~1.19）
+  - FBFM feedback 执行的 action 仍来自 old chunk，obs_t 固定不变，guidance 导致 state/action 不自洽
+  - FBFM beta 增大反而更差（beta=0: 1.01, beta=30: 2.00）
+
+  **6) 诊断可视化已生成**（`viz/plot_results.py --diag-only`）：
+  - `diag_fig1_strategy_comparison`: 4 场景 no-skip vs skip-d 对比
+  - `diag_fig2_chunk_boundary`: chunk 边界 action 跳变 + state mismatch
+  - `diag_fig3_action_mismatch`: old vs new chunk blind-period action 对比
+  - `diag_fig4_single_chunk`: 单 chunk 模型预测 vs 真实动力学
+  - `diag_fig5_ood_analysis`: 训练数据 vs rollout obs 分布对比
+  - `diag_fig6_rmse_summary`: RMSE 汇总柱状图
+
+  **7) 根因确认：对照 RTC 官方开源实现 (Physical-Intelligence/real-time-chunking-kinetix)**
+
+  官方实现有两个我们缺失的关键机制：
+
+  **(a) 训练时 simulated_delay（model.py line 280-289）**：
+  训练时随机采样 delay d，前 d 位 tau=1.0（clean data，不加噪），后 H-d 位正常加噪。
+  Loss 只计算后 H-d 位。模型在训练阶段就学会了「前 d 位是已确定的 action，后面的预测要与之保持连续性」。
+
+  **(b) 推理时 inpainting（model.py line 253-257）**：
+  每一步去噪中，前 d 位被**强制替换**为 old chunk 的值，且 tau 设为 1.0（per-position tau）。
+  模型看到前 d 位是 clean data，自动让后续 action 与之衔接。
+
+  **(c) 执行逻辑（eval_flow.py line 119-127）**：
+  ```python
+  action_to_execute = concat([
+      old_chunk[:, :delay],                    # 前 d 步：执行 old chunk
+      new_chunk[:, delay:execute_horizon],     # 后面：执行 new chunk 从 d 开始
+  ])
+  ```
+  执行逻辑和我们一致（blind 用 old，之后用 new[d:]），但因为 inpainting 保证了
+  new_chunk[0:d] ≈ old_chunk[0:d]，所以 new_chunk[d] 的 action 是基于正确的
+  state 前提设计的——state 连续性由 inpainting + 训练时 simulated_delay 共同保证。
+
+  **我们缺失的**：
+  1. 训练时没有 simulated_delay → 模型从未见过 per-position tau
+  2. 模型只接受标量 tau，不支持 per-position tau
+  3. 推理时没有 inpainting → 前 d 位不会被强制替换为 old chunk
+  4. 只靠 guidance 软约束拉向 old chunk，无法保证前 d 位完全一致
+
+  **结论**：FM baseline 发散不是 FM 算法的固有缺陷，而是我们的实现缺少 RTC 论文中的
+  inpainting + simulated_delay 训练机制。这两个机制共同保证了 new chunk 的前 d 位
+  与 old chunk 一致，从而让 chunk[d] 的 action 基于正确的 state 前提。
+
+  **8) 后续修复方向**：
+  - 方案 A：在 DiT 中支持 per-position tau，训练时加入 simulated_delay，推理时做 inpainting
+  - 方案 B：不改训练，只在推理时做 inpainting（需验证效果，因为模型没见过 per-position tau）
+  - 方案 C：保持当前模型，改用不 skip 的 rollout（blind 后用实际 state 重推，RMSE=0.199）
