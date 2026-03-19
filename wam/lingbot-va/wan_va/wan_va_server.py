@@ -267,6 +267,12 @@ class VA_Server:
         action_tensor = action_model_input[0, ..., 0]
         return rearrange(action_tensor, 'c f h -> (f h) c').detach().cpu()
 
+    def _flatten_state_constraints(self, latent_model_input: torch.Tensor) -> torch.Tensor:
+        # PrevChunk stores state constraints as (T_state, D_state), so flatten each
+        # latent frame into one row before appending feedback observations.
+        latent_tensor = latent_model_input[0]
+        return rearrange(latent_tensor, 'c f h w -> f (c h w)').detach().cpu()
+
     def _get_t5_prompt_embeds(
         self,
         prompt=None,
@@ -736,8 +742,16 @@ class VA_Server:
     def _feedback(self, obs):
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
+        if latent_model_input is None:
+            return
+        if self.prev_chunk_left_over is None:
+            logger.warning("feedback received before PrevChunk initialization; skip current feedback")
+            return
+
+        flattened_state = self._flatten_state_constraints(latent_model_input)
         # 2. 将latent输入加入反馈队列（权重自主维护）
-        self.prev_chunk_left_over.append_new_state(latent_model_input)
+        for state_step in flattened_state:
+            self.prev_chunk_left_over.append_new_state(state_step)
         
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
