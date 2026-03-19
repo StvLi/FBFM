@@ -83,16 +83,22 @@ def guided_inference_rtc(
     W: np.ndarray,              # (H, token_dim) per-element mask
     n_steps: int = 20,
     beta: float = 10.0,
+    d: int = 0,                 # inference delay — first d positions are inpainted
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> np.ndarray:                # (H, token_dim)  normalised
     """
-    RTC guided Flow Matching inference.
+    RTC guided Flow Matching inference with inpainting.
 
-    W is now (H, token_dim) per-element mask — for RTC only the action column
+    W is (H, token_dim) per-element mask — for RTC only the action column
     is non-zero (state columns are always 0).
 
+    Inpainting: at each denoising step, the first d positions of X are
+    replaced with A_prev[:d] (clean old-chunk values), and per-position
+    tau is set to 1.0 for those positions.
+
     Algorithm per denoising step τ:
-        v = policy(X^τ, obs, τ)
+        INPAINT: X[:, :d] = A_prev[:d], tau[:d] = 1.0
+        v = policy(X^τ, obs, τ_pp)
         X̂¹ = X^τ + (1−τ)·v
         e = (Y − X̂¹) * W             ← per-element mask
         g = eᵀ · ∂X̂¹/∂X^τ            ← VJP via autograd
@@ -106,6 +112,7 @@ def guided_inference_rtc(
         W:       (H, token_dim) per-element mask
         n_steps: denoising steps (default 20)
         beta:    max guidance weight
+        d:       inference delay (frozen prefix length for inpainting)
         device:  torch device
 
     Returns:
@@ -120,14 +127,23 @@ def guided_inference_rtc(
     W_t   = torch.from_numpy(W.astype(np.float32)).to(device).unsqueeze(0)        # (1,H,D)
 
     X = torch.randn(1, H, token_dim, device=device)
-    dt = 1.0 / n_steps
+    dt_step = 1.0 / n_steps
 
     for i in range(n_steps):
-        tau_val = max(i * dt, 1e-4)
-        tau_t = torch.full((1,), tau_val, dtype=torch.float32, device=device)
+        tau_val = max(i * dt_step, 1e-4)
+
+        # Inpainting: force first d positions to old chunk (clean)
+        if d > 0:
+            X = X.detach()
+            X[:, :d, :] = Y[:, :d, :]
+
+        # Per-position tau: (1, H)
+        tau_pp = torch.full((1, H), tau_val, dtype=torch.float32, device=device)
+        if d > 0:
+            tau_pp[:, :d] = 1.0  # frozen positions are clean
 
         X = X.detach().requires_grad_(True)
-        v = policy(X, obs_t, tau_t)
+        v = policy(X, obs_t, tau_pp)
 
         one_minus_tau = 1.0 - tau_val
         X_hat1 = X + one_minus_tau * v
@@ -144,7 +160,11 @@ def guided_inference_rtc(
         )[0]
 
         v_guided = v.detach() + k_p * g
-        X = X.detach() + dt * v_guided
+        X = X.detach() + dt_step * v_guided
+
+    # Final inpainting clamp
+    if d > 0:
+        X[:, :d, :] = Y[:, :d, :]
 
     return X[0].detach().cpu().numpy()
 
@@ -235,10 +255,10 @@ def rollout_rtc(
             times[t_global]   = info["t"]
             t_global += 1
 
-        # Guided inference
+        # Guided inference with inpainting
         new_norm = guided_inference_rtc(
             policy, obs_for_inference, A_prev, W,
-            n_steps=n_steps, beta=beta, device=device,
+            n_steps=n_steps, beta=beta, d=d, device=device,
         )
         current_chunk = _denormalize(new_norm, token_stats) if token_stats else new_norm
         chunk_ptr = d

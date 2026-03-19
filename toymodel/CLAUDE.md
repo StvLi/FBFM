@@ -133,8 +133,8 @@ rollout 每个大周期:
 |---|------|------|------|
 | 1 | MSD 仿真环境 | `sim/msd_env.py` | ✅ 完成 |
 | 2 | PID 专家数据集 | `sim/pid_controller.py`, `data/collect_dataset.py` | ✅ 完成 |
-| 3 | DiT FM 模型 (token_dim=3) | `model/dit.py`, `model/dataset.py`, `train/train_fm.py` | ✅ 代码完成（待 GPU 训练） |
-| 4 | 三算法 (token_dim=3, n_steps=20) | `algo/fm.py`, `algo/rtc.py`, `algo/fbfm.py` | ✅ 全部实现 |
+| 3 | DiT FM 模型 (token_dim=3, per-position tau) | `model/dit.py`, `model/dataset.py`, `train/train_fm.py` | ✅ 代码完成（含 simulated_delay，待 GPU 重新训练） |
+| 4 | 三算法 (token_dim=3, n_steps=20, inpainting) | `algo/fm.py`, `algo/rtc.py`, `algo/fbfm.py` | ✅ 全部实现（含 inpainting + per-position tau） |
 | 5 | 实验脚本 | `experiments/runner.py`, `exp_a/b/c/d.py`, `run_all.py` | ✅ 完成 |
 | 6 | 可视化 | `viz/plot_results.py` | ✅ 完成（待结果数据渲染） |
 
@@ -152,7 +152,7 @@ class MSDEnv:
     def get_params() -> dict           # 返回 {m, k, c, dt}
 ```
 
-### 4.2 RTC 核心函数（已实现）
+### 4.2 RTC 核心函数（已实现，含 inpainting）
 
 ```python
 # 文件: algo/rtc.py
@@ -163,11 +163,12 @@ def guided_inference_rtc(
     W,               # (H, token_dim) per-element mask (state=0, action=non-padded)
     n_steps=20,      # 去噪步数
     beta=10.0,       # 最大引导权重
+    d=0,             # inpainting delay: 前 d 位强制替换为 A_prev, tau=1.0
     device=...,
 ) -> np.ndarray:     # (H, token_dim) 归一化空间
 ```
 
-### 4.3 FBFM 核心函数（已实现）
+### 4.3 FBFM 核心函数（已实现，含 inpainting）
 
 ```python
 # 文件: algo/fbfm.py
@@ -179,10 +180,28 @@ def guided_inference_fbfm(
     n_steps=20,      # 总去噪步数
     n_inner=4,       # 每 block 去噪步数
     beta=10.0,       # 最大引导权重
-    env_feedback_fn=None,  # () -> (obs_new, u_executed)
+    env_feedback_fn=None,  # () -> (obs_new, u_executed, state_norm)
     device=...,
 ) -> np.ndarray:     # (H, token_dim) 归一化空间
+# d = n_blocks - 1 = 4 在函数内部计算
+# 每步去噪: inpaint X[:,:d] = X_prev[:d], tau[:d] = 1.0
 # W 在函数内部随 feedback 动态扩展 state 维度的有效范围
+# feedback 更新 Y 的 state 后, inpaint 自动将 real state 传播到 X 的 frozen 区域
+```
+
+### 4.4 FM 推理函数（已实现，含 inpainting）
+
+```python
+# 文件: model/inference.py
+def sample_fm(
+    policy,              # FlowMatchingDiT
+    obs,                 # (obs_dim,) or (B, obs_dim)
+    n_steps=20,          # 去噪步数
+    device=...,
+    token_stats=None,    # {'mean': (3,), 'std': (3,)} 用于反归一化
+    prev_chunk_norm=None,# (H, token_dim) 归一化 old chunk, 用于 inpainting
+    d=0,                 # inpainting delay: 前 d 位强制替换, tau=1.0
+) -> np.ndarray:         # (H, token_dim) 反归一化空间 (若提供 token_stats)
 ```
 
 ---
@@ -234,6 +253,12 @@ token_dim   = 3     # 每个 token = [x, x_dot, u]
 obs_dim     = 3     # conditioning = [x, x_dot, x_ref]
 n_denoising = 20    # 去噪步数（所有算法统一, 原为 16）
 n_inner     = 4     # FBFM 每轮推理链去噪步数
+
+# Simulated Delay + Inpainting（2026-03-19 新增）
+simulated_delay = 4 # 训练时最大 delay 步数, delay ∈ {0,1,2,3,4}
+                    # 推理时 inpainting d = s_chunk - 1 = 4
+                    # tau: (B,) 标量 或 (B,H) per-position
+                    # frozen 位 tau=1.0, active 位 tau~U(0,1)
 
 # RTC/FBFM
 beta        = 3.0   # 最大引导权重（从 10.0 降至 3.0，避免过度约束）
@@ -388,3 +413,71 @@ mpl.rcParams.update({
   - 方案 A：在 DiT 中支持 per-position tau，训练时加入 simulated_delay，推理时做 inpainting
   - 方案 B：不改训练，只在推理时做 inpainting（需验证效果，因为模型没见过 per-position tau）
   - 方案 C：保持当前模型，改用不 skip 的 rollout（blind 后用实际 state 重推，RMSE=0.199）
+
+- 2026-03-19：**Per-Position Tau + Simulated Delay + Inpainting 实现完成（方案 A）**
+
+  采用方案 A（最小改动路径），不重写 DiT 为 AdaLN 架构，而是在现有 cross-attention 架构上添加 per-position tau 支持。涉及 6 个文件的修改，全部通过语法检查。**旧 checkpoint 不兼容，需重新训练。**
+
+  **修改文件清单与具体改动：**
+
+  **(1) `model/dit.py` — 支持 per-position tau**
+
+  - `sinusoidal_embedding(tau, dim)`：原先只接受 `tau: (B,)` 返回 `(B, dim)`；现在同时支持 `tau: (B, H)` 返回 `(B, H, dim)`。通过 `tau.ndim` 分支处理。
+  - `FlowMatchingDiT.forward(X_tau, obs, tau)`：tau 注入方式从 cross-attention context 改为 per-position additive embedding。
+    - 原先：`tau_emb (B, d_model)` 和 `obs_emb (B, d_model)` stack 为 `context (B, 2, d_model)` 作为 cross-attention 的 key/value。
+    - 现在：`tau (B,)` 先 broadcast 到 `(B, H)`（或直接接受 `(B, H)`），经 `sinusoidal_embedding → tau_proj` 得到 `tau_emb (B, H, d_model)`，**直接加到 tokens 上**（与 pos_emb 同级）。Cross-attention context 只保留 `obs_emb (B, 1, d_model)`。
+  - 设计理由：官方 RTC 用 AdaLN 注入 per-position tau（通过 adaptive layer norm 的 scale/shift），改动量大。我们选择 additive embedding，效果类似——每个 position 都能感知自己的 tau 值（frozen 位 tau=1.0 vs active 位 tau∈[0,1]），且不需要重写 DiTBlock。
+  - 权重兼容性：`tau_proj` 的输入维度不变（仍是 d_model→d_model），但语义变了（原先处理标量 tau 的 embedding，现在处理 per-position 的）。`token_proj`、`pos_emb`、`blocks`、`out_proj` 结构不变，但因为 tau 注入方式改变，旧权重无法直接使用。
+
+  **(2) `train/train_fm.py` — 添加 simulated_delay 训练**
+
+  - CFG 新增 `"simulated_delay": 4`（最大 delay 步数，与 `d = s_chunk - 1 = 4` 一致）。
+  - `fm_loss` 函数重写：
+    - 采样 delay `d ∈ {0, 1, 2, 3, 4}`，指数权重分布（小 d 概率高）。
+    - 构造 per-position frozen mask `(B, H)`：前 d 位 = True。
+    - 构造 per-position tau `(B, H)`：frozen 位 = 1.0，其余位 = 共享标量 `tau ~ U(0,1)`。
+    - Per-position 插值：`X_tau = tau_pp * X1 + (1 - tau_pp) * X0`。Frozen 位 tau=1.0 → X_tau = X1（clean data）。
+    - Loss 只计算非 frozen 位：`loss = sum(sq_err * mask) / (mask.sum() * token_dim)`。
+  - 训练/验证循环中 `fm_loss` 调用新增 `max_delay=cfg["simulated_delay"]` 参数。
+
+  **(3) `model/inference.py` — 添加 inpainting 推理**
+
+  - `sample_fm` 新增参数 `prev_chunk_norm: (H, token_dim)` 和 `d: int`。
+  - 每步去噪中：若 `d > 0`，先将 `X[:, :d, :]` 替换为 `prev_chunk_norm[:d]`（hard replacement），然后构造 per-position tau `(B, H)`，frozen 位设为 1.0。
+  - 最终输出前再做一次 inpainting clamp，确保前 d 位完全等于 old chunk。
+  - Bootstrap 调用（无 old chunk）不传 inpainting 参数，行为与原先一致。
+
+  **(4) `algo/fm.py` — FM rollout 传入 inpainting 参数**
+
+  - 新增 `_normalize` helper。
+  - 每个大周期推理前，构造 `prev_chunk_norm`：old chunk 的未执行尾部 `current_chunk[chunk_ptr:]` 右补零至 `(H, token_dim)`，归一化后传入 `sample_fm`。
+  - `sample_fm` 调用新增 `prev_chunk_norm=prev_norm, d=d`。
+
+  **(5) `algo/rtc.py` — RTC guided inference 添加 inpainting + per-position tau**
+
+  - `guided_inference_rtc` 新增参数 `d: int = 0`。
+  - 每步去噪中：先 inpaint `X[:, :d, :] = Y[:, :d, :]`，然后构造 per-position tau `(1, H)`，frozen 位 = 1.0。
+  - 最终输出前 inpainting clamp。
+  - `rollout_rtc` 中 `guided_inference_rtc` 调用新增 `d=d`。
+
+  **(6) `algo/fbfm.py` — FBFM guided inference 添加 inpainting + per-position tau**
+
+  - `guided_inference_fbfm` 内部计算 `d = n_blocks - 1 = 4`。
+  - 每步去噪中：先 inpaint `X[:, :d, :] = Y[:, :d, :]`，然后构造 per-position tau `(1, H)`，frozen 位 = 1.0。
+  - Inpainting 与 feedback 的交互：feedback 更新 Y 的 state 维度（positions 1,2,3 在 inpainted 区域内），下一步 inpainting 自动将更新后的 Y 值复制到 X 中——即 inpainted 区域内的 real state 通过 hard replacement 传播，inpainted 区域外的 real state（position 4）通过 guidance soft constraint 传播。
+  - 最终输出前 inpainting clamp。
+
+  **正确性验证清单：**
+
+  | 检查项 | 结果 |
+  |--------|------|
+  | `sinusoidal_embedding` (B,H) → (B,H,dim) shape | ✅ `unsqueeze(-1) * freqs[None,None,:]` 正确 |
+  | `tau_proj` 接受 3D 输入 (B,H,d_model) | ✅ `nn.Linear` 对最后一维操作，支持任意前导维度 |
+  | delay 采样范围 {0..max_delay} 包含 d=4 | ✅ `arange(max_delay+1, 0, -1)` 产生 5 个权重 |
+  | Loss 归一化：per-element mean over active positions | ✅ `sum / (mask.sum() * token_dim)` |
+  | Inpainting 在 autograd 前执行（RTC/FBFM） | ✅ 先 `X.detach()` + inpaint，再 `requires_grad_(True)` |
+  | FBFM feedback 更新 Y 后 inpainting 自动传播 | ✅ positions 1-3 在 :d 内，通过 Y mutation + inpaint 传播 |
+  | Bootstrap 调用无 inpainting（d=0 或无 prev_chunk） | ✅ FM/RTC/FBFM 首次推理均不传 inpainting 参数 |
+  | 6 个文件语法检查 | ✅ 全部通过 `py_compile` |
+
+  **后续步骤**：重新训练模型（`python train/train_fm.py`），然后重新运行实验和可视化。

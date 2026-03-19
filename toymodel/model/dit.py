@@ -7,16 +7,19 @@ Architecture overview:
 
     X^tau: (B, H, token_dim) = (B, 16, 3)  — each token is [x, x_dot, u]
     obs:   (B, obs_dim)      = (B, 3)       — [x, x_dot, x_ref]
-    tau:   (B,)              scalar in [0, 1]
+    tau:   (B,) or (B, H)    scalar or per-position in [0, 1]
 
     v:     (B, H, token_dim) = (B, 16, 3)
 
 Design choices (lightweight for MSD toy problem):
     - Each timestep token (token_dim,) projected to (d_model,) as one sequence token
-    - Sinusoidal tau embedding → projected to d_model
-    - obs linearly projected to d_model
+    - Per-position sinusoidal tau embedding → projected to d_model, added to tokens
+    - obs linearly projected to d_model, used as cross-attention context
     - N_layers transformer blocks with cross-attention (obs as key/value)
     - Final linear head → (B, H, token_dim)
+
+    tau can be scalar (B,) or per-position (B, H) to support simulated_delay
+    training and inpainting inference (frozen positions get tau=1.0).
 
 This is intentionally small (d_model=128, N_layers=4) to train fast on CPU.
 """
@@ -33,14 +36,14 @@ import torch.nn.functional as F
 
 def sinusoidal_embedding(tau: torch.Tensor, dim: int) -> torch.Tensor:
     """
-    Sinusoidal embedding for scalar tau ∈ [0, 1].
+    Sinusoidal embedding for tau ∈ [0, 1].
 
     Args:
-        tau: (B,) — noise level
+        tau: (B,) or (B, H) — noise level (scalar or per-position)
         dim: int  — embedding dimension (must be even)
 
     Returns:
-        emb: (B, dim)
+        emb: (B, dim) if tau is (B,), or (B, H, dim) if tau is (B, H)
     """
     assert dim % 2 == 0
     half = dim // 2
@@ -48,10 +51,18 @@ def sinusoidal_embedding(tau: torch.Tensor, dim: int) -> torch.Tensor:
     freqs = torch.exp(
         -math.log(10000) * torch.arange(half, dtype=torch.float32, device=tau.device) / half
     )
-    # args: (B, half)
-    args = tau[:, None] * freqs[None, :]
-    # emb: (B, dim)
-    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+    if tau.ndim == 1:
+        # (B,) → (B, dim)
+        args = tau[:, None] * freqs[None, :]          # (B, half)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, dim)
+    elif tau.ndim == 2:
+        # (B, H) → (B, H, dim)
+        args = tau.unsqueeze(-1) * freqs[None, None, :]  # (B, H, half)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, H, dim)
+    else:
+        raise ValueError(f"tau must be 1D or 2D, got ndim={tau.ndim}")
+
     return emb
 
 
@@ -184,7 +195,7 @@ class FlowMatchingDiT(nn.Module):
         self,
         X_tau: torch.Tensor,  # (B, H, token_dim)
         obs:   torch.Tensor,  # (B, obs_dim)
-        tau:   torch.Tensor,  # (B,)
+        tau:   torch.Tensor,  # (B,) scalar or (B, H) per-position
     ) -> torch.Tensor:
         """
         Returns:
@@ -195,15 +206,22 @@ class FlowMatchingDiT(nn.Module):
         # tokens: (B, H, d_model)
         tokens = self.token_proj(X_tau) + self.pos_emb
 
-        # tau_emb: (B, d_model)
-        tau_emb = self.tau_proj(sinusoidal_embedding(tau, self.d_model))
-        # obs_emb: (B, d_model)
-        obs_emb = self.obs_proj(obs)
-        # context: (B, 2, d_model)
-        context = torch.stack([tau_emb, obs_emb], dim=1)
+        # Per-position tau embedding added directly to tokens
+        if tau.ndim == 1:
+            # (B,) → broadcast to (B, H)
+            tau_pp = tau[:, None].expand(-1, self.H)  # (B, H)
+        else:
+            tau_pp = tau  # already (B, H)
+
+        # tau_emb: (B, H, d_model) — per-position
+        tau_emb = self.tau_proj(sinusoidal_embedding(tau_pp, self.d_model))
+        tokens = tokens + tau_emb
+
+        # obs_emb: (B, 1, d_model) — cross-attention context (obs only)
+        obs_emb = self.obs_proj(obs).unsqueeze(1)  # (B, 1, d_model)
 
         for block in self.blocks:
-            tokens = block(tokens, context)
+            tokens = block(tokens, obs_emb)
 
         # v: (B, H, token_dim)
         v = self.out_proj(self.out_norm(tokens))

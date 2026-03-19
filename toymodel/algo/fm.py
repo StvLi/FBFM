@@ -1,12 +1,14 @@
 """
-algo/fm.py — Baseline Flow Matching rollout (no guidance)
+algo/fm.py — Baseline Flow Matching rollout (no guidance, with inpainting)
 
 Rollout rhythm (with simulated inference delay, same as RTC/FBFM):
-    Bootstrap: infer first chunk from initial obs (no delay)
+    Bootstrap: infer first chunk from initial obs (no delay, no inpainting)
     Each large cycle:
         1. Trigger: execute chunk[chunk_ptr], capture obs_for_inference
         2. Blind execution: execute d more steps from current chunk
-        3. Inference: sample_fm(obs_for_inference) -> new chunk (no guidance)
+        3. Inference: sample_fm(obs_for_inference, prev_chunk, d) -> new chunk
+           Inpainting ensures new_chunk[:d] ≈ old_chunk[:d], preserving
+           action continuity across chunk boundaries.
         4. chunk_ptr = d (skip first d tokens — they correspond to blind period)
 
 Shapes throughout:
@@ -23,6 +25,10 @@ from model.inference import sample_fm
 ACTION_IDX = 2  # index of action dimension within the token
 
 
+def _normalize(arr, stats):
+    return (arr - stats["mean"]) / stats["std"]
+
+
 def rollout_fm(
     policy: FlowMatchingDiT,
     env,                        # MSDEnv instance (already reset)
@@ -33,7 +39,7 @@ def rollout_fm(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> dict:
     """
-    Vanilla FM rollout with simulated inference delay (same timing as RTC/FBFM).
+    FM rollout with simulated inference delay and inpainting.
 
     Rhythm: trigger(1) + blind(d) + inference -> new chunk from chunk[d]
     """
@@ -49,7 +55,7 @@ def rollout_fm(
 
     obs = np.append(env.state.copy(), ref_seq[0])  # (3,)
 
-    # Bootstrap: first chunk, no delay
+    # Bootstrap: first chunk, no delay, no inpainting
     current_chunk = sample_fm(
         policy, obs, n_steps=n_steps,
         device=device, token_stats=token_stats,
@@ -82,10 +88,18 @@ def rollout_fm(
             times[t_global]   = info["t"]
             t_global += 1
 
-        # Inference: vanilla FM, no guidance (uses trigger-time obs)
+        # Build prev_chunk_norm for inpainting: old chunk's unexecuted tail, right-padded
+        n_remaining = H - chunk_ptr
+        prev_raw = np.zeros((H, token_dim), dtype=np.float32)
+        if n_remaining > 0:
+            prev_raw[:n_remaining] = current_chunk[chunk_ptr:]
+        prev_norm = _normalize(prev_raw, token_stats) if token_stats else prev_raw
+
+        # Inference with inpainting: first d positions forced to old chunk
         current_chunk = sample_fm(
             policy, obs_for_inference, n_steps=n_steps,
             device=device, token_stats=token_stats,
+            prev_chunk_norm=prev_norm, d=d,
         )
         chunk_ptr = d  # skip first d tokens (correspond to blind period)
 

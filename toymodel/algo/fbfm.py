@@ -120,19 +120,25 @@ def guided_inference_fbfm(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> np.ndarray:                # (H, token_dim) normalised
     """
-    FBFM guided inference with real-time feedback.
+    FBFM guided inference with real-time feedback and inpainting.
 
     W is (H, token_dim) and is MUTATED during inference:
         After each feedback call, state mask gains 1 more position.
         Action mask stays fixed.
 
-    Structure (n_steps=20, n_inner=4 → n_blocks=5):
+    Inpainting: the first d positions (where d = n_blocks - 1) are forced
+    to match X_prev (old chunk) at each denoising step, with per-position
+    tau=1.0 for those positions. This ensures action continuity.
+
+    Structure (n_steps=20, n_inner=4 → n_blocks=5, d=4):
         for block in range(5):
             for inner in range(4):
+                INPAINT: X[:, :d] = X_prev[:d], tau[:d] = 1.0
                 denoising step with current W
             if block < 4:
                 env_feedback_fn() → update obs
                 W[:, :STATE_DIM] expands by 1 position
+                Y state at new position replaced with real obs
 
     Args:
         policy:          FlowMatchingDiT (eval, on device)
@@ -153,13 +159,14 @@ def guided_inference_fbfm(
     H = policy.H
     token_dim = policy.token_dim
     n_blocks = n_steps // n_inner
+    d = n_blocks - 1  # inference delay for inpainting
 
     obs_t = torch.from_numpy(obs.astype(np.float32)).to(device).unsqueeze(0)
     Y     = torch.from_numpy(X_prev.astype(np.float32)).to(device).unsqueeze(0)
     W_t   = torch.from_numpy(W.copy().astype(np.float32)).to(device).unsqueeze(0)  # (1,H,D), mutable
 
     X = torch.randn(1, H, token_dim, device=device)
-    dt = 1.0 / n_steps
+    dt_step = 1.0 / n_steps
 
     # Track how many real state positions exist for progressive expansion
     n_real_states = int(W[:, 0].sum())  # derive from initial mask
@@ -167,11 +174,20 @@ def guided_inference_fbfm(
     for block in range(n_blocks):
         for inner in range(n_inner):
             step_idx = block * n_inner + inner
-            tau_val = max(step_idx * dt, 1e-4)
-            tau_t = torch.full((1,), tau_val, dtype=torch.float32, device=device)
+            tau_val = max(step_idx * dt_step, 1e-4)
+
+            # Inpainting: force first d positions to old chunk (clean)
+            if d > 0:
+                X = X.detach()
+                X[:, :d, :] = Y[:, :d, :]
+
+            # Per-position tau: (1, H)
+            tau_pp = torch.full((1, H), tau_val, dtype=torch.float32, device=device)
+            if d > 0:
+                tau_pp[:, :d] = 1.0  # frozen positions are clean
 
             X = X.detach().requires_grad_(True)
-            v = policy(X, obs_t, tau_t)
+            v = policy(X, obs_t, tau_pp)
 
             one_minus_tau = 1.0 - tau_val
             X_hat1 = X + one_minus_tau * v
@@ -188,7 +204,7 @@ def guided_inference_fbfm(
             )[0]
 
             v_guided = v.detach() + k_p * g
-            X = X.detach() + dt * v_guided
+            X = X.detach() + dt_step * v_guided
 
         # Feedback after every block except the last
         if block < n_blocks - 1 and env_feedback_fn is not None:
@@ -203,6 +219,10 @@ def guided_inference_fbfm(
                 # Replace Y state at this position with REAL observed state
                 state_t = torch.from_numpy(state_norm.astype(np.float32)).to(device)
                 Y[0, n_real_states - 1, :STATE_DIM] = state_t
+
+    # Final inpainting clamp
+    if d > 0:
+        X[:, :d, :] = Y[:, :d, :]
 
     return X[0].detach().cpu().numpy()
 

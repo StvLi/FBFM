@@ -50,6 +50,9 @@ CFG = {
     "n_heads":    4,
     "n_layers":   4,
 
+    # Simulated delay (RTC-style per-position tau training)
+    "simulated_delay": 4,  # max delay d, matches s_chunk - 1
+
     # Training
     "epochs":     800,
     "batch_size": 512,
@@ -82,32 +85,57 @@ def fm_loss(
     X1: torch.Tensor,    # (B, H, token_dim) — clean chunk
     obs: torch.Tensor,   # (B, obs_dim)
     device: str,
+    max_delay: int = 4,
 ) -> torch.Tensor:
     """
-    Compute one-step FM loss for a batch.
+    Compute one-step FM loss with simulated delay (per-position tau).
+
+    For each sample, a delay d is drawn from a weighted distribution [0..max_delay].
+    The first d positions are "frozen" (tau=1.0, X^tau=X1, excluded from loss).
+    Remaining positions use a shared scalar tau ~ U(0,1).
+
+    This teaches the model to condition on clean prefix tokens (inpainting at
+    inference time) while predicting velocity only for non-frozen positions.
 
     Returns:
         loss: scalar tensor
     """
-    B = X1.shape[0]
+    B, H = X1.shape[0], X1.shape[1]
 
     # X0 ~ N(0, I),  shape: (B, H, token_dim)
     X0 = torch.randn_like(X1)
 
-    # tau ~ Uniform(0, 1),  shape: (B,)
-    tau = torch.rand(B, device=device)
+    # Sample delay d ~ weighted distribution (higher weight for smaller d)
+    # weights: [exp(max_delay+1), exp(max_delay), ..., exp(1)]  → max_delay+1 elements
+    # torch.multinomial returns indices {0, 1, ..., max_delay}, so delay ∈ [0, max_delay]
+    weights = torch.exp(torch.arange(max_delay + 1, 0, -1, dtype=torch.float32))
+    weights = weights / weights.sum()
+    delay = torch.multinomial(weights.expand(B, -1), 1).squeeze(1)  # (B,)
 
-    # Linear interpolation: X^tau = tau * X1 + (1 - tau) * X0
-    tau_bc = tau[:, None, None]  # (B, 1, 1) for broadcasting
-    X_tau = tau_bc * X1 + (1.0 - tau_bc) * X0  # (B, H, token_dim)
+    # Per-position frozen mask: True = frozen (first d positions)
+    pos_idx = torch.arange(H, device=device)[None, :]       # (1, H)
+    frozen = pos_idx < delay[:, None].to(device)             # (B, H)
+
+    # Per-position tau: frozen=1.0, rest=shared scalar tau
+    tau_scalar = torch.rand(B, device=device)                # (B,)
+    tau_pp = torch.where(frozen, torch.ones(1, device=device),
+                         tau_scalar[:, None].expand(-1, H))  # (B, H)
+
+    # Per-position interpolation: X^tau = tau * X1 + (1-tau) * X0
+    tau_bc = tau_pp[:, :, None]                              # (B, H, 1)
+    X_tau = tau_bc * X1 + (1.0 - tau_bc) * X0               # (B, H, token_dim)
+    # Frozen positions: tau=1.0 → X_tau = X1 (clean data)
 
     # Target velocity: v_target = X1 - X0
-    v_target = X1 - X0  # (B, H, token_dim)
+    v_target = X1 - X0                                       # (B, H, token_dim)
 
-    # Predicted velocity
-    v_pred = policy(X_tau, obs, tau)  # (B, H, token_dim)
+    # Predicted velocity (per-position tau)
+    v_pred = policy(X_tau, obs, tau_pp)                      # (B, H, token_dim)
 
-    loss = nn.functional.mse_loss(v_pred, v_target)
+    # Loss only on non-frozen positions
+    loss_per_elem = (v_pred - v_target) ** 2                 # (B, H, token_dim)
+    loss_mask = (~frozen)[:, :, None].float()                # (B, H, 1)
+    loss = (loss_per_elem * loss_mask).sum() / (loss_mask.sum() * X1.shape[2] + 1e-8)
     return loss
 
 
@@ -181,7 +209,8 @@ def train(cfg: dict = CFG):
             obs = obs.to(device)
 
             optimizer.zero_grad()
-            loss = fm_loss(policy, X1, obs, device)
+            loss = fm_loss(policy, X1, obs, device,
+                           max_delay=cfg["simulated_delay"])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
@@ -196,7 +225,8 @@ def train(cfg: dict = CFG):
             for X1, obs in val_loader:
                 X1  = X1.to(device)
                 obs = obs.to(device)
-                loss = fm_loss(policy, X1, obs, device)
+                loss = fm_loss(policy, X1, obs, device,
+                               max_delay=cfg["simulated_delay"])
                 val_losses.append(loss.item())
 
         train_loss = np.mean(train_losses)
