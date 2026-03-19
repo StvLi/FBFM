@@ -208,6 +208,9 @@ class VA_Server:
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
 
+        # PrevChunk is the runtime constraint container shared by inference and feedback.
+        # These dimensions are inferred once from the current Lingbot-VA carrier rather than
+        # relying on the placeholder defaults inside PrevChunk.
         self.prev_chunk_left_over = None
         self.prev_chunk_action_num = None
         self.prev_chunk_action_dim = None
@@ -216,9 +219,14 @@ class VA_Server:
         self.latest_obs_for_shape = None
 
     def _infer_prev_chunk_dims(self):
+        # Action constraints are organized at action-step granularity: one chunk has
+        # frame_chunk_size * action_per_frame action steps, each with action_dim channels.
         action_num = self.job_config.frame_chunk_size * self.action_per_frame
         action_dim = self.job_config.action_dim
 
+        # State constraints are stored as per-frame feedback latents. We use the current
+        # observation to infer the true latent shape so PrevChunk.state_dim matches what
+        # _encode_obs() actually produces in this carrier implementation.
         state_num = self.job_config.frame_chunk_size
         state_dim = 128
         if self.latest_obs_for_shape is not None:
@@ -233,6 +241,8 @@ class VA_Server:
         self.prev_chunk_state_dim = state_dim
 
     def _build_empty_prev_chunk(self, constrain_mode="Feedback", actions=None, action_constrained_num=0):
+        # Build a shape-correct PrevChunk for the current rollout. States always start empty
+        # for the new chunk and are filled incrementally by feedback observations.
         if self.prev_chunk_action_num is None or self.prev_chunk_state_num is None:
             self._infer_prev_chunk_dims()
 
@@ -532,6 +542,7 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        # Clear cached shape hints and runtime constraints at episode boundary.
         self.latest_obs_for_shape = None
         self.prev_chunk_left_over = None
         #### clean vae and transformer cache
@@ -774,6 +785,8 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            # Save the current observation layout first, then construct a PrevChunk whose
+            # state/action buffers match the actual Lingbot-VA tensor shapes for this run.
             self.latest_obs_for_shape = obs.get('obs')
             self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
