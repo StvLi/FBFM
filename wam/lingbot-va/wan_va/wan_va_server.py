@@ -208,6 +208,47 @@ class VA_Server:
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
 
+        self.prev_chunk_left_over = None
+        self.prev_chunk_action_num = None
+        self.prev_chunk_action_dim = None
+        self.prev_chunk_state_num = None
+        self.prev_chunk_state_dim = None
+        self.latest_obs_for_shape = None
+
+    def _infer_prev_chunk_dims(self):
+        action_num = self.job_config.frame_chunk_size * self.action_per_frame
+        action_dim = self.job_config.action_dim
+
+        state_num = self.job_config.frame_chunk_size
+        state_dim = 128
+        if self.latest_obs_for_shape is not None:
+            encoded = self._encode_obs({'obs': self.latest_obs_for_shape})
+            if encoded is not None:
+                state_num = encoded.shape[2]
+                state_dim = encoded.shape[1] * encoded.shape[3] * encoded.shape[4]
+
+        self.prev_chunk_action_num = action_num
+        self.prev_chunk_action_dim = action_dim
+        self.prev_chunk_state_num = state_num
+        self.prev_chunk_state_dim = state_dim
+
+    def _build_empty_prev_chunk(self, constrain_mode="Feedback", actions=None, action_constrained_num=0):
+        if self.prev_chunk_action_num is None or self.prev_chunk_state_num is None:
+            self._infer_prev_chunk_dims()
+
+        return FBFM.PrevChunk(
+            constrain_mode=constrain_mode,
+            actions=actions,
+            action_constrained_num=action_constrained_num,
+            action_num=self.prev_chunk_action_num,
+            action_dim=self.prev_chunk_action_dim,
+            states=None,
+            state_constrained_num=0,
+            state_num=self.prev_chunk_state_num,
+            state_dim=self.prev_chunk_state_dim,
+            inference_delay=0,
+        )
+
     def _get_t5_prompt_embeds(
         self,
         prompt=None,
@@ -491,6 +532,8 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self.latest_obs_for_shape = None
+        self.prev_chunk_left_over = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -731,17 +774,8 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            self.prev_chunk_left_over = FBFM.PrevChunk(
-                # TODO: 初始化参数配置
-                constrain_mode = "Feedback",
-                # actions = ,                   # 来自上个chunk
-                # action_constrained_num = ,    # 来自rtc_config
-                # action_num = ,                # 来自rtc_config
-                # action_dim = ,                # 来自rtc_config
-                # state_num = ,                 # 来自rtc_config
-                # state_dim = ,                 # 来自rtc_config
-                # inference_delay = ,           # 来自延迟实测
-            )
+            self.latest_obs_for_shape = obs.get('obs')
+            self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
