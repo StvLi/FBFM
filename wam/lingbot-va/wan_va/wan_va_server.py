@@ -795,7 +795,8 @@ class VA_Server:
         
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
-    
+    #TODO:@torch
+
     def get_denoise_fn(self, input_dict, last_step, frame_chunk_size, 
                     mode='video', guidance_scale=1.0, need_patch=False):
         """
@@ -838,7 +839,7 @@ class VA_Server:
                 if mode == 'action':
                     noise_pred = rearrange(noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size)
                 
-                # CFG 处理 (统一逻辑)
+                # CFG 处理 (统一逻辑)   TODO:check
                 if guidance_scale > 1:
                     noise_pred = noise_pred[1:] + guidance_scale * (noise_pred[:1] - noise_pred[1:])
                 else:
