@@ -217,6 +217,8 @@ class VA_Server:
         self.prev_chunk_state_num = None
         self.prev_chunk_state_dim = None
         self.latest_obs_for_shape = None
+        self.prev_chunk_action_leftover = None
+        self.prev_chunk_action_constrained_num = 0
 
     def _infer_prev_chunk_dims(self):
         # Action constraints are organized at action-step granularity: one chunk has
@@ -258,6 +260,12 @@ class VA_Server:
             state_dim=self.prev_chunk_state_dim,
             inference_delay=0,
         )
+
+    def _flatten_action_constraints(self, action_model_input: torch.Tensor) -> torch.Tensor:
+        # PrevChunk stores action constraints as (T_action, D_action), so convert the
+        # normalized action tensor from (1, C, F, H, 1) to per-step rows.
+        action_tensor = action_model_input[0, ..., 0]
+        return rearrange(action_tensor, 'c f h -> (f h) c').detach().cpu()
 
     def _get_t5_prompt_embeds(
         self,
@@ -545,6 +553,8 @@ class VA_Server:
         # Clear cached shape hints and runtime constraints at episode boundary.
         self.latest_obs_for_shape = None
         self.prev_chunk_left_over = None
+        self.prev_chunk_action_leftover = None
+        self.prev_chunk_action_constrained_num = 0
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -741,6 +751,8 @@ class VA_Server:
 
         action_model_input = self.preprocess_action(obs['state'])
         action_model_input = action_model_input.to(latent_model_input)
+        self.prev_chunk_action_leftover = self._flatten_action_constraints(action_model_input)
+        self.prev_chunk_action_constrained_num = self.prev_chunk_action_leftover.shape[0]
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
@@ -788,7 +800,11 @@ class VA_Server:
             # Save the current observation layout first, then construct a PrevChunk whose
             # state/action buffers match the actual Lingbot-VA tensor shapes for this run.
             self.latest_obs_for_shape = obs.get('obs')
-            self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
+            self.prev_chunk_left_over = self._build_empty_prev_chunk(
+                constrain_mode="Feedback",
+                actions=self.prev_chunk_action_leftover,
+                action_constrained_num=self.prev_chunk_action_constrained_num,
+            )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
