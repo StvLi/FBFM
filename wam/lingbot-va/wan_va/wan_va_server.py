@@ -102,6 +102,26 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
 
         if constrained_y is not None and weights is not None:
             x_t = x_t.clone().detach()
+            constrained_y = constrained_y.to(x_t)
+            if x_t.dim() == 2 and constrained_y.dim() == 2:
+                t_size = min(x_t.shape[0], constrained_y.shape[0])
+                d_size = min(x_t.shape[1], constrained_y.shape[1])
+                x_t = x_t[:t_size, :d_size]
+                sample = sample[:t_size, :d_size]
+                constrained_y = constrained_y[:t_size, :d_size]
+                weights = weights[:t_size].to(x_t).unsqueeze(-1)
+            elif x_t.dim() == 3 and constrained_y.dim() == 3:
+                t_size = min(x_t.shape[1], constrained_y.shape[1])
+                d_size = min(x_t.shape[2], constrained_y.shape[2])
+                x_t = x_t[:, :t_size, :d_size]
+                sample = sample[:, :t_size, :d_size]
+                constrained_y = constrained_y[:, :t_size, :d_size]
+                weights = weights[:t_size].to(x_t).view(1, t_size, 1)
+            else:
+                raise ValueError(
+                    f"Unsupported constraint alignment shapes: x_t={tuple(x_t.shape)}, "
+                    f"constrained_y={tuple(constrained_y.shape)}"
+                )
 
             # 疑似没有用 weights 已经自动过了
             # batch_size = x_t.shape[0] # B
@@ -272,6 +292,20 @@ class VA_Server:
         # latent frame into one row before appending feedback observations.
         latent_tensor = latent_model_input[0]
         return rearrange(latent_tensor, 'c f h w -> f (c h w)').detach().cpu()
+
+    def _flatten_video_sample(self, latents: torch.Tensor) -> torch.Tensor:
+        return rearrange(latents[0], 'c f h w -> f (c h w)')
+
+    def _unflatten_video_sample(self, flat_latents: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        _, c, f, h, w = reference.shape
+        return rearrange(flat_latents, 'f (c h w) -> 1 c f h w', c=c, h=h, w=w)
+
+    def _flatten_action_sample(self, actions: torch.Tensor) -> torch.Tensor:
+        return rearrange(actions[0, ..., 0], 'c f h -> (f h) c')
+
+    def _unflatten_action_sample(self, flat_actions: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        _, c, f, h, _ = reference.shape
+        return rearrange(flat_actions, '(f h) c -> 1 c f h 1', f=f, h=h, c=c)
 
     def _get_t5_prompt_embeds(
         self,
@@ -679,19 +713,24 @@ class VA_Server:
                 frame_chunk_size, 
                 mode='video',
                 guidance_scale=self.job_config.guidance_scale,
-                need_patch=(self.job_config.video_step != -1)
+                need_patch=(self.job_config.video_step != -1),
+                reference_sample=latents,
             )
-            
-            latents = self.scheduler.step(
+
+            flat_latents = self._flatten_video_sample(latents)
+            flat_state_constraints = self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None
+
+            flat_latents = self.scheduler.step(
                 original_denoise_step_partial=denoise_fn,
-                x_t=latents,
+                x_t=flat_latents,
                 timestep=t,
-                sample=latents,
+                sample=flat_latents,
                 to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None,
+                constrained_y=flat_state_constraints,
                 weights=self.prev_chunk_left_over.get_state_prefix_weights() if hasattr(self, 'prev_chunk_left_over') else None,
                 device=self.device
             )
+            latents = self._unflatten_video_sample(flat_latents, latents)
             
             latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
         
@@ -714,19 +753,24 @@ class VA_Server:
                 frame_chunk_size, 
                 mode='action',
                 guidance_scale=self.job_config.action_guidance_scale,
-                need_patch=False
+                need_patch=False,
+                reference_sample=actions,
             )
-            
-            actions = self.action_scheduler.step(
+
+            flat_actions = self._flatten_action_sample(actions)
+            flat_action_constraints = self.prev_chunk_left_over.get_constrained_actions()
+
+            flat_actions = self.action_scheduler.step(
                 original_denoise_step_partial=denoise_fn,
-                x_t=actions,
+                x_t=flat_actions,
                 timestep=t,
-                sample=actions,
+                sample=flat_actions,
                 to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_actions(),
+                constrained_y=flat_action_constraints,
                 weights=self.prev_chunk_left_over.get_action_prefix_weights(),
                 device=self.device
             )
+            actions = self._unflatten_action_sample(flat_actions, actions)
 
             actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
@@ -875,7 +919,7 @@ class VA_Server:
     #TODO:@torch
 
     def get_denoise_fn(self, input_dict, last_step, frame_chunk_size, 
-                    mode='video', guidance_scale=1.0, need_patch=False):
+                    mode='video', guidance_scale=1.0, need_patch=False, reference_sample=None):
         """
         返回一个可求导的去噪函数，支持 video 和 action 两种模式
         
@@ -892,7 +936,11 @@ class VA_Server:
         def denoise_fn(x_t):
             # 根据模式选择对应的 key
             res_key = 'latent_res_lst' if mode == 'video' else 'action_res_lst'
-            input_dict[res_key]['noisy_latents'] = x_t
+            if mode == 'video':
+                model_x_t = self._unflatten_video_sample(x_t, reference_sample)
+            else:
+                model_x_t = self._unflatten_action_sample(x_t, reference_sample)
+            input_dict[res_key]['noisy_latents'] = model_x_t
             
             # 调用 transformer
             noise_pred = self.transformer(
@@ -902,27 +950,25 @@ class VA_Server:
                 action_mode=(mode == 'action')
             )
             
-            # 后处理
-            if not last_step:
-                # Patch 处理 (仅 video 模式需要)
-                if need_patch:
-                    noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1
-                    )
-                
-                # Action 模式需要 rearrange
-                if mode == 'action':
-                    noise_pred = rearrange(noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size)
-                
-                # CFG 处理 (统一逻辑)   TODO:check
-                if guidance_scale > 1:
-                    noise_pred = noise_pred[1:] + guidance_scale * (noise_pred[:1] - noise_pred[1:])
-                else:
-                    noise_pred = noise_pred[:1]
+            # CFG 处理 (统一逻辑)   TODO:check
+            if guidance_scale > 1:
+                noise_pred = noise_pred[1:] + guidance_scale * (noise_pred[:1] - noise_pred[1:])
+            else:
+                noise_pred = noise_pred[:1]
+
+            # 后处理：统一恢复到与 x_t 对应的 5D 表示后再 flatten 回 (T, D)
+            if mode == 'video':
+                noise_pred = data_seq_to_patch(
+                    self.job_config.patch_size, noise_pred,
+                    frame_chunk_size, self.latent_height,
+                    self.latent_width, batch_size=1
+                )
+            else:
+                noise_pred = rearrange(noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size)
             
-            return noise_pred
+            if mode == 'video':
+                return self._flatten_video_sample(noise_pred)
+            return self._flatten_action_sample(noise_pred)
         
         return denoise_fn
 
