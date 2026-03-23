@@ -579,8 +579,10 @@ def eval_policy(task_name,
                 gen_video_list.append(imagined_video)
             key_frame_list = []
 
+            # tau=4 is the WAN2.2 VAE temporal downsample rate. The client uses it to
+            # convert the action-step axis into the feedback sampling interval.
             assert action.shape[2] % 4 == 0
-            action_per_frame = action.shape[2] // 4
+            feedback_interval = action.shape[2] // 4
 
             start_idx = 1 if first else 0
             # 动作执行循环
@@ -611,7 +613,7 @@ def eval_policy(task_name,
                         raise NotImplementedError
                     TASK_ENV.take_action(ee_action, action_type='ee')
                    
-                    if (j+1) % action_per_frame == 0:
+                    if (j+1) % feedback_interval == 0:
                         # 对obs的处理 获取obs - 发送server - （server: VAE编码）
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
