@@ -239,9 +239,11 @@ class VA_Server:
         self.latest_obs_for_shape = None
         self.prev_chunk_action_leftover = None
         self.prev_chunk_action_constrained_num = 0
-        # Current eval clients send feedback four times within each predicted frame.
-        # Keep this explicit so PrevChunk.state_num matches the real feedback horizon.
-        self.feedbacks_per_frame = getattr(self.job_config, 'feedbacks_per_frame', 4)
+        # WAN2.2 VAE uses temporal downsample rate tau=4. The current eval client samples
+        # feedback at the latent-frame cadence implied by this stride, so the number of
+        # feedback states stored for one predicted frame is derived from action_per_frame / tau.
+        self.vae_temporal_downsample = getattr(self.job_config, 'vae_temporal_downsample', 4)
+        self.feedbacks_per_frame = max(1, self.action_per_frame // self.vae_temporal_downsample)
 
     def _infer_prev_chunk_dims(self):
         # Action constraints are organized at action-step granularity: one chunk has
@@ -249,9 +251,9 @@ class VA_Server:
         action_num = self.job_config.frame_chunk_size * self.action_per_frame
         action_dim = self.job_config.action_dim
 
-        # State constraints are stored as feedback latents, not just predicted frame
-        # count. In the current single-thread client protocol, feedback is sent multiple
-        # times within each frame, so the state horizon must match that feedback count.
+        # State constraints follow the feedback sampling cadence. In the current client
+        # protocol, feedback is emitted multiple times within one predicted frame, and
+        # that count is derived from action_per_frame / tau.
         state_num = self.job_config.frame_chunk_size * self.feedbacks_per_frame
         state_dim = 128
         if self.latest_obs_for_shape is not None:
