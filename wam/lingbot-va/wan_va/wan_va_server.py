@@ -292,17 +292,30 @@ class VA_Server:
         self.prev_chunk_left_over.actions.zero_()
         self.prev_chunk_left_over.action_constrained_num = 0
         if actions is None:
+            logger.info("PrevChunk action prefix cleared")
             return
 
         actual_num = min(action_constrained_num, self.prev_chunk_left_over.action_num, actions.shape[0])
         self.prev_chunk_left_over.actions[:actual_num] = actions[:actual_num].clone()
         self.prev_chunk_left_over.action_constrained_num = actual_num
+        logger.info(
+            "PrevChunk action prefix updated: actions_shape=%s constrained=%s/%s",
+            tuple(self.prev_chunk_left_over.actions.shape),
+            self.prev_chunk_left_over.action_constrained_num,
+            self.prev_chunk_left_over.action_num,
+        )
 
     def _reset_prev_chunk_states(self):
         if self.prev_chunk_left_over is None:
             return
         self.prev_chunk_left_over.states.zero_()
         self.prev_chunk_left_over.state_constrained_num = 0
+        logger.info(
+            "PrevChunk state prefix reset: states_shape=%s constrained=%s/%s",
+            tuple(self.prev_chunk_left_over.states.shape),
+            self.prev_chunk_left_over.state_constrained_num,
+            self.prev_chunk_left_over.state_num,
+        )
 
     def _flatten_action_constraints(self, action_model_input: torch.Tensor) -> torch.Tensor:
         # PrevChunk stores action constraints as (T_action, D_action), so convert the
@@ -819,6 +832,12 @@ class VA_Server:
         # 2. 将latent输入加入反馈队列（权重自主维护）
         for state_step in flattened_state:
             self.prev_chunk_left_over.append_new_state(state_step)
+        logger.info(
+            "PrevChunk feedback appended: appended=%s constrained=%s/%s",
+            flattened_state.shape[0],
+            self.prev_chunk_left_over.state_constrained_num,
+            self.prev_chunk_left_over.state_num,
+        )
         
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
@@ -886,6 +905,13 @@ class VA_Server:
             self._update_prev_chunk_actions(
                 actions=self.prev_chunk_action_leftover,
                 action_constrained_num=self.prev_chunk_action_constrained_num,
+            )
+            logger.info(
+                "PrevChunk before infer: action_constrained=%s/%s state_constrained=%s/%s",
+                self.prev_chunk_left_over.action_constrained_num,
+                self.prev_chunk_left_over.action_num,
+                self.prev_chunk_left_over.state_constrained_num,
+                self.prev_chunk_left_over.state_num,
             )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             self._reset_prev_chunk_states()
