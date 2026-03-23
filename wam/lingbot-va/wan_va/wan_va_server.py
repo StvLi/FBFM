@@ -239,11 +239,8 @@ class VA_Server:
         self.latest_obs_for_shape = None
         self.prev_chunk_action_leftover = None
         self.prev_chunk_action_constrained_num = 0
-        # WAN2.2 VAE uses temporal downsample rate tau=4. The current eval client samples
-        # feedback at the latent-frame cadence implied by this stride, so the number of
-        # feedback states stored for one predicted frame is derived from action_per_frame / tau.
         self.vae_temporal_downsample = getattr(self.job_config, 'vae_temporal_downsample', 4)
-        self.feedbacks_per_frame = max(1, self.action_per_frame // self.vae_temporal_downsample)
+        self.feedbacks_per_frame = None
 
     def _infer_prev_chunk_dims(self):
         # Action constraints are organized at action-step granularity: one chunk has
@@ -636,6 +633,10 @@ class VA_Server:
         self.streaming_vae.clear_cache()
 
         self.action_per_frame = self.job_config.action_per_frame
+        # WAN2.2 VAE uses temporal downsample rate tau=4. Compute how many feedback
+        # observations are expected inside one predicted latent frame only after
+        # action_per_frame has been initialized from the active job config.
+        self.feedbacks_per_frame = max(1, self.action_per_frame // self.vae_temporal_downsample)
         self.height, self.width = self.job_config.height, self.job_config.width
 
         if self.env_type == 'robotwin_tshape':
