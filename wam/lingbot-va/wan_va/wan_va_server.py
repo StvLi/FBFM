@@ -320,6 +320,13 @@ class VA_Server:
         action_tensor = action_model_input[0, ..., 0]
         return rearrange(action_tensor, 'c f h -> (f h) c').detach().cpu()
 
+    def _trim_action_leftover(self, flat_actions: torch.Tensor, executed_action_steps: int) -> torch.Tensor:
+        if executed_action_steps <= 0:
+            return flat_actions
+        if executed_action_steps >= flat_actions.shape[0]:
+            return flat_actions[:0]
+        return flat_actions[executed_action_steps:]
+
     def _flatten_state_constraints(self, latent_model_input: torch.Tensor) -> torch.Tensor:
         # PrevChunk stores state constraints as (T_state, D_state), so flatten each
         # latent frame into one row before appending feedback observations.
@@ -852,10 +859,13 @@ class VA_Server:
 
         action_model_input = self.preprocess_action(obs['state'])
         action_model_input = action_model_input.to(latent_model_input)
-        self.prev_chunk_action_leftover = self._flatten_action_constraints(action_model_input)
+        executed_action_steps = int(obs.get('executed_action_steps', 0))
+        flat_actions = self._flatten_action_constraints(action_model_input)
+        self.prev_chunk_action_leftover = self._trim_action_leftover(flat_actions, executed_action_steps)
         self.prev_chunk_action_constrained_num = self.prev_chunk_action_leftover.shape[0]
         logger.info(
-            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
+            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}, "
+            f"executed_action_steps={executed_action_steps}, leftover={self.prev_chunk_action_constrained_num}"
         )
         input_dict = self._prepare_latent_input(latent_model_input,
                                                 action_model_input,
