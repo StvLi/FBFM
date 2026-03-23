@@ -857,7 +857,8 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
+        prev_action = obs.get('prev_action', obs['state'])
+        action_model_input = self.preprocess_action(prev_action)
         action_model_input = action_model_input.to(latent_model_input)
         executed_action_steps = int(obs.get('executed_action_steps', 0))
         flat_actions = self._flatten_action_constraints(action_model_input)

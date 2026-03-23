@@ -629,7 +629,7 @@ def eval_policy(task_name,
                     compute_kv_cache=True,
                     imagine=False,
                     save_visualization=save_visualization,
-                    state=action,
+                    prev_action=action,
                     executed_action_steps=executed_action_steps,
                 )
             )
