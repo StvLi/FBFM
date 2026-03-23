@@ -281,6 +281,25 @@ class VA_Server:
             inference_delay=0,
         )
 
+    def _update_prev_chunk_actions(self, actions=None, action_constrained_num=0):
+        if self.prev_chunk_left_over is None:
+            self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
+
+        self.prev_chunk_left_over.actions.zero_()
+        self.prev_chunk_left_over.action_constrained_num = 0
+        if actions is None:
+            return
+
+        actual_num = min(action_constrained_num, self.prev_chunk_left_over.action_num, actions.shape[0])
+        self.prev_chunk_left_over.actions[:actual_num] = actions[:actual_num].clone()
+        self.prev_chunk_left_over.action_constrained_num = actual_num
+
+    def _reset_prev_chunk_states(self):
+        if self.prev_chunk_left_over is None:
+            return
+        self.prev_chunk_left_over.states.zero_()
+        self.prev_chunk_left_over.state_constrained_num = 0
+
     def _flatten_action_constraints(self, action_model_input: torch.Tensor) -> torch.Tensor:
         # PrevChunk stores action constraints as (T_action, D_action), so convert the
         # normalized action tensor from (1, C, F, H, 1) to per-step rows.
@@ -858,12 +877,14 @@ class VA_Server:
             # Save the current observation layout first, then construct a PrevChunk whose
             # state/action buffers match the actual Lingbot-VA tensor shapes for this run.
             self.latest_obs_for_shape = obs.get('obs')
-            self.prev_chunk_left_over = self._build_empty_prev_chunk(
-                constrain_mode="Feedback",
+            if self.prev_chunk_left_over is None:
+                self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
+            self._update_prev_chunk_actions(
                 actions=self.prev_chunk_action_leftover,
                 action_constrained_num=self.prev_chunk_action_constrained_num,
             )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            self._reset_prev_chunk_states()
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
