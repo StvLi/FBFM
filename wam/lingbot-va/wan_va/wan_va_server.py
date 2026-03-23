@@ -165,6 +165,13 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.base_model_root = job_config.wan22_pretrained_model_name_or_path
+        self.transformer_checkpoint_root = getattr(job_config, 'transformer_checkpoint_path', None)
+        self.transformer_model_root = (
+            self.transformer_checkpoint_root
+            if self.transformer_checkpoint_root is not None
+            else self.base_model_root
+        )
 
         self.rtc_config = RTCConfig(
             # TODO: 暂时用这个，后面改成从job_config中读取
@@ -185,7 +192,7 @@ class VA_Server:
         self.action_scheduler.set_timesteps(1000, training=True)
 
         self.vae = load_vae(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.base_model_root,
                          'vae'),
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
@@ -193,18 +200,18 @@ class VA_Server:
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
         self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.base_model_root,
                          'tokenizer'), )
 
         self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.base_model_root,
                          'text_encoder'),
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.transformer_model_root,
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
@@ -221,7 +228,7 @@ class VA_Server:
         self.streaming_vae_half = None
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                os.path.join(self.base_model_root,
                              'vae'),
                 torch_dtype=self.dtype,
                 torch_device='cpu' if self.enable_offload else self.device,
