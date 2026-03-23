@@ -239,6 +239,9 @@ class VA_Server:
         self.latest_obs_for_shape = None
         self.prev_chunk_action_leftover = None
         self.prev_chunk_action_constrained_num = 0
+        # Current eval clients send feedback four times within each predicted frame.
+        # Keep this explicit so PrevChunk.state_num matches the real feedback horizon.
+        self.feedbacks_per_frame = getattr(self.job_config, 'feedbacks_per_frame', 4)
 
     def _infer_prev_chunk_dims(self):
         # Action constraints are organized at action-step granularity: one chunk has
@@ -246,15 +249,14 @@ class VA_Server:
         action_num = self.job_config.frame_chunk_size * self.action_per_frame
         action_dim = self.job_config.action_dim
 
-        # State constraints are stored as per-frame feedback latents. We use the current
-        # observation to infer the true latent shape so PrevChunk.state_dim matches what
-        # _encode_obs() actually produces in this carrier implementation.
-        state_num = self.job_config.frame_chunk_size
+        # State constraints are stored as feedback latents, not just predicted frame
+        # count. In the current single-thread client protocol, feedback is sent multiple
+        # times within each frame, so the state horizon must match that feedback count.
+        state_num = self.job_config.frame_chunk_size * self.feedbacks_per_frame
         state_dim = 128
         if self.latest_obs_for_shape is not None:
             encoded = self._encode_obs({'obs': self.latest_obs_for_shape})
             if encoded is not None:
-                state_num = encoded.shape[2]
                 state_dim = encoded.shape[1] * encoded.shape[3] * encoded.shape[4]
 
         self.prev_chunk_action_num = action_num
