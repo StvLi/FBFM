@@ -297,12 +297,15 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             model_config = model_config_class.from_dict(model_config)
 
             # Instantiate the model
+            # model 在此创建
             if hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
                 print(f"Loading LoRA weights from pretrained")
                 model = model_class.load_lora(model_path)
             else:
                 print(f"Loading model from pretrained directly")
-                model = model_class.from_pretrained(model_path, config=model_config)
+                # model_path: 模型路径 初始化时参数model_path输入
+                # config: 通过model_dir / "config.json"导入, model_dir 来自参数model_path
+                model = model_class.from_pretrained(model_path, config=model_config) 
         else:
             print(f"No model config overrides provided")
             # Otherwise, just call from_pretrained directly
@@ -350,7 +353,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
 
         torch.cuda.empty_cache()
 
-        self.trained_model = model
+        self.trained_model = model  # 模型从此导入
 
         # 2. Load the action, video, and state transforms
         # 2.1. Load the metadata for normalization stats

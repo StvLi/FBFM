@@ -252,6 +252,7 @@ class ARDroidRoboarenaPolicy:
             action: (N, 8) action array
         """
         # Check for session change - reset state if new session
+        # 会话管理：检测会话ID，如果会话ID改变，则重置状态
         session_id = obs.get("session_id", None)
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
@@ -265,18 +266,18 @@ class ARDroidRoboarenaPolicy:
         self._msg_index += 1
         self._call_count += 1
         
-        # Convert observation format
+        # Convert observation format # AR_droid
         converted_obs = self._convert_observation(obs)
         
         # Signal workers to continue (0 = continue)
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
-        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+        dist.broadcast(signal_tensor, src=0, group=self._signal_group)  # 同时推理
         
         # Broadcast obs to workers
-        self._broadcast_batch_to_workers(converted_obs)
+        self._broadcast_batch_to_workers(converted_obs)                 # obs广播到所有进程
         
         # Create batch for policy
-        batch = Batch(obs=converted_obs)
+        batch = Batch(obs=converted_obs)                                # 天授深度学习框架封装
         
         # Distributed forward pass
         dist.barrier()
@@ -285,16 +286,16 @@ class ARDroidRoboarenaPolicy:
         dist.barrier()
         
         # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
+        self.video_across_time.append(video_pred)                       # 视频预测
         
         # Extract and convert action
-        action_chunk_dict = result_batch.act
+        action_chunk_dict = result_batch.act                            # 获取动作
         
         # Convert Batch to dict
         action_dict = {}
         for k in dir(action_chunk_dict):
             if k.startswith("action."):
-                action_dict[k] = getattr(action_chunk_dict, k)
+                action_dict[k] = getattr(action_chunk_dict, k)          # 转字典
         
         action = self._convert_action(action_dict)
         
@@ -502,7 +503,7 @@ class WebsocketPolicyServer:
                 batch = self._receive_batch_from_rank0()
                 # Participate in distributed forward pass
                 dist.barrier()
-                with torch.no_grad():
+                with torch.no_grad(): # 分布式推理
                     result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
                 dist.barrier()
 
@@ -576,7 +577,7 @@ class WebsocketPolicyServer:
                     # All ranks need to participate in the forward pass
                     dist.barrier()
                     forward_start_time = time.perf_counter()
-                    with torch.no_grad():
+                    with torch.no_grad():   # 分布式推理（之后主要阅读）
                         result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
                     dist.barrier()
                     print(f"Forward Time: {time.perf_counter() - forward_start_time:.2f} seconds")
@@ -588,31 +589,39 @@ class WebsocketPolicyServer:
 
                     self.video_across_time.append(video_chunk)
 
-                    if len(self.video_across_time) > 10:
+                    # 特性	        分支一（缓存阈值）	    分支二（推理块边界）
+                    # 触发频率	    低（每 10 帧）	        高（每推理块）
+                    # IO 效率	   高（批量写入）	        中（定期写入）
+                    # 数据安全性	中（可能丢失未保存帧）	  高（定期保存）
+                    # 与模型同步	无	                   有（对齐推理节奏）
+                    # 缓存策略	    全部清空	            保留最后一帧
+                    # 主要目的	    性能优化	            正确性保证
+
+                    if len(self.video_across_time) > 10:    # 缓存10帧再写入 避免频繁IO
                         frame_list = []
                         video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                        frames = self._policy.trained_model.action_head.vae.decode(
+                        frames = self._policy.trained_model.action_head.vae.decode( # VAE 解码
                             video_across_time_cat,
                             tiled=self._policy.trained_model.action_head.tiled,
                             tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
                             tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
                         )
                         frames = rearrange(frames, "B C T H W -> B T H W C")
-                        frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+                        frames = frames[0]                                                                  # [B, T, H, W, C] -> [T, H, W, C]
+                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8) # 归一化到[0, 255]
                         # Add each frame individually to the list
                         for frame in frames:
                             frame_list.append(frame)
 
                         sample_frame = frame_list[0]
-                        if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
+                        if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]: # 判断是否为单通道/RGB/RGBD图片
                             # Save all frames as a single MP4 file
                             save_dir = self._output_dir if self._output_dir else "."
                             os.makedirs(save_dir, exist_ok=True)
-                            all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
+                            all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")] # 获取已存在MP4文件 避免重名
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
-                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8
+                            n = (num_frames - 1) // 8  # num_frames = 8n+1, so n = (num_frames-1)/8 # 视频8帧存一个视频
                             output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
                             imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
                             print(f"Saved video to: {output_path}")
@@ -620,19 +629,20 @@ class WebsocketPolicyServer:
                             print(f"Warning: Invalid frame shape {sample_frame.shape}. Expected (H, W, C) with C in [1, 3, 4]. Skipping video save.")
 
                         self.video_across_time = []
-                    elif self._policy.trained_model.action_head.current_start_frame == 1 + self._policy.trained_model.action_head.num_frame_per_block and len(self.video_across_time) > 1:
+                    elif self._policy.trained_model.action_head.current_start_frame == 1 + self._policy.trained_model.action_head.num_frame_per_block \
+                        and len(self.video_across_time) > 1:    # 模型完成一个推理块生成 and 缓存区至少有2帧 定期保存
                         print("current_start_frame == 1 + num_frame_per_block and len(self.video_across_time) > 1")
                         frame_list = []
-                        video_across_time_cat = torch.cat(self.video_across_time[:-1], dim=2)
+                        video_across_time_cat = torch.cat(self.video_across_time[:-1], dim=2) # (B C T H W) 沿着时间轴 不处理最后一帧（防止出现冲突）
                         frames = self._policy.trained_model.action_head.vae.decode(
-                            video_across_time_cat,
+                            video_across_time_cat,  # VAE解码
                             tiled=self._policy.trained_model.action_head.tiled,
                             tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
                             tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
                         )
                         frames = rearrange(frames, "B C T H W -> B T H W C")
                         frames = frames[0]
-                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+                        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8) # 归一化
                         # Add each frame individually to the list
                         for frame in frames:
                             frame_list.append(frame)
@@ -651,19 +661,19 @@ class WebsocketPolicyServer:
                         self.video_across_time = [video_chunk]
 
                     
-                    def batch_to_dict(batch):
+                    def batch_to_dict(batch):   # 将batch转换成字典
                         out = {}
                         for k in dir(batch):
                             if not k.startswith("action."):
                                 continue
-                            out[k] = getattr(batch, k)
+                            out[k] = getattr(batch, k)  # 存入字典中
                         return out
                     action_chunk_dict = batch_to_dict(action_chunk_dict)
-                    await websocket.send(packer.pack(action_chunk_dict))
+                    await websocket.send(packer.pack(action_chunk_dict))    # 发送action到客户端
 
-                except websockets.ConnectionClosed:
+                except websockets.ConnectionClosed: # 连接断开
                     logger.info(f"Connection from {websocket.remote_address} closed")
-                    if len(self.video_across_time) > 0:
+                    if len(self.video_across_time) > 0: # 断开连接时，仍然将剩余Latent解码成视频并保存
                         frame_list = []
                         video_across_time_cat = torch.cat(self.video_across_time, dim=2)
                         frames = self._policy.trained_model.action_head.vae.decode(
@@ -749,7 +759,7 @@ def main(args: Args) -> None:
     torch._dynamo.config.recompile_limit = 800
 
     embodiment_tag = "oxe_droid"
-    model_path = args.model_path
+    model_path = args.model_path    # 直接决定模型权重和配置 来自于命令行参数
     policy_metadata = {
         "embodiment": embodiment_tag,
         "model_name": "dreamzero",
@@ -763,6 +773,7 @@ def main(args: Args) -> None:
     signal_group = dist.new_group(backend="gloo", timeout=timeout_delta)
     logger.info(f"Rank {rank} initialized signal_group (gloo)")
 
+    # 初始化策略
     policy = GrootSimPolicy(
         embodiment_tag=EmbodimentTag(embodiment_tag),
         model_path=model_path,
@@ -789,13 +800,19 @@ def main(args: Args) -> None:
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
     
     # Create wrapper policy that converts between roboarena and AR_droid formats
+    # 实现以下功能：
+    #   1. obs格式化转换： roboarena -> AR_droid
+    #   2. action格式化转换： AR_droid -> roboarena
+    #   3. 分布式协调
+    #   4. 会话检查
     wrapper_policy = ARDroidRoboarenaPolicy(
-        groot_policy=policy,
+        groot_policy=policy,    # GrootSimPolicy
         signal_group=signal_group,
         output_dir=output_dir,
-    )
+    )   # 这一类的infer()方法会调用_policy(以GrootSimPolicy实例化).lazy_joint_forward_causal()
     
     # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
+    # 服务器基础配置
     server_config = PolicyServerConfig(
         image_resolution=(180, 320),  # AR_droid expects 180x320 images
         needs_wrist_camera=True,
@@ -806,16 +823,18 @@ def main(args: Args) -> None:
     )
     
     if rank == 0:
+        # rank 0 仅做通讯协调
         logging.info("Using roboarena policy server interface")
         logging.info(f"Server config: {server_config}")
         roboarena_server = RoboarenaServer(
-            policy=wrapper_policy,
+            policy=wrapper_policy,  # ARDroidRoboarenaPolicy
             server_config=server_config,
             host="0.0.0.0",
             port=args.port,
-        )
-        roboarena_server.serve_forever()
+        )   
+        roboarena_server.serve_forever() # 调用了_policy(以ARDroidRoboarenaPolicy实例化).infer()
     else:
+        # 其他 rank 运行 inference
         # Non-rank-0 processes need to run worker loop for distributed inference
         # We'll use the existing WebsocketPolicyServer's worker loop mechanism
         server = WebsocketPolicyServer(
@@ -834,3 +853,12 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, force=True)
     args = tyro.cli(Args)
     main(args)
+
+    # CUDA_VISIBLE_DEVICES=0,1 \
+    # python \
+    # -m torch.distributed.run \
+    # --standalone \
+    # --nproc_per_node=2 socket_test_optimized_AR.py \ 
+    # --port 5000 \
+    # --enable-dit-cache \ 
+    # --model-path ./checkpoints/DreamZero-AgiBot

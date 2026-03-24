@@ -98,9 +98,9 @@ class WebsocketPolicyServer:
                     self._policy.reset(obs)
                     to_return = "reset successful"
                 else:
-                    action = self._policy.infer(obs)
-                    to_return = packer.pack(action)
-                await websocket.send(to_return)
+                    action = self._policy.infer(obs)# 模型推理
+                    to_return = packer.pack(action) # 准备返回action
+                await websocket.send(to_return)     # 发送action
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
                 break
