@@ -722,6 +722,7 @@ class VA_Server:
             return dict()
         elif feedback:
             # FBFM 处理中间帧逻辑
+            # 第4帧获取到之后才会进入这个循环
             logger.info(f"################# Feedback #################")
             self._feedback(obs=obs)
             return dict()
