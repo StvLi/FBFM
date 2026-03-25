@@ -577,13 +577,19 @@ class VA_Server:
         if len(images) < 1:
             return None
         
-        # # VAE 的 3D 卷积需要至少 2 帧，如果不足则重复最后一帧
-        # min_frames = 2
-        # if len(images) < min_frames:
-        #     original_len = len(images)
-        #     last_image = images[-1]
-        #     images = images + [last_image] * (min_frames - len(images))
-        #     logger.warning(f"Input has only {original_len} frames, padding to {min_frames} frames by repeating the last frame")
+        # The WAN VAE uses temporal 3D convolutions. Early rollout steps may not yet
+        # provide enough observations, so repeat the latest frame until the minimum
+        # temporal length is satisfied.
+        min_frames = 3
+        if len(images) < min_frames:
+            original_len = len(images)
+            last_image = images[-1]
+            images = images + [last_image] * (min_frames - len(images))
+            logger.warning(
+                "Input has only %s frames, padding to %s frames by repeating the last frame",
+                original_len,
+                min_frames,
+            )
         
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
