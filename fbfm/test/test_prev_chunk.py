@@ -207,5 +207,46 @@ class TestPrevChunk(unittest.TestCase):
         self.prev_chunk.constrain_mode = "NoFeedback"
         self.assertEqual(self.prev_chunk.get_constrain_mode(), "NoFeedback")
 
+    def test_single_thread_chunk_carry_over_lifecycle(self):
+        """Validate the intended single-thread lifecycle across two chunks.
+
+        Semantics:
+        - next inference starts with previous action leftover as action prefix
+        - state feedback is accumulated during execution of the current chunk
+        - after the chunk is consumed by inference, state prefix is reset while
+          action prefix can be replaced by the next leftover
+        """
+        leftover_actions = torch.randn(6, self.action_dim)
+        prev_chunk = PrevChunk(
+            actions=leftover_actions,
+            action_constrained_num=6,
+            action_num=self.action_num,
+            action_dim=self.action_dim,
+            state_num=self.state_num,
+            state_dim=self.state_dim,
+        )
+
+        self.assertTrue(torch.equal(prev_chunk.actions[:6], leftover_actions))
+        self.assertEqual(prev_chunk.action_constrained_num, 6)
+        self.assertEqual(prev_chunk.state_constrained_num, 0)
+
+        first_state = torch.randn(self.state_dim)
+        second_state = torch.randn(self.state_dim)
+        prev_chunk.append_new_state(first_state)
+        prev_chunk.append_new_state(second_state)
+
+        self.assertEqual(prev_chunk.state_constrained_num, 2)
+        self.assertTrue(torch.equal(prev_chunk.states[0], first_state))
+        self.assertTrue(torch.equal(prev_chunk.states[1], second_state))
+
+        # Simulate "start next inference": keep action prefix but clear consumed state feedback.
+        prev_chunk.states.zero_()
+        prev_chunk.state_constrained_num = 0
+
+        self.assertEqual(prev_chunk.action_constrained_num, 6)
+        self.assertEqual(prev_chunk.state_constrained_num, 0)
+        self.assertTrue(torch.equal(prev_chunk.actions[:6], leftover_actions))
+        self.assertTrue(torch.all(prev_chunk.states == 0))
+
 if __name__ == '__main__':
     unittest.main()

@@ -102,6 +102,26 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
 
         if constrained_y is not None and weights is not None:
             x_t = x_t.clone().detach()
+            constrained_y = constrained_y.to(x_t)
+            if x_t.dim() == 2 and constrained_y.dim() == 2:
+                t_size = min(x_t.shape[0], constrained_y.shape[0])
+                d_size = min(x_t.shape[1], constrained_y.shape[1])
+                x_t = x_t[:t_size, :d_size]
+                sample = sample[:t_size, :d_size]
+                constrained_y = constrained_y[:t_size, :d_size]
+                weights = weights[:t_size].to(x_t).unsqueeze(-1)
+            elif x_t.dim() == 3 and constrained_y.dim() == 3:
+                t_size = min(x_t.shape[1], constrained_y.shape[1])
+                d_size = min(x_t.shape[2], constrained_y.shape[2])
+                x_t = x_t[:, :t_size, :d_size]
+                sample = sample[:, :t_size, :d_size]
+                constrained_y = constrained_y[:, :t_size, :d_size]
+                weights = weights[:t_size].to(x_t).view(1, t_size, 1)
+            else:
+                raise ValueError(
+                    f"Unsupported constraint alignment shapes: x_t={tuple(x_t.shape)}, "
+                    f"constrained_y={tuple(constrained_y.shape)}"
+                )
 
             # 疑似没有用 weights 已经自动过了
             # batch_size = x_t.shape[0] # B
@@ -145,6 +165,13 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.base_model_root = job_config.wan22_pretrained_model_name_or_path
+        self.transformer_checkpoint_root = getattr(job_config, 'transformer_checkpoint_path', None)
+        self.transformer_model_root = (
+            self.transformer_checkpoint_root
+            if self.transformer_checkpoint_root is not None
+            else self.base_model_root
+        )
 
         self.rtc_config = RTCConfig(
             # TODO: 暂时用这个，后面改成从job_config中读取
@@ -165,7 +192,7 @@ class VA_Server:
         self.action_scheduler.set_timesteps(1000, training=True)
 
         self.vae = load_vae(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.base_model_root,
                          'vae'),
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
@@ -173,18 +200,18 @@ class VA_Server:
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
         self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.base_model_root,
                          'tokenizer'), )
 
         self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.base_model_root,
                          'text_encoder'),
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(self.transformer_model_root,
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
@@ -201,12 +228,128 @@ class VA_Server:
         self.streaming_vae_half = None
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                os.path.join(self.base_model_root,
                              'vae'),
                 torch_dtype=self.dtype,
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+
+        # PrevChunk is the runtime constraint container shared by inference and feedback.
+        # These dimensions are inferred once from the current Lingbot-VA carrier rather than
+        # relying on the placeholder defaults inside PrevChunk.
+        self.prev_chunk_left_over = None
+        self.prev_chunk_action_num = None
+        self.prev_chunk_action_dim = None
+        self.prev_chunk_state_num = None
+        self.prev_chunk_state_dim = None
+        self.latest_obs_for_shape = None
+        self.prev_chunk_action_leftover = None
+        self.prev_chunk_action_constrained_num = 0
+        self.vae_temporal_downsample = getattr(self.job_config, 'vae_temporal_downsample', 4)
+        self.feedbacks_per_frame = None
+
+    def _infer_prev_chunk_dims(self):
+        # Action constraints are organized at action-step granularity: one chunk has
+        # frame_chunk_size * action_per_frame action steps, each with action_dim channels.
+        action_num = self.job_config.frame_chunk_size * self.action_per_frame
+        action_dim = self.job_config.action_dim
+
+        # State constraints follow the feedback sampling cadence. Infer the state horizon
+        # from the latent/video time axis, but keep the per-state feature dimension purely
+        # structural so PrevChunk construction never depends on encoding a short real obs.
+        state_num = self.job_config.frame_chunk_size * self.feedbacks_per_frame
+        state_channels = 48
+        state_dim = state_channels * self.latent_height * self.latent_width
+
+        self.prev_chunk_action_num = action_num
+        self.prev_chunk_action_dim = action_dim
+        self.prev_chunk_state_num = state_num
+        self.prev_chunk_state_dim = state_dim
+
+    def _build_empty_prev_chunk(self, constrain_mode="Feedback", actions=None, action_constrained_num=0):
+        # Build a shape-correct PrevChunk for the current rollout. States always start empty
+        # for the new chunk and are filled incrementally by feedback observations.
+        if self.prev_chunk_action_num is None or self.prev_chunk_state_num is None:
+            self._infer_prev_chunk_dims()
+
+        return FBFM.PrevChunk(
+            constrain_mode=constrain_mode,
+            actions=actions,
+            action_constrained_num=action_constrained_num,
+            action_num=self.prev_chunk_action_num,
+            action_dim=self.prev_chunk_action_dim,
+            states=None,
+            state_constrained_num=0,
+            state_num=self.prev_chunk_state_num,
+            state_dim=self.prev_chunk_state_dim,
+            inference_delay=0,
+        )
+
+    def _update_prev_chunk_actions(self, actions=None, action_constrained_num=0):
+        if self.prev_chunk_left_over is None:
+            self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
+
+        self.prev_chunk_left_over.actions.zero_()
+        self.prev_chunk_left_over.action_constrained_num = 0
+        if actions is None:
+            logger.info("PrevChunk action prefix cleared")
+            return
+
+        actual_num = min(action_constrained_num, self.prev_chunk_left_over.action_num, actions.shape[0])
+        self.prev_chunk_left_over.actions[:actual_num] = actions[:actual_num].clone()
+        self.prev_chunk_left_over.action_constrained_num = actual_num
+        logger.info(
+            "PrevChunk action prefix updated: actions_shape=%s constrained=%s/%s",
+            tuple(self.prev_chunk_left_over.actions.shape),
+            self.prev_chunk_left_over.action_constrained_num,
+            self.prev_chunk_left_over.action_num,
+        )
+
+    def _reset_prev_chunk_states(self):
+        if self.prev_chunk_left_over is None:
+            return
+        self.prev_chunk_left_over.states.zero_()
+        self.prev_chunk_left_over.state_constrained_num = 0
+        logger.info(
+            "PrevChunk state prefix reset: states_shape=%s constrained=%s/%s",
+            tuple(self.prev_chunk_left_over.states.shape),
+            self.prev_chunk_left_over.state_constrained_num,
+            self.prev_chunk_left_over.state_num,
+        )
+
+    def _flatten_action_constraints(self, action_model_input: torch.Tensor) -> torch.Tensor:
+        # PrevChunk stores action constraints as (T_action, D_action), so convert the
+        # normalized action tensor from (1, C, F, H, 1) to per-step rows.
+        action_tensor = action_model_input[0, ..., 0]
+        return rearrange(action_tensor, 'c f h -> (f h) c').detach().cpu()
+
+    def _trim_action_leftover(self, flat_actions: torch.Tensor, executed_action_steps: int) -> torch.Tensor:
+        if executed_action_steps <= 0:
+            return flat_actions
+        if executed_action_steps >= flat_actions.shape[0]:
+            return flat_actions[:0]
+        return flat_actions[executed_action_steps:]
+
+    def _flatten_state_constraints(self, latent_model_input: torch.Tensor) -> torch.Tensor:
+        # PrevChunk stores state constraints as (T_state, D_state), so flatten each
+        # latent frame into one row before appending feedback observations.
+        latent_tensor = latent_model_input[0]
+        return rearrange(latent_tensor, 'c f h w -> f (c h w)').detach().cpu()
+
+    def _flatten_video_sample(self, latents: torch.Tensor) -> torch.Tensor:
+        return rearrange(latents[0], 'c f h w -> f (c h w)')
+
+    def _unflatten_video_sample(self, flat_latents: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        _, c, f, h, w = reference.shape
+        return rearrange(flat_latents, 'f (c h w) -> 1 c f h w', c=c, h=h, w=w)
+
+    def _flatten_action_sample(self, actions: torch.Tensor) -> torch.Tensor:
+        return rearrange(actions[0, ..., 0], 'c f h -> (f h) c')
+
+    def _unflatten_action_sample(self, flat_actions: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        _, c, f, h, _ = reference.shape
+        return rearrange(flat_actions, '(f h) c -> 1 c f h 1', f=f, h=h, c=c)
 
     def _get_t5_prompt_embeds(
         self,
@@ -431,13 +574,19 @@ class VA_Server:
         if len(images) < 1:
             return None
         
-        # # VAE 的 3D 卷积需要至少 2 帧，如果不足则重复最后一帧
-        # min_frames = 2
-        # if len(images) < min_frames:
-        #     original_len = len(images)
-        #     last_image = images[-1]
-        #     images = images + [last_image] * (min_frames - len(images))
-        #     logger.warning(f"Input has only {original_len} frames, padding to {min_frames} frames by repeating the last frame")
+        # The WAN VAE uses temporal 3D convolutions. Early rollout steps may not yet
+        # provide enough observations, so repeat the latest frame until the minimum
+        # temporal length is satisfied.
+        min_frames = 3
+        if len(images) < min_frames:
+            original_len = len(images)
+            last_image = images[-1]
+            images = images + [last_image] * (min_frames - len(images))
+            logger.warning(
+                "Input has only %s frames, padding to %s frames by repeating the last frame",
+                original_len,
+                min_frames,
+            )
         
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
@@ -491,11 +640,20 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        # Clear cached shape hints and runtime constraints at episode boundary.
+        self.latest_obs_for_shape = None
+        self.prev_chunk_left_over = None
+        self.prev_chunk_action_leftover = None
+        self.prev_chunk_action_constrained_num = 0
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
 
         self.action_per_frame = self.job_config.action_per_frame
+        # WAN2.2 VAE uses temporal downsample rate tau=4. Compute how many feedback
+        # observations are expected inside one predicted latent frame only after
+        # action_per_frame has been initialized from the active job config.
+        self.feedbacks_per_frame = max(1, self.action_per_frame // self.vae_temporal_downsample)
         self.height, self.width = self.job_config.height, self.job_config.width
 
         if self.env_type == 'robotwin_tshape':
@@ -609,19 +767,24 @@ class VA_Server:
                 frame_chunk_size, 
                 mode='video',
                 guidance_scale=self.job_config.guidance_scale,
-                need_patch=(self.job_config.video_step != -1)
+                need_patch=(self.job_config.video_step != -1),
+                reference_sample=latents,
             )
-            
-            latents = self.scheduler.step(
+
+            flat_latents = self._flatten_video_sample(latents)
+            flat_state_constraints = self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None
+
+            flat_latents = self.scheduler.step(
                 original_denoise_step_partial=denoise_fn,
-                x_t=latents,
+                x_t=flat_latents,
                 timestep=t,
-                sample=latents,
+                sample=flat_latents,
                 to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None,
+                constrained_y=flat_state_constraints,
                 weights=self.prev_chunk_left_over.get_state_prefix_weights() if hasattr(self, 'prev_chunk_left_over') else None,
                 device=self.device
             )
+            latents = self._unflatten_video_sample(flat_latents, latents)
             
             latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
         
@@ -644,19 +807,24 @@ class VA_Server:
                 frame_chunk_size, 
                 mode='action',
                 guidance_scale=self.job_config.action_guidance_scale,
-                need_patch=False
+                need_patch=False,
+                reference_sample=actions,
             )
-            
-            actions = self.action_scheduler.step(
+
+            flat_actions = self._flatten_action_sample(actions)
+            flat_action_constraints = self.prev_chunk_left_over.get_constrained_actions()
+
+            flat_actions = self.action_scheduler.step(
                 original_denoise_step_partial=denoise_fn,
-                x_t=actions,
+                x_t=flat_actions,
                 timestep=t,
-                sample=actions,
+                sample=flat_actions,
                 to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_actions(),
+                constrained_y=flat_action_constraints,
                 weights=self.prev_chunk_left_over.get_action_prefix_weights(),
                 device=self.device
             )
+            actions = self._unflatten_action_sample(flat_actions, actions)
 
             actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
@@ -672,8 +840,22 @@ class VA_Server:
     def _feedback(self, obs):
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
+        if latent_model_input is None:
+            return
+        if self.prev_chunk_left_over is None:
+            logger.warning("feedback received before PrevChunk initialization; skip current feedback")
+            return
+
+        flattened_state = self._flatten_state_constraints(latent_model_input)
         # 2. 将latent输入加入反馈队列（权重自主维护）
-        self.prev_chunk_left_over.append_new_state(latent_model_input)
+        for state_step in flattened_state:
+            self.prev_chunk_left_over.append_new_state(state_step)
+        logger.info(
+            "PrevChunk feedback appended: appended=%s constrained=%s/%s",
+            flattened_state.shape[0],
+            self.prev_chunk_left_over.state_constrained_num,
+            self.prev_chunk_left_over.state_num,
+        )
         
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
@@ -685,10 +867,16 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
+        prev_action = obs.get('prev_action', obs['state'])
+        action_model_input = self.preprocess_action(prev_action)
         action_model_input = action_model_input.to(latent_model_input)
+        executed_action_steps = int(obs.get('executed_action_steps', 0))
+        flat_actions = self._flatten_action_constraints(action_model_input)
+        self.prev_chunk_action_leftover = self._trim_action_leftover(flat_actions, executed_action_steps)
+        self.prev_chunk_action_constrained_num = self.prev_chunk_action_leftover.shape[0]
         logger.info(
-            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
+            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}, "
+            f"executed_action_steps={executed_action_steps}, leftover={self.prev_chunk_action_constrained_num}"
         )
         input_dict = self._prepare_latent_input(latent_model_input,
                                                 action_model_input,
@@ -732,18 +920,24 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            self.prev_chunk_left_over = FBFM.PrevChunk(
-                # TODO: 初始化参数配置
-                constrain_mode = "Feedback",
-                # actions = ,                   # 来自上个chunk
-                # action_constrained_num = ,    # 来自rtc_config
-                # action_num = ,                # 来自rtc_config
-                # action_dim = ,                # 来自rtc_config
-                # state_num = ,                 # 来自rtc_config
-                # state_dim = ,                 # 来自rtc_config
-                # inference_delay = ,           # 来自延迟实测
+            # Save the current observation layout first, then construct a PrevChunk whose
+            # state/action buffers match the actual Lingbot-VA tensor shapes for this run.
+            self.latest_obs_for_shape = obs.get('obs')
+            if self.prev_chunk_left_over is None:
+                self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
+            self._update_prev_chunk_actions(
+                actions=self.prev_chunk_action_leftover,
+                action_constrained_num=self.prev_chunk_action_constrained_num,
+            )
+            logger.info(
+                "PrevChunk before infer: action_constrained=%s/%s state_constrained=%s/%s",
+                self.prev_chunk_left_over.action_constrained_num,
+                self.prev_chunk_left_over.action_num,
+                self.prev_chunk_left_over.state_constrained_num,
+                self.prev_chunk_left_over.state_num,
             )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            self._reset_prev_chunk_states()
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
@@ -796,9 +990,10 @@ class VA_Server:
         
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
-    
+    #TODO:@torch
+
     def get_denoise_fn(self, input_dict, last_step, frame_chunk_size, 
-                    mode='video', guidance_scale=1.0, need_patch=False):
+                    mode='video', guidance_scale=1.0, need_patch=False, reference_sample=None):
         """
         返回一个可求导的去噪函数，支持 video 和 action 两种模式
         
@@ -815,7 +1010,11 @@ class VA_Server:
         def denoise_fn(x_t):
             # 根据模式选择对应的 key
             res_key = 'latent_res_lst' if mode == 'video' else 'action_res_lst'
-            input_dict[res_key]['noisy_latents'] = x_t
+            if mode == 'video':
+                model_x_t = self._unflatten_video_sample(x_t, reference_sample)
+            else:
+                model_x_t = self._unflatten_action_sample(x_t, reference_sample)
+            input_dict[res_key]['noisy_latents'] = model_x_t
             
             # 调用 transformer
             noise_pred = self.transformer(
@@ -825,27 +1024,25 @@ class VA_Server:
                 action_mode=(mode == 'action')
             )
             
-            # 后处理
-            if not last_step:
-                # Patch 处理 (仅 video 模式需要)
-                if need_patch:
-                    noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1
-                    )
-                
-                # Action 模式需要 rearrange
-                if mode == 'action':
-                    noise_pred = rearrange(noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size)
-                
-                # CFG 处理 (统一逻辑)
-                if guidance_scale > 1:
-                    noise_pred = noise_pred[1:] + guidance_scale * (noise_pred[:1] - noise_pred[1:])
-                else:
-                    noise_pred = noise_pred[:1]
+            # CFG 处理 (统一逻辑)   TODO:check
+            if guidance_scale > 1:
+                noise_pred = noise_pred[1:] + guidance_scale * (noise_pred[:1] - noise_pred[1:])
+            else:
+                noise_pred = noise_pred[:1]
+
+            # 后处理：统一恢复到与 x_t 对应的 5D 表示后再 flatten 回 (T, D)
+            if mode == 'video':
+                noise_pred = data_seq_to_patch(
+                    self.job_config.patch_size, noise_pred,
+                    frame_chunk_size, self.latent_height,
+                    self.latent_width, batch_size=1
+                )
+            else:
+                noise_pred = rearrange(noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size)
             
-            return noise_pred
+            if mode == 'video':
+                return self._flatten_video_sample(noise_pred)
+            return self._flatten_action_sample(noise_pred)
         
         return denoise_fn
 
