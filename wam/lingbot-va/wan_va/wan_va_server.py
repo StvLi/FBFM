@@ -255,15 +255,12 @@ class VA_Server:
         action_num = self.job_config.frame_chunk_size * self.action_per_frame
         action_dim = self.job_config.action_dim
 
-        # State constraints follow the feedback sampling cadence. In the current client
-        # protocol, feedback is emitted multiple times within one predicted frame, and
-        # that count is derived from action_per_frame / tau.
+        # State constraints follow the feedback sampling cadence. Infer the state horizon
+        # from the latent/video time axis, but keep the per-state feature dimension purely
+        # structural so PrevChunk construction never depends on encoding a short real obs.
         state_num = self.job_config.frame_chunk_size * self.feedbacks_per_frame
-        state_dim = 128
-        if self.latest_obs_for_shape is not None:
-            encoded = self._encode_obs({'obs': self.latest_obs_for_shape})
-            if encoded is not None:
-                state_dim = encoded.shape[1] * encoded.shape[3] * encoded.shape[4]
+        state_channels = 48
+        state_dim = state_channels * self.latent_height * self.latent_width
 
         self.prev_chunk_action_num = action_num
         self.prev_chunk_action_dim = action_dim
