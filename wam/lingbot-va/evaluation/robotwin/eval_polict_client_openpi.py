@@ -613,7 +613,7 @@ def eval_policy(task_name,
                         raise NotImplementedError
                     TASK_ENV.take_action(ee_action, action_type='ee')
                    
-                    if (j+1) % feedback_interval == 0:
+                    if (j+1) % action_per_frame == 0:
                         # 对obs的处理 获取obs - 发送server - （server: VAE编码）
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
