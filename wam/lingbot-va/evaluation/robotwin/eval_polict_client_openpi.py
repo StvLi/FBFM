@@ -582,7 +582,7 @@ def eval_policy(task_name,
             # tau=4 is the WAN2.2 VAE temporal downsample rate. The client uses it to
             # convert the action-step axis into the feedback sampling interval.
             assert action.shape[2] % 4 == 0
-            feedback_interval = action.shape[2] // 4
+            action_per_frame = 4
 
             start_idx = 1 if first else 0
             # 动作执行循环
@@ -618,7 +618,10 @@ def eval_policy(task_name,
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
-                        _ = model.infer(dict(obs=obs, feedback=True)) # 将最新观测发送到server 进行FBFM 这一逻辑仅进行反馈 不考虑正常推理obs
+                        if len(full_obs_list) >= action_per_frame:  
+                            # 将最新4帧观测发送到server 进行FBFM 
+                            # 这一逻辑仅进行反馈 不考虑正常推理obs
+                            _ = model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True)) 
                     
             first = False
 
