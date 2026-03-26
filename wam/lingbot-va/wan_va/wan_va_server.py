@@ -916,10 +916,7 @@ class VA_Server:
             self._reset(prompt=prompt)
             return dict()
         elif feedback:
-            # FBFM 处理中间帧逻辑
-            # 第4帧获取到之后才会进入这个循环
-            logger.info(f"################# Feedback #################")
-            self._feedback(obs=obs)
+            logger.info(f"################# Feedback Disabled (NONE) #################")
             return dict()
         elif compute_kv_cache:
             logger.info(f"################# Compute KV Cache #################")
@@ -931,7 +928,7 @@ class VA_Server:
             # state/action buffers match the actual Lingbot-VA tensor shapes for this run.
             self.latest_obs_for_shape = obs.get('obs')
             if self.prev_chunk_left_over is None:
-                self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="Feedback")
+                self.prev_chunk_left_over = self._build_empty_prev_chunk(constrain_mode="None")
             self._update_prev_chunk_actions(
                 actions=self.prev_chunk_action_leftover,
                 action_constrained_num=self.prev_chunk_action_constrained_num,
