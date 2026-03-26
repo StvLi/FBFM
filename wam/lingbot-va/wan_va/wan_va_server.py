@@ -845,6 +845,9 @@ class VA_Server:
         return actions, latents
 
     def _feedback(self, obs):
+        if self.prev_chunk_left_over is not None and self.prev_chunk_left_over.get_constrain_mode() == "None":
+            logger.info("Feedback ignored in NONE mode")
+            return
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
         if latent_model_input is None:
@@ -916,7 +919,8 @@ class VA_Server:
             self._reset(prompt=prompt)
             return dict()
         elif feedback:
-            logger.info(f"################# Feedback Disabled (NONE) #################")
+            logger.info(f"################# Feedback #################")
+            self._feedback(obs=obs)
             return dict()
         elif compute_kv_cache:
             logger.info(f"################# Compute KV Cache #################")
