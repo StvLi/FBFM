@@ -773,7 +773,7 @@ class VA_Server:
                 frame_chunk_size, 
                 mode='video',
                 guidance_scale=self.job_config.guidance_scale,
-                need_patch=(self.job_config.video_step != -1),
+                need_patch=(self.job_config.video_exec_step != -1),
                 reference_sample=latents,
             )
 
@@ -1009,7 +1009,7 @@ class VA_Server:
             frame_chunk_size: 帧块大小
             mode: 'video' 或 'action'
             guidance_scale: CFG 引导系数
-            need_patch: 是否需要 patch 处理 (video 模式且 video_step != -1 时为 True)
+            need_patch: 是否需要 patch 处理 (video 模式且 video_exec_step != -1 时为 True)
         """
         assert mode in ['video', 'action'], "mode must be 'video' or 'action'"
         
