@@ -702,8 +702,19 @@ class VA_Server:
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
+        init_latent = None
         if frame_st_id == 0:
-            init_latent = self._encode_obs(obs)
+            obs_seq = obs.get('obs', [])
+            if not isinstance(obs_seq, list):
+                obs_seq = [obs_seq]
+            if len(obs_seq) >= self.vae_temporal_downsample:
+                init_latent = self._encode_obs(obs)
+            else:
+                logger.warning(
+                    "Skip init_latent encoding at first chunk: obs history too short (%s < %s)",
+                    len(obs_seq),
+                    self.vae_temporal_downsample,
+                )
             self.init_latent = init_latent
 
         latents = torch.randn(1,
@@ -745,7 +756,11 @@ class VA_Server:
         # 1. Video Generation Loop
         for i, t in enumerate(tqdm(timesteps)):
             last_step = i == len(timesteps) - 1
-            latent_cond = init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
+            latent_cond = (
+                init_latent[:, :, 0:1].to(self.dtype)
+                if (frame_st_id == 0 and init_latent is not None)
+                else None
+            )
             
             input_dict = self._prepare_latent_input(
                 latents, None, t, t, latent_cond, None, frame_st_id=frame_st_id
@@ -853,7 +868,7 @@ class VA_Server:
         self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
-        if self.frame_st_id == 0:
+        if self.frame_st_id == 0 and self.init_latent is not None:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
