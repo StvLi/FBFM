@@ -792,7 +792,8 @@ class VA_Server:
             )
             latents = self._unflatten_video_sample(flat_latents, latents)
             
-            latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+            if frame_st_id == 0 and latent_cond is not None:
+                latents[:, :, 0:1] = latent_cond
         
         # 2. Action Generation Loop
         for i, t in enumerate(tqdm(action_timesteps)):
