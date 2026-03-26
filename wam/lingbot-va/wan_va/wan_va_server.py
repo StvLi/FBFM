@@ -574,19 +574,10 @@ class VA_Server:
         if len(images) < 1:
             return None
         
-        # The WAN VAE uses temporal 3D convolutions. Early rollout steps may not yet
-        # provide enough observations, so repeat the latest frame until the minimum
-        # temporal length is satisfied.
-        min_frames = 3
-        if len(images) < min_frames:
-            original_len = len(images)
-            last_image = images[-1]
-            images = images + [last_image] * (min_frames - len(images))
-            logger.warning(
-                "Input has only %s frames, padding to %s frames by repeating the last frame",
-                original_len,
-                min_frames,
-            )
+        # The short-sequence padding workaround is intentionally disabled here.
+        # If the incoming observation history is too short for the WAN VAE, the caller
+        # should solve it at the protocol / scheduling level rather than silently
+        # repeating frames inside _encode_obs().
         
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
