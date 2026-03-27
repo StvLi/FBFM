@@ -52,6 +52,62 @@ from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import Flo
 
 KVCacheType: TypeAlias = torch.Tensor
 
+class WrapperedFlowUniPCMultistepScheduler(FlowUniPCMultistepScheduler):
+    def __init__(
+            self,
+            num_train_timesteps: int = 1000,
+            solver_order: int = 2,
+            prediction_type: str = "flow_prediction",
+            shift: Optional[float] = 1.0,
+            use_dynamic_shifting=False,
+            thresholding: bool = False,
+            dynamic_thresholding_ratio: float = 0.995,
+            sample_max_value: float = 1.0,
+            predict_x0: bool = True,                    # 调用时未设置 默认为True
+            solver_type: str = "bh2",
+            lower_order_final: bool = True,
+            disable_corrector: List[int] = [],
+            solver_p: SchedulerMixin = None,
+            timestep_spacing: str = "linspace",
+            steps_offset: int = 0,
+            final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
+            fbfm_config = None,
+    ):
+            super()._init__(
+                self,
+                num_train_timesteps = num_train_timesteps,
+                solver_order = solver_order,
+                prediction_type = prediction_type,
+                shift = shift,
+                use_dynamic_shifting = use_dynamic_shifting,
+                thresholding = thresholding,
+                dynamic_thresholding_ratio = dynamic_thresholding_ratio,
+                sample_max_value = sample_max_value,
+                predict_x0 = predict_x0,                    # 调用时未设置 默认为True
+                solver_type = solver_type,
+                lower_order_final = lower_order_final,
+                disable_corrector = disable_corrector,
+                solver_p = solver_p,
+                timestep_spacing = timestep_spacing,
+                steps_offset = steps_offset,
+                final_sigmas_type = final_sigmas_type,  # "zero", "sigma_min"
+            )
+            self.fbfm_config = fbfm_config
+
+    def step(
+        self,
+        # model_output: torch.Tensor,
+        original_denoise_step_partial,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+        step_index: int,
+        return_dict: bool = True,
+        constrained_y : Tensor | None = None,
+        weights : Tensor | None = None, 
+    ) -> SchedulerOutput | tuple:
+        
+        pass
+
 @dataclass
 class WANPolicyHeadConfig(PretrainedConfig):
     add_pos_embed: bool = field(
