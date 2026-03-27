@@ -82,7 +82,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             thresholding: bool = False,
             dynamic_thresholding_ratio: float = 0.995,
             sample_max_value: float = 1.0,
-            predict_x0: bool = True,
+            predict_x0: bool = True,                    # 调用时未设置 默认为True
             solver_type: str = "bh2",
             lower_order_final: bool = True,
             disable_corrector: List[int] = [],
@@ -262,6 +262,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 The converted model output.
         """
         if self.predict_x0:
+            # 用于兼容不同的t设置：
+            # 外部未设置 进入本分支
             if self.config.prediction_type == "flow_prediction":
                 sigma_t = self.sigmas[step_index]
                 x0_pred = sample - sigma_t * model_output
@@ -576,7 +578,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             model_output=model_output,
             sample=sample,
             step_index=step_index,
-        )
+        ) # 流匹配算法在这一部分内部实现
         if use_corrector:
             sample = self.multistep_uni_c_bh_update(
                 this_model_output=model_output_convert,

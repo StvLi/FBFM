@@ -898,6 +898,7 @@ class WANPolicyHead(ActionHead):
                     current_start_frame=kv_cache_metadata["start_frame"],
                 )
                 if kv_cache_metadata["update_kv_cache"]:
+                    # 更新kv_cache
                     for block_index, updated_kv_cache in enumerate(updated_kv_caches):
                         kv_cache[block_index] = updated_kv_cache.clone()
             obs_noise_pred = obs_noise_pred.clone()
@@ -941,14 +942,26 @@ class WANPolicyHead(ActionHead):
         return cast(list[tuple[torch.Tensor, torch.Tensor]], output_predictions)
     
     def should_run_model(self, index, current_timestep, prev_predictions):
+        """
+        判断当前步骤是否应该运行模型，支持动态缓存调度策略
+        
+        Args:
+            index: 当前步骤的索引位置
+            current_timestep: 当前的时间步
+            prev_predictions: 之前的预测结果列表，每个元素为 (obs_noise_pred, action_noise_pred) 元组
+            
+        Returns:
+            bool: True 表示应该运行模型，False 表示可以跳过当前步骤
+        """
 
         if not self.dynamic_cache_schedule:
             return self.dit_step_mask[index]
 
-        # Always run first 2 steps to establish history
+        # 始终运行前 2 步以建立历史预测记录
         if len(prev_predictions) < 2:
             return True
 
+        # 根据跳过倒计时决定是否运行模型
         if self.skip_countdown > 1:
             self.skip_countdown -= 1
             return False
@@ -956,10 +969,12 @@ class WANPolicyHead(ActionHead):
             self.skip_countdown = 0 
             return True
 
+        # 计算最近两次预测的动作噪声之间的余弦相似度
         v_last = prev_predictions[-1][1].flatten(1).float()
         v_prev = prev_predictions[-2][1].flatten(1).float()
         sim = torch.nn.functional.cosine_similarity(v_last, v_prev, dim=1).mean()
 
+        # 根据相似度阈值设置跳过计数，相似度高则跳过更多步骤
         thresholds = [0.95, 0.93]
         countdowns = [4, 2]
 
@@ -1091,8 +1106,9 @@ class WANPolicyHead(ActionHead):
             else: 
                 first_frame = videos[:, :, 0:1]  # Extract first frame
                 videos = torch.cat([first_frame, videos], dim=2)
-           
-            image = self.vae.encode(
+
+            # 视频编码
+            image = self.vae.encode(    
                 videos,
                 tiled=self.tiled,
                 tile_size=(self.tile_size_height, self.tile_size_width),
@@ -1140,11 +1156,22 @@ class WANPolicyHead(ActionHead):
 
         start_kv_event.record()
 
+        # 视频生成是自回归过程，每一帧的生成都依赖于前面已生成的帧：
+        #     第 1 次迭代：生成第 1-4 帧，使用第 0 帧作为参考
+        #     第 2 次迭代：生成第 5-8 帧，使用第 1-4 帧作为参考
+        #     第 3 次迭代：生成第 9-12 帧，使用第 5-8 帧作为参考
+
         if self.current_start_frame == 0:
+            # 处理首帧
             timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
+            # 通过传入 current_ref_latents（最近的参考帧）并设置 timestep=0：
+            #     模型执行一次前向传播
+            #     计算这些参考帧的 KV Cache
+            #     存储在 kv_caches 中
+            #     丢弃返回的噪声预测（因为没有实际去噪需求）
             self._run_diffusion_steps(
                 noisy_input=image.transpose(1, 2),
-                timestep=timestep * 0,
+                timestep=timestep * 0,  # timestep=0
                 action=None,
                 timestep_action=None,
                 state=None,
@@ -1157,22 +1184,29 @@ class WANPolicyHead(ActionHead):
                 crossattn_caches=crossattn_caches,
                 kv_cache_metadata=dict(
                     start_frame=0,
-                    update_kv_cache=True,
+                    update_kv_cache=True,   # 缓存更新
                 ),
             )
             self.current_start_frame += 1
             
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
-        if self.current_start_frame != 1:
+        if self.current_start_frame != 1: 
+            # 处理非首帧
             current_ref_latents = image[:, -self.num_frame_per_block:]
             if self.current_start_frame <= self.ys.shape[2]:
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
             else:
                 y = self.ys[:, :, -self.num_frame_per_block:]
+
+            # 通过传入 current_ref_latents（最近的参考帧）并设置 timestep=0：
+            #     模型执行一次前向传播
+            #     计算这些参考帧的 KV Cache
+            #     存储在 kv_caches 中
+            #     丢弃返回的噪声预测（因为没有实际去噪需求）
             self._run_diffusion_steps(
                 noisy_input=current_ref_latents.transpose(1, 2),
-                timestep=timestep * 0,
+                timestep=timestep * 0,  # timestep=0
                 action=None,
                 timestep_action=None,
                 state=None,
@@ -1185,7 +1219,7 @@ class WANPolicyHead(ActionHead):
                 crossattn_caches=crossattn_caches,
                 kv_cache_metadata=dict(
                     start_frame=self.current_start_frame - self.num_frame_per_block,
-                    update_kv_cache=True,
+                    update_kv_cache=True,   # 缓存更新
                 ),
             )
 
@@ -1245,7 +1279,9 @@ class WANPolicyHead(ActionHead):
                 dtype=torch.int64,
             ) * action_timestep
 
+            # 3.2.3中所呈现的DIT Cache实现
             # check if we need to run the DIT step
+            # 如果余弦相似度小于阈值，则运行模型推理；否则，继续使用上一轮的DIT缓存。
             should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
             if should_run_model:
                 dit_compute_steps += 1
@@ -1286,6 +1322,7 @@ class WANPolicyHead(ActionHead):
 
             end_diffusion_events[index].record()
 
+            # 流匹配逻辑
             # Video: denoising step (uses rescaled schedule if decoupled)
             noisy_input = sample_scheduler.step(
                 model_output=flow_pred.transpose(1, 2),
