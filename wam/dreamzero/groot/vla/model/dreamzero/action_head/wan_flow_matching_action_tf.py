@@ -106,7 +106,146 @@ class WrapperedFlowUniPCMultistepScheduler(FlowUniPCMultistepScheduler):
         weights : Tensor | None = None, 
     ) -> SchedulerOutput | tuple:
         
-        pass
+        if self.num_inference_steps is None:
+            raise ValueError(
+                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+            )
+
+        use_corrector = (
+            step_index > 0 and
+            step_index - 1 not in self.disable_corrector and
+            self.last_sample is not None
+        )
+
+        model_output_convert = self.convert_model_output(
+            # model_output=model_output,
+            original_denoise_step_partial,
+            sample=sample,
+            step_index=step_index,
+        ) # 流匹配算法在这一部分内部实现
+
+        # 阈值修正
+        if use_corrector:
+            sample = self.multistep_uni_c_bh_update(
+                this_model_output=model_output_convert,
+                last_sample=self.last_sample,
+                this_sample=sample,
+                order=self.this_order,
+                step_index=step_index,
+            )
+            # We must clone the outputs of a CUDA graph'd computation.
+            sample = sample.clone()
+
+        for i in range(self.config.solver_order - 1):
+            self.model_outputs[i] = self.model_outputs[i + 1]
+            self.timestep_list[i] = self.timestep_list[i + 1]
+
+        self.model_outputs[-1] = model_output_convert
+        self.timestep_list[-1] = timestep
+
+        if self.config.lower_order_final:
+            this_order = min(
+                self.config.solver_order,
+                len(self.timesteps) - step_index,
+            )
+        else:
+            this_order = self.config.solver_order
+
+        # Warmup for multistep.
+        self.this_order = min(this_order, self.lower_order_nums + 1)
+        assert self.this_order > 0
+
+        self.last_sample = sample
+        # Pass the original non-converted model output, in case solver-p is used.
+        prev_sample = self.multistep_uni_p_bh_update(
+            model_output=model_output,
+            sample=sample,
+            order=self.this_order,
+            step_index=step_index,
+        )
+        # We must clone the outputs of a CUDA graph'd computation.
+        prev_sample = prev_sample.clone()
+
+        if self.lower_order_nums < self.config.solver_order:
+            self.lower_order_nums += 1
+
+        if not return_dict:
+            return (prev_sample,)
+
+        return SchedulerOutput(prev_sample=prev_sample)
+    
+    def convert_model_output(
+        self,
+        # model_output: torch.Tensor,
+        original_denoise_step_partial,
+        prev_chunk_left_over,
+        x_t: torch.Tensor,
+        step_index: int,
+        constrained_y : torch.Tensor | None = None,
+        weights : torch.Tensor | None = None, 
+    ) -> torch.Tensor:
+        if self.predict_x0:
+            # 用于兼容不同的t设置：
+            # 外部未设置 进入本分支
+            if self.config.prediction_type == "flow_prediction":
+                sigma_t = self.sigmas[step_index]
+                tau = 1 - sigma_t
+                if prev_chunk_left_over is None:
+                    # First step, no guidance - return v_t
+                    v_t = original_denoise_step_partial(x_t)
+                    x0_pred = x_t - sigma_t * v_t
+                else:
+                    x_t = x_t.clone().detach()
+                    with torch.enable_grad():
+                        v_t = original_denoise_step_partial(x_t)
+                        x_t.requires_grad_(True)
+
+                        x1_t = x_t - sigma_t * v_t  # noqa: N806
+                        err = (prev_chunk_left_over - x1_t) * weights
+                        grad_outputs = err.clone().detach()
+                        correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+
+                    max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
+                    tau_tensor = torch.as_tensor(tau)
+                    squared_one_minus_tau = (1 - tau_tensor) ** 2
+                    inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
+                    c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
+                    guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+                    guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+
+                    v_guided = v_t - guidance_weight * correction
+                    x0_pred = x_t - sigma_t * v_guided
+            else:
+                raise ValueError(
+                    f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
+                    " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
+                )
+
+            if self.config.thresholding:
+                x0_pred = self._threshold_sample(x0_pred)
+
+            return x0_pred
+        else:
+            # if self.config.prediction_type == "flow_prediction":
+            #     sigma_t = self.sigmas[step_index]
+            #     epsilon = sample - (1 - sigma_t) * model_output
+            # else:
+            #     raise ValueError(
+            #         f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
+            #         " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
+            #     )
+
+            # if self.config.thresholding:
+            #     sigma_t = self.sigmas[step_index]
+            #     x0_pred = sample - sigma_t * model_output
+            #     x0_pred = self._threshold_sample(x0_pred)
+            #     epsilon = model_output + x0_pred
+
+            # return epsilon
+            raise ValueError(
+                    f"predict_x0 given as {self.predict_x0} which is not supported for FBFM yet."
+                )
+        
 
 @dataclass
 class WANPolicyHeadConfig(PretrainedConfig):
