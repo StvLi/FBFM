@@ -262,8 +262,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 The converted model output.
         """
         if self.predict_x0:
-            # 用于兼容不同的t设置：
-            # 外部未设置 进入本分支
+            # 初始化时外部未设置predict_x0 进入本分支
             if self.config.prediction_type == "flow_prediction":
                 sigma_t = self.sigmas[step_index]
                 x0_pred = sample - sigma_t * model_output
