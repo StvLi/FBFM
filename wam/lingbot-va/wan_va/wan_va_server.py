@@ -573,6 +573,7 @@ class VA_Server:
             images = [images]
         if len(images) < 1:
             return None
+        logger.info("encode_obs: num_images=%s", len(images))
         
         # The short-sequence padding workaround is intentionally disabled here.
         # If the incoming observation history is too short for the WAN VAE, the caller
@@ -602,6 +603,8 @@ class VA_Server:
             videos_high = videos[0] / 255.0 * 2.0 - 1.0
             videos_left_and_right = torch.cat(videos[1:],
                                               dim=0) / 255.0 * 2.0 - 1.0
+            logger.info("encode_obs: videos_high shape=%s", tuple(videos_high.shape))
+            logger.info("encode_obs: videos_left_and_right shape=%s", tuple(videos_left_and_right.shape))
             vae_device = next(self.streaming_vae.vae.parameters()).device
             enc_out_high = self.streaming_vae.encode_chunk(
                 videos_high.to(vae_device).to(self.dtype))
@@ -616,6 +619,7 @@ class VA_Server:
             videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
             vae_device = next(self.streaming_vae.vae.parameters()).device
             videos_chunk = videos.to(vae_device).to(self.dtype)
+            logger.info("encode_obs: videos shape=%s", tuple(videos_chunk.shape))
             enc_out = self.streaming_vae.encode_chunk(videos_chunk)
 
         mu, logvar = torch.chunk(enc_out, 2, dim=1)

@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import logging
+
 import torch
 from diffusers import AutoencoderKLWan
 from transformers import (
@@ -7,6 +9,8 @@ from transformers import (
 )
 
 from .model import WanTransformer3DModel
+
+logger = logging.getLogger(__name__)
 
 
 def load_vae(
@@ -87,6 +91,7 @@ class WanVAEStreamingWrapper:
         if hasattr(self.vae.config,
                    "patch_size") and self.vae.config.patch_size is not None:
             x_chunk = patchify(x_chunk, self.vae.config.patch_size)
+        logger.info("encode_chunk input shape=%s", tuple(x_chunk.shape))
         feat_idx = [0]
         out = self.encoder(x_chunk,
                            feat_cache=self.feat_cache,
