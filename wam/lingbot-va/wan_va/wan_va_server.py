@@ -616,11 +616,15 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        feedback = obs.get('feedback', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
             return dict()
+        elif feedback:
+            print("反馈了吗?如反!!!")
+            pass
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
