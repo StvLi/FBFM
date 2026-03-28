@@ -624,6 +624,7 @@ class VA_Server:
             return dict()
         elif feedback:
             print("反馈了吗?如如反!!!")
+            self.transformer.clear_pred_cache(self.cache_name)
             latent_model_input = self._encode_obs(obs)
             print("反馈了吗?已如反!!!")
             return dict()
