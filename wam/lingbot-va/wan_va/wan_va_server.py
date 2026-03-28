@@ -267,7 +267,7 @@ class VA_Server:
         self.prev_chunk_state_num = state_num
         self.prev_chunk_state_dim = state_dim
 
-    def _build_empty_prev_chunk(self, constrain_mode="Feedback", actions=None, action_constrained_num=0):
+    def _build_empty_prev_chunk(self, constrain_mode="None", actions=None, action_constrained_num=0):
         # Build a shape-correct PrevChunk for the current rollout. States always start empty
         # for the new chunk and are filled incrementally by feedback observations.
         if self.prev_chunk_action_num is None or self.prev_chunk_state_num is None:
