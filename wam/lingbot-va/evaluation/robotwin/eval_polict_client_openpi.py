@@ -622,9 +622,9 @@ def eval_policy(task_name,
                             # 将最新4帧观测发送到server 进行FBFM 
                             # 这一逻辑仅进行反馈 不考虑正常推理obs
                             print('<<< DEBUG INFO: >>>')
-                            print('full_obs_list Dims: ',full_obs_list.shape)
-                            print('truncated full_obs_list Dims: ',full_obs_list[-action_per_frame:].shape)
-                            print('key_frame_list: ',key_frame_list.shape)
+                            print('full_obs_list Dims: ',len(full_obs_list))
+                            print('truncated full_obs_list Dims: ',len(full_obs_list[-action_per_frame:]))
+                            print('key_frame_list: ',len(key_frame_list))
                             _ = model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True)) 
                     
             first = False
