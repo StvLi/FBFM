@@ -623,7 +623,9 @@ class VA_Server:
             self._reset(prompt=prompt)
             return dict()
         elif feedback:
-            print("反馈了吗?如反!!!")
+            print("反馈了吗?如如反!!!")
+            latent_model_input = self._encode_obs(obs)
+            print("反馈了吗?已如反!!!")
             return dict()
         elif compute_kv_cache:
             logger.info(

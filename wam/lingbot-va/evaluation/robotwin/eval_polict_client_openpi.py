@@ -580,8 +580,8 @@ def eval_policy(task_name,
             key_frame_list = []
 
             assert action.shape[2] % 4 == 0
-            # action_per_frame = action.shape[2] // 4
-            action_per_frame = 4
+            action_per_frame = action.shape[2] // 4
+            # action_per_frame = 4
 
             start_idx = 1 if first else 0
             for i in range(start_idx, action.shape[1]):
