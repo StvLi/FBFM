@@ -13,6 +13,9 @@ if str(robowin_root) not in sys.path:
 # Save original working directory before changing it
 original_cwd = Path.cwd()
 
+
+DEBUG = True
+
 import os
 os.chdir(robowin_root)
 
@@ -619,42 +622,76 @@ def eval_policy(task_name,
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
                         if len(full_obs_list) >= action_per_frame:  
-                            # 将最新4帧观测发送到server 进行FBFM 
-                            # 这一逻辑仅进行反馈 不考虑正常推理obs
-                            print('<<< DEBUG INFO: >>>')
-                            print("full_obs_list len:", len(full_obs_list))
-                            for idx, obs_item in enumerate(full_obs_list):
-                                print(
-                                    f"full_obs_list[{idx}]",
-                                    "cam_high:", obs_item["observation.images.cam_high"].shape,
-                                    "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
-                                    "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
-                                )
+                            if DEBUG:
+                                # 输出debug信息
+                                print('<<< DEBUG INFO: >>>')
+                                print("full_obs_list len:", len(full_obs_list))
+                                for idx, obs_item in enumerate(full_obs_list):
+                                    print(
+                                        f"full_obs_list[{idx}]",
+                                        "cam_high:", obs_item["observation.images.cam_high"].shape,
+                                        "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
+                                        "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
+                                    )
 
-                            truncated_obs = full_obs_list[-action_per_frame:]
-                            print("truncated full_obs_list len:", len(truncated_obs))
-                            for idx, obs_item in enumerate(truncated_obs):
-                                print(
-                                    f"truncated_obs[{idx}]",
-                                    "cam_high:", obs_item["observation.images.cam_high"].shape,
-                                    "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
-                                    "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
-                                )
+                                truncated_obs = full_obs_list[-action_per_frame:]
+                                print("truncated full_obs_list len:", len(truncated_obs))
+                                for idx, obs_item in enumerate(truncated_obs):
+                                    print(
+                                        f"truncated_obs[{idx}]",
+                                        "cam_high:", obs_item["observation.images.cam_high"].shape,
+                                        "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
+                                        "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
+                                    )
 
-                            print("key_frame_list len:", len(key_frame_list))
-                            for idx, obs_item in enumerate(key_frame_list):
-                                print(
-                                    f"key_frame_list[{idx}]",
-                                    "cam_high:", obs_item["observation.images.cam_high"].shape,
-                                    "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
-                                    "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
-                                )
-                            
-                            _ = model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True)) 
+                                print("key_frame_list len:", len(key_frame_list))
+                                for idx, obs_item in enumerate(key_frame_list):
+                                    print(
+                                        f"key_frame_list[{idx}]",
+                                        "cam_high:", obs_item["observation.images.cam_high"].shape,
+                                        "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
+                                        "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
+                                    )
+                            else:
+                                # 将最新4帧观测发送到server 进行FBFM 
+                                # 这一逻辑仅进行反馈 不考虑正常推理obs
+                                _ = model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True)) 
                     
             first = False
 
             executed_action_steps = start_idx * action.shape[2]
+            
+            if DEBUG:
+                                # 输出debug信息
+                                print('<<< DEBUG INFO: >>>')
+                                print("full_obs_list len:", len(full_obs_list))
+                                for idx, obs_item in enumerate(full_obs_list):
+                                    print(
+                                        f"full_obs_list[{idx}]",
+                                        "cam_high:", obs_item["observation.images.cam_high"].shape,
+                                        "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
+                                        "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
+                                    )
+
+                                truncated_obs = full_obs_list[-action_per_frame:]
+                                print("truncated full_obs_list len:", len(truncated_obs))
+                                for idx, obs_item in enumerate(truncated_obs):
+                                    print(
+                                        f"truncated_obs[{idx}]",
+                                        "cam_high:", obs_item["observation.images.cam_high"].shape,
+                                        "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
+                                        "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
+                                    )
+
+                                print("key_frame_list len:", len(key_frame_list))
+                                for idx, obs_item in enumerate(key_frame_list):
+                                    print(
+                                        f"key_frame_list[{idx}]",
+                                        "cam_high:", obs_item["observation.images.cam_high"].shape,
+                                        "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
+                                        "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
+                                    )
+
             model.infer(
                 dict(
                     obs=key_frame_list,
