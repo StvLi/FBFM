@@ -581,6 +581,7 @@ def eval_policy(task_name,
 
             assert action.shape[2] % 4 == 0
             action_per_frame = action.shape[2] // 4
+            # action_per_frame = 4
 
             start_idx = 1 if first else 0
             for i in range(start_idx, action.shape[1]):
@@ -614,6 +615,11 @@ def eval_policy(task_name,
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
+                        if len(full_obs_list) >= action_per_frame:  
+                                # 将最新4帧观测发送到server 进行FBFM 
+                                # 这一逻辑仅进行反馈 不考虑正常推理obs
+                                model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))
+
                     
             first = False
 

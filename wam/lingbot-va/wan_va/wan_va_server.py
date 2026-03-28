@@ -616,10 +616,17 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        feedback = obs.get('feedback', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
+            return dict()
+        elif feedback:
+            print("反馈了吗?如如反!!!")
+            self.transformer.clear_pred_cache(self.cache_name)
+            latent_model_input = self._encode_obs(obs)
+            print("反馈了吗?已如反!!!")
             return dict()
         elif compute_kv_cache:
             logger.info(
