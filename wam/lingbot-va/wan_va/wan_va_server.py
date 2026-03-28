@@ -624,7 +624,7 @@ class VA_Server:
             return dict()
         elif feedback:
             print("反馈了吗?如反!!!")
-            pass
+            return dict()
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
