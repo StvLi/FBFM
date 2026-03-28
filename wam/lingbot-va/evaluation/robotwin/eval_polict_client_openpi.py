@@ -567,13 +567,13 @@ def eval_policy(task_name,
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
         first_obs = None
-        while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
+        while TASK_ENV.take_action_cnt<TASK_ENV.step_lim: 
             if first:
                 observation = TASK_ENV.get_obs()
                 first_obs = format_obs(observation, prompt)
 
             ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
-            action = ret['action']
+            action = ret['action'] # (action_dim, frame_per_chunk, action_per_frame)
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
@@ -586,12 +586,12 @@ def eval_policy(task_name,
 
             start_idx = 1 if first else 0
             # 动作执行循环
-            for i in range(start_idx, action.shape[1]): # 这个循环是遍历各个chunk
-                for j in range(action.shape[2]):        # 这个循环是遍历一个chunk的每一action
+            for i in range(start_idx, action.shape[1]): # 遍历每个 frame
+                for j in range(action.shape[2]):        # 遍历一个frame的每一action
                     raw_action_step = action[:, i, j].flatten() 
                     full_action_history.append(raw_action_step)
 
-                    ee_action = action[:, i, j]
+                    ee_action = action[:, i, j] 
                     if action.shape[0] == 14:
                         ee_action = np.concatenate([
                             ee_action[:3],
