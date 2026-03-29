@@ -37,6 +37,104 @@ from utils import (
     save_async,
 )
 
+# FBFM
+import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
+from fbfm.policies.fbfm.configuration_rtc import RTCConfig
+from torch import Tensor
+
+class WrapperedFlowMatchScheduler(FlowMatchScheduler):
+    def __init__(
+        self,
+        num_inference_steps=100,
+        num_train_timesteps=1000,
+        shift=3.0,
+        sigma_max=1.0,
+        sigma_min=0.003 / 1.002,
+        inverse_timesteps=False,
+        extra_one_step=False,
+        reverse_sigmas=False,
+        exponential_shift=False,
+        exponential_shift_mu=None,
+        shift_terminal=None,
+        rtc_config: RTCConfig = None,
+        ):
+        super().__init__(
+            num_inference_steps=num_inference_steps,
+            num_train_timesteps=num_train_timesteps,
+            shift=shift,
+            sigma_max=sigma_max,
+            sigma_min=sigma_min,
+            inverse_timesteps=inverse_timesteps,
+            extra_one_step=extra_one_step,
+            reverse_sigmas=reverse_sigmas,
+            exponential_shift=exponential_shift,
+            exponential_shift_mu=exponential_shift_mu,
+            shift_terminal=shift_terminal,
+            )
+        self.rtc_config = rtc_config
+    @torch.enable_grad()
+    def step(self,
+             original_denoise_step_partial,
+             x_t,
+             timestep, 
+             sample, 
+             to_final=False, 
+             constrained_y : Tensor | None = None,
+             weights : Tensor | None = None, 
+             device = None, 
+             **kwargs
+             ):
+        # 原step函数
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.cpu()
+        timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        
+        # 去噪时间方案
+        sigma = self.sigmas[timestep_id]
+        if to_final or timestep_id + 1 >= len(self.timesteps):
+            sigma_ = 1 if (self.inverse_timesteps
+                           or self.reverse_sigmas) else 0
+        else:
+            sigma_ = self.sigmas[timestep_id + 1]
+
+        # 转换为RTC中 由1到0的虚时间轴 由tau表示
+        tau = 1 - sigma
+
+        if constrained_y is not None and weights is not None:
+            x_t = x_t.clone().detach()
+
+            # 疑似没有用 weights 已经自动过了
+            # batch_size = x_t.shape[0] # B
+            # chunk_size = x_t.shape[1] # T
+            # action_dim = x_t.shape[2] # N
+
+            with torch.enable_grad():
+                v_t = original_denoise_step_partial(x_t)
+                x_t.requires_grad_(True)
+
+                x1_t = x_t - sigma * v_t  # noqa: N806
+                err = (constrained_y - x1_t) * weights
+                grad_outputs = err.clone().detach()
+                correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+
+            max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
+            tau_tensor = torch.as_tensor(tau)
+            squared_one_minus_tau = (1 - tau_tensor) ** 2
+            inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
+            c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
+            guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+            guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+
+            v_result_t = v_t - guidance_weight * correction
+
+        else:
+            # First step, no guidance - return v_t
+            v_result_t = original_denoise_step_partial(x_t)
+
+        
+        prev_sample = sample + v_result_t * (sigma_ - sigma)
+
+        return prev_sample
 
 class VA_Server:
 
@@ -48,13 +146,21 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
-        self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
+        self.rtc_config = RTCConfig(
+            # TODO: 暂时用这个，后面改成从job_config中读取
+        )
+
+        # FBFM装饰后得Scheduler
+        self.scheduler = WrapperedFlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
-                                            extra_one_step=True)
-        self.action_scheduler = FlowMatchScheduler(
+                                            extra_one_step=True,
+                                            rtc_config=self.rtc_config)
+        self.action_scheduler = WrapperedFlowMatchScheduler(
             shift=self.job_config.action_snr_shift,
             sigma_min=0.0,
-            extra_one_step=True)
+            extra_one_step=True,
+            rtc_config=self.rtc_config)
+        
         self.scheduler.set_timesteps(1000, training=True)
         self.action_scheduler.set_timesteps(1000, training=True)
 
@@ -161,9 +267,6 @@ class VA_Server:
         device=None,
         dtype=None,
     ):
-        r"""
-        TODO
-        """
         device = device or self.device
         dtype = dtype or self.dtype
 
@@ -489,84 +592,73 @@ class VA_Server:
              1),  # pad 1 element at the end (right side) of the last dimension
             mode='constant',
             value=0)
+    
+        # 1. Video Generation Loop
+        for i, t in enumerate(tqdm(timesteps)):
+            last_step = i == len(timesteps) - 1
+            latent_cond = init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
+            
+            input_dict = self._prepare_latent_input(
+                latents, None, t, t, latent_cond, None, frame_st_id=frame_st_id
+            )
+            
+            # 使用通用去噪函数
+            denoise_fn = self.get_denoise_fn(
+                input_dict, 
+                last_step, 
+                frame_chunk_size, 
+                mode='video',
+                guidance_scale=self.job_config.guidance_scale,
+                need_patch=(self.job_config.video_step != -1)
+            )
+            
+            latents = self.scheduler.step(
+                original_denoise_step_partial=denoise_fn,
+                x_t=latents,
+                timestep=t,
+                sample=latents,
+                to_final=last_step,
+                constrained_y=self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None,
+                weights=self.prev_chunk_left_over.get_state_prefix_weights() if hasattr(self, 'prev_chunk_left_over') else None,
+                device=self.device
+            )
+            
+            latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+        
+        # 2. Action Generation Loop
+        for i, t in enumerate(tqdm(action_timesteps)):
+            last_step = i == len(action_timesteps) - 1
+            action_cond = torch.zeros(
+                [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
+                device=self.device, dtype=self.dtype
+            ) if frame_st_id == 0 else None
 
-        with (
-                torch.no_grad(),
-        ):
-            # 1. Video Generation Loop
-            for i, t in enumerate(tqdm(timesteps)):
-                last_step = i == len(timesteps) - 1
-                latent_cond = init_latent[:, :, 0:1].to(
-                    self.dtype) if frame_st_id == 0 else None
-                input_dict = self._prepare_latent_input(
-                    latents,
-                    None,
-                    t,
-                    t,
-                    latent_cond,
-                    None,
-                    frame_st_id=frame_st_id)
+            input_dict = self._prepare_latent_input(
+                None, actions, t, t, None, action_cond, frame_st_id=frame_st_id
+            )
+            
+            # 复用通用去噪函数
+            denoise_fn = self.get_denoise_fn(
+                input_dict, 
+                last_step, 
+                frame_chunk_size, 
+                mode='action',
+                guidance_scale=self.job_config.action_guidance_scale,
+                need_patch=False
+            )
+            
+            actions = self.action_scheduler.step(
+                original_denoise_step_partial=denoise_fn,
+                x_t=actions,
+                timestep=t,
+                sample=actions,
+                to_final=last_step,
+                constrained_y=self.prev_chunk_left_over.get_constrained_actions(),
+                weights=self.prev_chunk_left_over.get_action_prefix_weights(),
+                device=self.device
+            )
 
-                video_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=False)
-
-                if not last_step or video_step != -1:
-                    video_noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, video_noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
-                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
-                    else:
-                        video_noise_pred = video_noise_pred[:1]
-                    latents = self.scheduler.step(video_noise_pred,
-                                                  t,
-                                                  latents,
-                                                  return_dict=False)
-
-                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
-
-            for i, t in enumerate(tqdm(action_timesteps)):
-                last_step = i == len(action_timesteps) - 1
-                action_cond = torch.zeros(
-                    [
-                        1, self.job_config.action_dim, 1,
-                        self.action_per_frame, 1
-                    ],
-                    device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
-
-                input_dict = self._prepare_latent_input(
-                    None,
-                    actions,
-                    t,
-                    t,
-                    None,
-                    action_cond,
-                    frame_st_id=frame_st_id)
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True)
-
-                if not last_step:
-                    action_noise_pred = rearrange(action_noise_pred,
-                                                  'b (f n) c -> b c f n 1',
-                                                  f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
-                    else:
-                        action_noise_pred = action_noise_pred[:1]
-                    actions = self.action_scheduler.step(action_noise_pred,
-                                                         t,
-                                                         actions,
-                                                         return_dict=False)
-
-                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+            actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
         actions[:, ~self.action_mask] *= 0
 
@@ -577,6 +669,12 @@ class VA_Server:
         torch.cuda.empty_cache()
         return actions, latents
 
+    def _feedback(self, obs):
+        # 1. 将obs转换成latent
+        latent_model_input = self._encode_obs(obs)
+        # 2. 将latent输入加入反馈队列（权重自主维护）
+        self.prev_chunk_left_over.append_new_state(latent_model_input)
+        
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
@@ -616,25 +714,35 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
-        feedback = obs.get('feedback', False)
+        feedback = obs.get('feedback', False)    # 状态反馈标志
 
         if reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
             return dict()
         elif feedback:
-            print("反馈了吗?如如反!!!")
-            self.transformer.clear_pred_cache(self.cache_name)
-            latent_model_input = self._encode_obs(obs)
-            print("反馈了吗?已如反!!!")
+            # FBFM 处理中间帧逻辑
+            # 第4帧获取到之后才会进入这个循环
+            logger.info(f"################# Feedback #################")
+            self._feedback(obs=obs)
             return dict()
         elif compute_kv_cache:
-            logger.info(
-                f"################# Compute KV Cache #################")
+            logger.info(f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            self.prev_chunk_left_over = FBFM.PrevChunk(
+                # TODO: 初始化参数配置
+                constrain_mode = "Feedback",
+                # actions = ,                   # 来自上个chunk
+                # action_constrained_num = ,    # 来自rtc_config
+                # action_num = ,                # 来自rtc_config
+                # action_dim = ,                # 来自rtc_config
+                # state_num = ,                 # 来自rtc_config
+                # state_dim = ,                 # 来自rtc_config
+                # inference_delay = ,           # 来自延迟实测
+            )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
@@ -658,7 +766,7 @@ class VA_Server:
         init_obs = {}
         init_obs['obs'] = [imf_dict]
         return init_obs
-    
+
     @torch.no_grad()
     def generate(self):
         self.video_processor = VideoProcessor(vae_scale_factor=1)
@@ -688,6 +796,58 @@ class VA_Server:
         
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
+    
+    def get_denoise_fn(self, input_dict, last_step, frame_chunk_size, 
+                    mode='video', guidance_scale=1.0, need_patch=False):
+        """
+        返回一个可求导的去噪函数，支持 video 和 action 两种模式
+        
+        Args:
+            input_dict: 输入字典，包含 latent_res_lst 或 action_res_lst
+            last_step: 是否为最后一步
+            frame_chunk_size: 帧块大小
+            mode: 'video' 或 'action'
+            guidance_scale: CFG 引导系数
+            need_patch: 是否需要 patch 处理 (video 模式且 video_step != -1 时为 True)
+        """
+        assert mode in ['video', 'action'], "mode must be 'video' or 'action'"
+        
+        def denoise_fn(x_t):
+            # 根据模式选择对应的 key
+            res_key = 'latent_res_lst' if mode == 'video' else 'action_res_lst'
+            input_dict[res_key]['noisy_latents'] = x_t
+            
+            # 调用 transformer
+            noise_pred = self.transformer(
+                self._repeat_input_for_cfg(input_dict[res_key]),
+                update_cache=1 if last_step else 0,
+                cache_name=self.cache_name,
+                action_mode=(mode == 'action')
+            )
+            
+            # 后处理
+            if not last_step:
+                # Patch 处理 (仅 video 模式需要)
+                if need_patch:
+                    noise_pred = data_seq_to_patch(
+                        self.job_config.patch_size, noise_pred,
+                        frame_chunk_size, self.latent_height,
+                        self.latent_width, batch_size=2 if self.use_cfg else 1
+                    )
+                
+                # Action 模式需要 rearrange
+                if mode == 'action':
+                    noise_pred = rearrange(noise_pred, 'b (f n) c -> b c f n 1', f=frame_chunk_size)
+                
+                # CFG 处理 (统一逻辑)
+                if guidance_scale > 1:
+                    noise_pred = noise_pred[1:] + guidance_scale * (noise_pred[:1] - noise_pred[1:])
+                else:
+                    noise_pred = noise_pred[:1]
+            
+            return noise_pred
+        
+        return denoise_fn
 
 def run(args):    
     
@@ -713,9 +873,6 @@ def run(args):
         raise ValueError(f"Unknown infer mode: {config.infer_mode}")
 
 def main():
-    """
-    TODO
-    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config-name",
