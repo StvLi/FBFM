@@ -6,8 +6,7 @@ from .shared_config import va_shared_cfg
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/share/project/Ruimeng/FBFM/wam/lingbot-va/pre_models"
-va_robotwin_cfg.transformer_checkpoint_path = "/share/project/caomingyu/WAM_baseline/lingbot_ckpt/lingbot_va_results/20260305_205235/checkpoints/checkpoint_step_20000"
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/share/project/caomingyu/WAM_baseline/lingbot_va_results/20260305_205235/checkpoints/checkpoint_step_16000"
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
