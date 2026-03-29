@@ -567,13 +567,19 @@ class VA_Server:
                                                           action_mask] *= 0
         return input_dict
 
-    def _encode_obs(self, obs):
+    def _encode_obs(self, obs, reset_vae_cache: bool = False):
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
             return None
         logger.info("encode_obs: num_images=%s", len(images))
+
+        if reset_vae_cache:
+            self.streaming_vae.clear_cache()
+            if self.streaming_vae_half is not None:
+                self.streaming_vae_half.clear_cache()
+            logger.info("encode_obs: cleared streaming VAE cache before encoding")
         
         # The short-sequence padding workaround is intentionally disabled here.
         # If the incoming observation history is too short for the WAN VAE, the caller
@@ -850,7 +856,7 @@ class VA_Server:
 
     def _feedback(self, obs):
         # 1. 将obs转换成latent
-        latent_model_input = self._encode_obs(obs)
+        latent_model_input = self._encode_obs(obs, reset_vae_cache=True)
         if latent_model_input is None:
             return
         if self.prev_chunk_left_over is None:
@@ -872,7 +878,7 @@ class VA_Server:
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
-        latent_model_input = self._encode_obs(obs)
+        latent_model_input = self._encode_obs(obs, reset_vae_cache=True)
         if self.frame_st_id == 0 and self.init_latent is not None:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
