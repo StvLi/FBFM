@@ -569,6 +569,7 @@ def eval_policy(task_name,
         inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
+        kv_cache_frame_history = []
         first_obs = None
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim: 
             if first:
@@ -586,6 +587,8 @@ def eval_policy(task_name,
             # convert the action-step axis into the feedback sampling interval.
             assert action.shape[2] % 4 == 0
             action_per_frame = 8
+            fixed_kv_cache_frames = 2
+            enable_feedback = False
 
             start_idx = 1 if first else 0
             # 动作执行循环
@@ -621,6 +624,7 @@ def eval_policy(task_name,
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
+                        kv_cache_frame_history.append(obs)
                         if len(full_obs_list) >= action_per_frame:  
                             if DEBUG:
                                 # 输出debug信息
@@ -652,7 +656,7 @@ def eval_policy(task_name,
                                         "cam_left:", obs_item["observation.images.cam_left_wrist"].shape,
                                         "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
                                     )
-                            else:
+                            elif enable_feedback:
                                 # 将最新4帧观测发送到server 进行FBFM 
                                 # 这一逻辑仅进行反馈 不考虑正常推理obs
                                 _ = model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True)) 
@@ -692,16 +696,18 @@ def eval_policy(task_name,
                                         "cam_right:", obs_item["observation.images.cam_right_wrist"].shape,
                                     )
 
-            model.infer(
-                dict(
-                    obs=key_frame_list,
-                    compute_kv_cache=True,
-                    imagine=False,
-                    save_visualization=save_visualization,
-                    state=action,
-                    executed_action_steps=executed_action_steps,
+            kv_cache_obs = kv_cache_frame_history[-fixed_kv_cache_frames:]
+            if len(kv_cache_obs) == fixed_kv_cache_frames:
+                model.infer(
+                    dict(
+                        obs=kv_cache_obs,
+                        compute_kv_cache=True,
+                        imagine=False,
+                        save_visualization=save_visualization,
+                        state=action,
+                        executed_action_steps=executed_action_steps,
+                    )
                 )
-            )
   
             if TASK_ENV.eval_success:
                 succ = True
