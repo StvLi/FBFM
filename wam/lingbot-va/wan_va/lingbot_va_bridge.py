@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+import numpy as np
 import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 from utils import FlowMatchScheduler

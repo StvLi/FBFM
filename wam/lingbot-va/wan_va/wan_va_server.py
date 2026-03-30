@@ -40,6 +40,7 @@ from utils import (
 # FBFM核心组件
 from lingbot_va_bridge import VA_PrevChunkAdapter as PrevChunkAdapter           # 跨Chunk数据维护
 from lingbot_va_bridge import WrapperedFlowMatchScheduler as FlowMatchScheduler # FBFM流匹配实现
+from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 
 class VA_Server:
 
