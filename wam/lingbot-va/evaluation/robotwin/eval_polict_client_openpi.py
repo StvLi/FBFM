@@ -578,8 +578,13 @@ def eval_policy(task_name,
                 observation = TASK_ENV.get_obs()
                 first_obs = format_obs(observation, prompt)
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
-            action = ret['action']
+            # DEBUG: Pseudo-Asynchronous
+            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale,
+                                   immediate_return = first,    # 只有在第一轮时候才返回
+                                   )) #(TASK_ENV, model, observation)
+            if first:
+                action = ret['action']
+
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
@@ -589,6 +594,7 @@ def eval_policy(task_name,
 
             assert action.shape[2] % 4 == 0
             action_per_frame = 4
+            chunk_size = action.shape[1] * action.shape[2] # 2*16 = 32
 
             start_idx = 1 if first else 0
             # 动作执行循环
@@ -600,6 +606,11 @@ def eval_policy(task_name,
                     if not first and pseudo_async_steps_count < INFER_DELAY_STEPS:
                        # Skip the first INFER_DELAY_STEPS steps
                        continue
+                    elif pseudo_async_steps_count == INFER_DELAY_STEPS:
+                        ret = model.infer(dict(immediate_return = True,    # 此时返回并接收
+                                   ))
+                        action = ret['action']                             # 接收到下一题chunk的action
+
 
                     raw_action_step = action[:, i, j].flatten() 
                     full_action_history.append(raw_action_step)
@@ -636,10 +647,12 @@ def eval_policy(task_name,
                                 # 这一逻辑仅进行反馈 不考虑正常推理obs
                                 model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))
 
-                    
-            first = False
-
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+                    if pseudo_async_steps_count == chunk_size - INFER_DELAY_STEPS:
+                        # 提前触发推理逻辑
+                        first = False
+                        model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action,
+                                        immediate_return = False,  # 不直接返回 在下一周期中if pseudo_async_steps_count == INFER_DELAY_STEPS 分支中返回
+                                        ))
             
             # DEBUG: Pseudo-Asynchronous
             pseudo_async_steps_count = 0 # Reset
