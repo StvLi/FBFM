@@ -628,6 +628,7 @@ class VA_Server:
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
         feedback = obs.get('feedback', False)    # 状态反馈标志
+        immediate_return = obs.get('immediate_return', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
@@ -673,10 +674,50 @@ class VA_Server:
                 dtype=self.dtype,
                 inference_delay=16,
             )
-
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            self.last_action = action
-            return dict(action=action)
+            if immediate_return:
+                if self.prev_chunk_left_over is None:
+                    logger.info(f"################# Init First PrevChunkAdapter with None #################")
+                    self.prev_chunk_left_over = PrevChunkAdapter(
+                        constrain_mode="None",
+                        prev_actions=self.last_action,
+                        used_action_channel_ids=self.job_config.used_action_channel_ids,
+                        action_num=action_num,
+                        action_dim=self.job_config.action_dim,
+                        frame_chunk_size=frame_chunk_size,
+                        action_per_frame=action_per_frame,
+                        state_num=state_num,
+                        latent_channel=latent_channel,
+                        latent_height=self.latent_height,
+                        latent_width=self.latent_width,
+                        state_dim=state_dim,
+                        device=self.device,
+                        dtype=self.dtype,
+                        inference_delay=16,
+                    )
+                action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+                self.last_action = action
+                return dict(action=action)
+            else:
+                logger.info(f"################# Init a New PrevChunkAdapter with Feedback #################")
+                # 如果不要立即返回结果，则清空self.prev_chunk_left_over，开始记录
+                self.prev_chunk_left_over = PrevChunkAdapter(
+                    constrain_mode="Feedback",
+                    prev_actions=self.last_action,
+                    used_action_channel_ids=self.job_config.used_action_channel_ids,
+                    action_num=action_num,
+                    action_dim=self.job_config.action_dim,
+                    frame_chunk_size=frame_chunk_size,
+                    action_per_frame=action_per_frame,
+                    state_num=state_num,
+                    latent_channel=latent_channel,
+                    latent_height=self.latent_height,
+                    latent_width=self.latent_width,
+                    state_dim=state_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                    inference_delay=16,
+                )
+                return dict()
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
