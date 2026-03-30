@@ -585,7 +585,7 @@ def eval_policy(task_name,
             # tau=4 is the WAN2.2 VAE temporal downsample rate. The client uses it to
             # convert the action-step axis into the feedback sampling interval.
             assert action.shape[2] % 4 == 0
-            action_per_frame = 4
+            action_per_frame = 8
 
             start_idx = 1 if first else 0
             # 动作执行循环
@@ -698,7 +698,7 @@ def eval_policy(task_name,
                     compute_kv_cache=True,
                     imagine=False,
                     save_visualization=save_visualization,
-                    prev_action=action,
+                    state=action,
                     executed_action_steps=executed_action_steps,
                 )
             )
