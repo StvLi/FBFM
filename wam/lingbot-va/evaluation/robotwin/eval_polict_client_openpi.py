@@ -587,7 +587,7 @@ def eval_policy(task_name,
             # convert the action-step axis into the feedback sampling interval.
             assert action.shape[2] % 4 == 0
             action_per_frame = 8
-            fixed_kv_cache_frames = 4
+            fixed_kv_cache_frames = 8
             enable_feedback = False
 
             start_idx = 1 if first else 0
