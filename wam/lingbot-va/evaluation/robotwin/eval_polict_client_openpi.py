@@ -567,6 +567,12 @@ def eval_policy(task_name,
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
         first_obs = None
+
+        # DEBUG: Pseudo-Asynchronous
+        INFER_DELAY_STEPS = 16
+        pseudo_async_steps_count = 0
+        key_frame_list = []
+
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
             if first:
                 observation = TASK_ENV.get_obs()
@@ -577,7 +583,9 @@ def eval_policy(task_name,
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
-            key_frame_list = []
+            
+            # DEBUG: Pseudo-Asynchronous
+            # key_frame_list = []
 
             assert action.shape[2] % 4 == 0
             action_per_frame = 4
@@ -586,6 +594,13 @@ def eval_policy(task_name,
             # 动作执行循环
             for i in range(start_idx, action.shape[1]): # 这个循环是遍历各个chunk
                 for j in range(action.shape[2]):        # 这个循环是遍历一个chunk的每一action
+                    
+                    # DEBUG: Pseudo-Asynchronous
+                    pseudo_async_steps_count += 1
+                    if not first and pseudo_async_steps_count < INFER_DELAY_STEPS:
+                       # Skip the first INFER_DELAY_STEPS steps
+                       continue
+
                     raw_action_step = action[:, i, j].flatten() 
                     full_action_history.append(raw_action_step)
 
@@ -625,6 +640,11 @@ def eval_policy(task_name,
             first = False
 
             model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+            
+            # DEBUG: Pseudo-Asynchronous
+            pseudo_async_steps_count = 0 # Reset
+            overlap_frame_num = INFER_DELAY_STEPS // action_per_frame
+            key_frame_list = full_obs_list[-overlap_frame_num:]
   
             if TASK_ENV.eval_success:
                 succ = True
