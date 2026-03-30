@@ -580,12 +580,12 @@ def eval_policy(task_name,
             key_frame_list = []
 
             assert action.shape[2] % 4 == 0
-            action_per_frame = action.shape[2] // 4
-            # action_per_frame = 4
+            action_per_frame = 4
 
             start_idx = 1 if first else 0
-            for i in range(start_idx, action.shape[1]):
-                for j in range(action.shape[2]):
+            # 动作执行循环
+            for i in range(start_idx, action.shape[1]): # 这个循环是遍历各个chunk
+                for j in range(action.shape[2]):        # 这个循环是遍历一个chunk的每一action
                     raw_action_step = action[:, i, j].flatten() 
                     full_action_history.append(raw_action_step)
 
@@ -612,10 +612,11 @@ def eval_policy(task_name,
                     TASK_ENV.take_action(ee_action, action_type='ee')
                    
                     if (j+1) % action_per_frame == 0:
+                        # 对obs的处理 获取obs - 发送server - （server: VAE编码）
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
-                        if len(full_obs_list) >= action_per_frame:  
+                        if len(full_obs_list) >= action_per_frame+1:  
                                 # 将最新4帧观测发送到server 进行FBFM 
                                 # 这一逻辑仅进行反馈 不考虑正常推理obs
                                 model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))

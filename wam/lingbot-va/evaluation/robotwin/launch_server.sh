@@ -4,6 +4,8 @@ MASTER_PORT=${MASTER_PORT:-29061}
 save_root='visualization/'
 mkdir -p $save_root
 
+export PYTHONPATH=/share/project/peize/FBFM:$PYTHONPATH
+
 python -m torch.distributed.run \
     --nproc_per_node 1 \
     --master_port $MASTER_PORT \
