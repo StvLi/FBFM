@@ -400,6 +400,8 @@ class VA_Server:
         self.frame_st_id = 0
         self.init_latent = None
         self.last_action = None
+        self.last_obs = None
+        self.first_epoch = True
         if hasattr(self, 'prev_chunk_left_over'):
             delattr(self, 'prev_chunk_left_over')
         #### clean vae and transformer cache
@@ -583,6 +585,7 @@ class VA_Server:
         return actions, latents
 
     def _feedback(self, obs):
+        # pass
         # 1. 将obs转换成latent
         latent_model_input = self._encode_obs(obs)
         # 2. 将latent输入加入反馈队列（权重自主维护）
@@ -643,6 +646,39 @@ class VA_Server:
         elif compute_kv_cache:
             logger.info(f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
+
+            if not self.first_epoch:
+                logger.info(f"################# Init a New PrevChunkAdapter with Feedback #################")
+
+                frame_chunk_size = self.job_config.frame_chunk_size
+                action_per_frame = self.action_per_frame
+                action_num = frame_chunk_size * action_per_frame
+
+                latent_channel = getattr(self.transformer.config, 'in_channels', 48)
+
+                state_num = frame_chunk_size
+                state_dim = latent_channel * self.latent_height * self.latent_width
+
+                # 如果不要立即返回结果，则清空self.prev_chunk_left_over，开始记录
+                self.prev_chunk_left_over = PrevChunkAdapter(
+                    constrain_mode="None",
+                    prev_actions=self.last_action,
+                    used_action_channel_ids=self.job_config.used_action_channel_ids,
+                    action_num=action_num,
+                    action_dim=self.job_config.action_dim,
+                    frame_chunk_size=frame_chunk_size,
+                    action_per_frame=action_per_frame,
+                    state_num=state_num,
+                    latent_channel=latent_channel,
+                    latent_height=self.latent_height,
+                    latent_width=self.latent_width,
+                    state_dim=state_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                    inference_delay=16,
+                )
+                self.last_obs = obs
+
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
@@ -658,7 +694,7 @@ class VA_Server:
 
             # Build PrevChunk adapter so FBFM constraints can work with VA outputs.
             self.prev_chunk_left_over = PrevChunkAdapter(
-                constrain_mode="Feedback",
+                constrain_mode="None",
                 prev_actions=self.last_action,
                 used_action_channel_ids=self.job_config.used_action_channel_ids,
                 action_num=action_num,
@@ -675,7 +711,8 @@ class VA_Server:
                 inference_delay=16,
             )
             if immediate_return:
-                if self.prev_chunk_left_over is None:
+                if self.first_epoch:
+                    # 第一epoch
                     logger.info(f"################# Init First PrevChunkAdapter with None #################")
                     self.prev_chunk_left_over = PrevChunkAdapter(
                         constrain_mode="None",
@@ -694,30 +731,15 @@ class VA_Server:
                         dtype=self.dtype,
                         inference_delay=16,
                     )
-                action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-                self.last_action = action
-                return dict(action=action)
-            else:
-                logger.info(f"################# Init a New PrevChunkAdapter with Feedback #################")
-                # 如果不要立即返回结果，则清空self.prev_chunk_left_over，开始记录
-                self.prev_chunk_left_over = PrevChunkAdapter(
-                    constrain_mode="Feedback",
-                    prev_actions=self.last_action,
-                    used_action_channel_ids=self.job_config.used_action_channel_ids,
-                    action_num=action_num,
-                    action_dim=self.job_config.action_dim,
-                    frame_chunk_size=frame_chunk_size,
-                    action_per_frame=action_per_frame,
-                    state_num=state_num,
-                    latent_channel=latent_channel,
-                    latent_height=self.latent_height,
-                    latent_width=self.latent_width,
-                    state_dim=state_dim,
-                    device=self.device,
-                    dtype=self.dtype,
-                    inference_delay=16,
-                )
-                return dict()
+                    action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+                    self.last_action = action
+                    self.first_epoch = False
+                    return dict(action=action)
+                else:
+                    # 后续epoch
+                    action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+                    self.last_action = action
+                    return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)

@@ -579,10 +579,10 @@ def eval_policy(task_name,
                 first_obs = format_obs(observation, prompt)
 
             # DEBUG: Pseudo-Asynchronous
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale,
-                                   immediate_return = first,    # 只有在第一轮时候才返回
-                                   )) #(TASK_ENV, model, observation)
             if first:
+                ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale,
+                                    immediate_return = first,    # 只有在第一轮时候才返回
+                                    )) #(TASK_ENV, model, observation)
                 action = ret['action']
 
             if 'video' in ret:
@@ -603,13 +603,16 @@ def eval_policy(task_name,
                     
                     # DEBUG: Pseudo-Asynchronous
                     pseudo_async_steps_count += 1
-                    if not first and pseudo_async_steps_count < INFER_DELAY_STEPS:
-                       # Skip the first INFER_DELAY_STEPS steps
-                       continue
-                    elif pseudo_async_steps_count == INFER_DELAY_STEPS:
-                        ret = model.infer(dict(immediate_return = True,    # 此时返回并接收
-                                   ))
-                        action = ret['action']                             # 接收到下一题chunk的action
+                    if not first:
+                        if pseudo_async_steps_count < INFER_DELAY_STEPS+1:
+                            # Skip the first INFER_DELAY_STEPS steps
+                            continue
+                        elif  pseudo_async_steps_count == INFER_DELAY_STEPS+1:
+                            ret = model.infer(dict(
+                                obs = first_obs,
+                                immediate_return = True,    # 此时返回并接收
+                                    ))
+                            action = ret['action']                             # 接收到下一题chunk的action
 
 
                     raw_action_step = action[:, i, j].flatten() 
@@ -642,7 +645,7 @@ def eval_policy(task_name,
                         obs = format_obs(TASK_ENV.get_obs(), prompt)
                         full_obs_list.append(obs)
                         key_frame_list.append(obs)
-                        if len(full_obs_list) >= action_per_frame+1:  
+                        if len(full_obs_list) >= action_per_frame:  
                                 # 将最新4帧观测发送到server 进行FBFM 
                                 # 这一逻辑仅进行反馈 不考虑正常推理obs
                                 model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))
@@ -650,7 +653,7 @@ def eval_policy(task_name,
                     if pseudo_async_steps_count == chunk_size - INFER_DELAY_STEPS:
                         # 提前触发推理逻辑
                         first = False
-                        model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action,
+                        model.infer(dict(obs = full_obs_list[-action_per_frame:], compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action,
                                         immediate_return = False,  # 不直接返回 在下一周期中if pseudo_async_steps_count == INFER_DELAY_STEPS 分支中返回
                                         ))
             
