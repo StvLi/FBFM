@@ -5,6 +5,170 @@ import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 from utils import FlowMatchScheduler
 
+
+def latent_to_state_vectors(
+    latent: Tensor,
+    *,
+    latent_channel: int,
+    latent_height: int,
+    latent_width: int,
+) -> list[Tensor]:
+    """Convert a latent tensor into per-timestep flattened state vectors."""
+    if latent is None:
+        return []
+
+    if latent.dim() != 5:
+        raise ValueError(f"Expected latent with shape (B, C, F, H, W), got {tuple(latent.shape)}")
+    if latent.shape[0] != 1:
+        raise ValueError(f"Expected latent batch size B=1, got B={latent.shape[0]}")
+    if latent.shape[1] != latent_channel:
+        raise ValueError(
+            f"latent channel mismatch: got C={latent.shape[1]}, expected {latent_channel}"
+        )
+    if latent.shape[3] != latent_height or latent.shape[4] != latent_width:
+        raise ValueError(
+            "latent spatial shape mismatch: "
+            f"got {(latent.shape[3], latent.shape[4])}, "
+            f"expected {(latent_height, latent_width)}"
+        )
+
+    latent_cf_hw = latent[0]
+    vectors = []
+    for ft in range(latent_cf_hw.shape[1]):
+        vectors.append(latent_cf_hw[:, ft, :, :].reshape(-1))
+    return vectors
+
+
+class FeedbackStateBuffer:
+    """Persistent state-feedback buffer independent from per-inference adapters."""
+
+    def __init__(self, *, state_dim: int, device: torch.device, dtype: torch.dtype):
+        self._state_dim = state_dim
+        self._device = device
+        self._dtype = dtype
+        self._states: list[Tensor] = []
+
+    def clear(self) -> None:
+        self._states.clear()
+
+    def __len__(self) -> int:
+        return len(self._states)
+
+    def append_vectors(self, states: Tensor | list[Tensor]) -> None:
+        if isinstance(states, list):
+            state_list = states
+        else:
+            tensor = states if torch.is_tensor(states) else torch.as_tensor(states)
+            if tensor.dim() == 1:
+                state_list = [tensor]
+            elif tensor.dim() == 2:
+                state_list = [tensor[i] for i in range(tensor.shape[0])]
+            else:
+                raise ValueError(
+                    f"append_vectors expects 1D/2D tensor or list, got shape {tuple(tensor.shape)}"
+                )
+
+        for state in state_list:
+            vec = state.reshape(-1)
+            if vec.shape[0] != self._state_dim:
+                raise ValueError(
+                    f"state vector dim mismatch: got {vec.shape[0]}, expected {self._state_dim}"
+                )
+            self._states.append(vec.to(device=self._device, dtype=self._dtype).clone().detach())
+
+    def append_latent(
+        self,
+        latent: Tensor,
+        *,
+        latent_channel: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> int:
+        vectors = latent_to_state_vectors(
+            latent,
+            latent_channel=latent_channel,
+            latent_height=latent_height,
+            latent_width=latent_width,
+        )
+        self.append_vectors(vectors)
+        return len(vectors)
+
+    def export_recent(self, max_states: int) -> tuple[Tensor | None, int]:
+        if max_states <= 0 or len(self._states) == 0:
+            return None, 0
+        selected = self._states[-max_states:]
+        if not selected:
+            return None, 0
+        stacked = torch.stack(selected, dim=0)
+        return stacked, stacked.shape[0]
+
+
+class SlotAlignedStateBuffer:
+    """Maintain slot-indexed state constraints for the next latent chunk."""
+
+    def __init__(self, *, state_dim: int, slot_count: int, device: torch.device, dtype: torch.dtype):
+        if slot_count <= 0:
+            raise ValueError(f"slot_count must be positive, got {slot_count}")
+        self._state_dim = state_dim
+        self._slot_count = slot_count
+        self._device = device
+        self._dtype = dtype
+        self.clear()
+
+    def clear(self) -> None:
+        self._states = torch.zeros(
+            self._slot_count,
+            self._state_dim,
+            device=self._device,
+            dtype=self._dtype,
+        )
+        self._mask = torch.zeros(self._slot_count, device=self._device, dtype=self._dtype)
+        self._next_slot = 0
+
+    def __len__(self) -> int:
+        return int(self._mask.sum().item())
+
+    @property
+    def slot_count(self) -> int:
+        return self._slot_count
+
+    def append_state(self, state: Tensor) -> bool:
+        if self._next_slot >= self._slot_count:
+            return False
+        vec = state.reshape(-1)
+        if vec.shape[0] != self._state_dim:
+            raise ValueError(
+                f"state vector dim mismatch: got {vec.shape[0]}, expected {self._state_dim}"
+            )
+        self._states[self._next_slot] = vec.to(device=self._device, dtype=self._dtype)
+        self._mask[self._next_slot] = 1
+        self._next_slot += 1
+        return True
+
+    def export(self) -> tuple[Tensor, Tensor, int]:
+        return self._states.clone(), self._mask.clone(), self.__len__()
+
+
+class FeedbackSlotTracker:
+    """Track how many raw feedback observations map to one latent state slot."""
+
+    def __init__(self, obs_per_state: int):
+        if obs_per_state <= 0:
+            raise ValueError(f"obs_per_state must be positive, got {obs_per_state}")
+        self.obs_per_state = obs_per_state
+        self.obs_count = 0
+
+    def reset(self) -> None:
+        self.obs_count = 0
+
+    def append(self, num_obs: int = 1) -> int:
+        if num_obs < 0:
+            raise ValueError(f"num_obs must be non-negative, got {num_obs}")
+        prev_slots = self.obs_count // self.obs_per_state
+        self.obs_count += num_obs
+        new_slots = self.obs_count // self.obs_per_state
+        return new_slots - prev_slots
+
 class VA_PrevChunkAdapter(FBFM.PrevChunk):
     """
     Adapter that makes FBFM.PrevChunk constraints compatible with VA_server's
@@ -31,6 +195,9 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
                     latent_height: int,
                     latent_width: int,
                     state_dim: int,
+                    prev_states: Tensor | None = None,
+                    prev_state_constrained_num: int = 0,
+                    prev_state_mask: Tensor | None = None,
                     device: torch.device,
                     dtype: torch.dtype,
                     inference_delay: int = 0):
@@ -69,6 +236,7 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
         self._latent_height = latent_height
         self._latent_width = latent_width
         self._state_dim = state_dim
+        self._explicit_state_mask = None
         self._device = device
         self._dtype = dtype
         self._used_action_channel_ids = used_action_channel_ids
@@ -77,14 +245,19 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
         actions_2d = None
         action_constrained_num = 0
         if prev_actions is not None:
-            actions_2d, action_constrained_num = self._va_prev_actions_to_prev_actions_2d(
+            full_actions_2d, full_action_num = self._va_prev_actions_to_prev_actions_2d(
                 prev_actions,
                 used_action_channel_ids=used_action_channel_ids,
                 action_dim=action_dim,
                 frame_chunk_size=frame_chunk_size,
                 action_per_frame=action_per_frame,
             )
-            action_constrained_num = min(action_constrained_num, action_num)
+            if inference_delay is not None and inference_delay > 0:
+                action_constrained_num = min(inference_delay, full_action_num, action_num)
+                actions_2d = full_actions_2d[-action_constrained_num:].contiguous()
+            else:
+                action_constrained_num = min(full_action_num, action_num)
+                actions_2d = full_actions_2d[:action_constrained_num].contiguous()
 
         # 调用父类构造函数，传入处理后的动作数据、状态占位符及各项配置参数以完成基础初始化
         super().__init__(
@@ -93,12 +266,24 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
             action_constrained_num=action_constrained_num,
             action_num=action_num,
             action_dim=action_dim,
-            states=None,
-            state_constrained_num=0,
+            states=prev_states,
+            state_constrained_num=prev_state_constrained_num,
             state_num=state_num,
             state_dim=state_dim,
             inference_delay=inference_delay,
         )
+        if prev_state_mask is not None:
+            if prev_state_mask.dim() != 1 or prev_state_mask.shape[0] != state_num:
+                raise ValueError(
+                    f"prev_state_mask must have shape ({state_num},), got {tuple(prev_state_mask.shape)}"
+                )
+            self._explicit_state_mask = prev_state_mask.to(
+                device=self._device,
+                dtype=self._dtype,
+            ).clone()
+            self.state_constrained_num = int((self._explicit_state_mask > 0).sum().item())
+        else:
+            self._explicit_state_mask = None
 
         # 将初始化生成的动作和状态张量迁移至指定的计算设备并转换为设定的数据类型
         self.actions = self.actions.to(device=self._device, dtype=self._dtype)
@@ -260,8 +445,11 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
 
     def get_state_prefix_weights(self) -> Tensor:
         # (B=1, 1, F, 1, 1)
-        w_1d = super().get_state_prefix_weights().to(device=self._device,
-                                                     dtype=self._dtype)
+        if self._explicit_state_mask is not None:
+            w_1d = self._explicit_state_mask
+        else:
+            w_1d = super().get_state_prefix_weights().to(device=self._device,
+                                                         dtype=self._dtype)
         return w_1d[None, None, :, None, None].contiguous()
 
     def get_constrained_actions(self) -> Tensor:
@@ -337,7 +525,7 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
         tau = 1 - sigma
 
         if constrained_y is not None and weights is not None:
-            x_t = x_t.clone().detach()
+            x_t = x_t.clone().detach().requires_grad_(True)
 
             # 疑似没有用 weights 已经自动过了
             # batch_size = x_t.shape[0] # B
@@ -346,8 +534,6 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
 
             with torch.enable_grad():
                 v_t = original_denoise_step_partial(x_t)
-                x_t.requires_grad_(True)
-
                 x1_t = x_t - sigma * v_t  # noqa: N806
                 err = (constrained_y - x1_t) * weights
                 grad_outputs = err.clone().detach()
