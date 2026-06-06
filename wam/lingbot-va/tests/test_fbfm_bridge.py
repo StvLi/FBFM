@@ -6,12 +6,16 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[3]
+LINGBOT_VA_ROOT = Path(__file__).resolve().parents[1]
 WAN_VA_ROOT = Path(__file__).resolve().parents[1] / "wan_va"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(LINGBOT_VA_ROOT) not in sys.path:
+    sys.path.insert(0, str(LINGBOT_VA_ROOT))
 if str(WAN_VA_ROOT) not in sys.path:
     sys.path.insert(0, str(WAN_VA_ROOT))
 
+from evaluation.robotwin.pseudo_async import should_request_next_kv_cache
 from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 from lingbot_va_bridge import FeedbackStateBuffer
 from lingbot_va_bridge import FeedbackSlotTracker
@@ -125,6 +129,30 @@ def test_feedback_slot_tracker_emits_one_slot_every_four_observations():
     assert tracker.obs_count == 8
     tracker.reset()
     assert tracker.obs_count == 0
+
+
+def test_pseudo_async_requests_next_kv_cache_after_each_executable_segment():
+    chunk_size = 32
+    infer_delay_steps = 16
+
+    assert should_request_next_kv_cache(
+        first=True,
+        step_count=16,
+        chunk_size=chunk_size,
+        infer_delay_steps=infer_delay_steps,
+    )
+    assert not should_request_next_kv_cache(
+        first=False,
+        step_count=16,
+        chunk_size=chunk_size,
+        infer_delay_steps=infer_delay_steps,
+    )
+    assert should_request_next_kv_cache(
+        first=False,
+        step_count=32,
+        chunk_size=chunk_size,
+        infer_delay_steps=infer_delay_steps,
+    )
 
 
 def test_slot_aligned_state_buffer_exports_state_and_mask():
@@ -301,6 +329,37 @@ def test_feedback_stream_aligns_four_new_observations_to_one_state_slot():
     server._feedback({"obs": ["obs40", "obs44", "obs48", "obs52"]})
     assert encode_calls[-1] == ["obs36", "obs40", "obs44", "obs48"]
     assert server.feedback_pending_obs == []
+
+
+def test_feedback_accumulation_window_reopens_after_slots_are_full():
+    server, _ = _make_fake_feedback_server()
+    server.feedback_stream_seeded = True
+    server.feedback_has_received_window = True
+
+    server.frame_st_id = 2
+    server._start_feedback_accumulation_window()
+    assert server.feedback_target_frame_st_id == 2
+
+    server._ingest_feedback_observations(["obs20", "obs24", "obs28", "obs32"], True)
+    server._ingest_feedback_observations(["obs36", "obs40", "obs44", "obs48"], True)
+    states, mask, count = server.feedback_state_buffer.export()
+    assert count == 2
+    assert torch.equal(mask, torch.tensor([1.0, 1.0]))
+    assert torch.equal(states[:, 0], torch.tensor([1.0, 2.0]))
+
+    server.frame_st_id = 3
+    server._start_feedback_accumulation_window()
+    states, mask, count = server.feedback_state_buffer.export()
+    assert server.feedback_target_frame_st_id == 3
+    assert count == 0
+    assert torch.equal(mask, torch.tensor([0.0, 0.0]))
+    assert torch.equal(states[:, 0], torch.tensor([0.0, 0.0]))
+
+    server._ingest_feedback_observations(["obs52", "obs56", "obs60", "obs64"], True)
+    states, mask, count = server.feedback_state_buffer.export()
+    assert count == 1
+    assert torch.equal(mask, torch.tensor([1.0, 0.0]))
+    assert torch.equal(states[:, 0], torch.tensor([3.0, 0.0]))
 
 
 def test_feedback_stream_rejects_latent_frame_count_mismatch():

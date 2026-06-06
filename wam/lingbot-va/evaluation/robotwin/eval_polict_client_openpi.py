@@ -6,7 +6,9 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/share/project/chenghy/package/RoboTwin")
+robowin_root = Path(
+    os.environ.get("ROBOTWIN_ROOT", "/mnt/dataset/projs/projects/RoboTwin")
+)
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -30,6 +32,11 @@ import importlib
 import argparse
 import pdb
 from evaluation.robotwin.geometry import euler2quat
+from evaluation.robotwin.pseudo_async import (
+    should_receive_async_result,
+    should_request_next_kv_cache,
+    should_wait_for_async_result,
+)
 import numpy as np
 
 from description.utils.generate_episode_instructions import *
@@ -603,16 +610,15 @@ def eval_policy(task_name,
                     
                     # DEBUG: Pseudo-Asynchronous
                     pseudo_async_steps_count += 1
-                    if not first:
-                        if pseudo_async_steps_count < INFER_DELAY_STEPS+1:
-                            # Skip the first INFER_DELAY_STEPS steps
-                            continue
-                        elif  pseudo_async_steps_count == INFER_DELAY_STEPS+1:
-                            ret = model.infer(dict(
-                                obs = first_obs,
-                                immediate_return = True,    # 此时返回并接收
-                                    ))
-                            action = ret['action']                             # 接收到下一题chunk的action
+                    if should_wait_for_async_result(first, pseudo_async_steps_count, INFER_DELAY_STEPS):
+                        # Skip the first INFER_DELAY_STEPS steps
+                        continue
+                    if should_receive_async_result(first, pseudo_async_steps_count, INFER_DELAY_STEPS):
+                        ret = model.infer(dict(
+                            obs=first_obs,
+                            immediate_return=True,    # 此时返回并接收
+                        ))
+                        action = ret['action']                             # 接收到下一题chunk的action
 
 
                     raw_action_step = action[:, i, j].flatten() 
@@ -650,7 +656,7 @@ def eval_policy(task_name,
                                 # 这一逻辑仅进行反馈 不考虑正常推理obs
                                 model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))
 
-                    if pseudo_async_steps_count == chunk_size - INFER_DELAY_STEPS:
+                    if should_request_next_kv_cache(first, pseudo_async_steps_count, chunk_size, INFER_DELAY_STEPS):
                         # 提前触发推理逻辑
                         first = False
                         model.infer(dict(obs = full_obs_list[-action_per_frame:], compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action,
@@ -752,4 +758,3 @@ if __name__ == "__main__":
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
-
