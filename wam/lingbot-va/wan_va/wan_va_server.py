@@ -473,46 +473,183 @@ class VA_Server:
     def _build_feedback_state_buffer(self):
         latent_channel = getattr(self.transformer.config, 'in_channels', 48)
         state_dim = latent_channel * self.latent_height * self.latent_width
+        self.feedback_obs_per_state = getattr(self.job_config, 'feedback_obs_per_state', 4)
         self.feedback_state_buffer = SlotAlignedStateBuffer(
             state_dim=state_dim,
             slot_count=self.job_config.frame_chunk_size,
             device=self.device,
             dtype=self.dtype,
         )
-        self.feedback_slot_tracker = FeedbackSlotTracker(obs_per_state=4)
+        self.feedback_slot_tracker = FeedbackSlotTracker(
+            obs_per_state=self.feedback_obs_per_state
+        )
+        self.feedback_pending_obs = []
+        self.feedback_stream_seeded = False
+        self.feedback_has_received_window = False
+        self.feedback_constraint_active = False
+        self.feedback_target_frame_st_id = self.frame_st_id
+        self._clear_feedback_encoder_cache()
 
-    def _clear_feedback_state_buffer(self):
-        if hasattr(self, 'feedback_state_buffer'):
-            self.feedback_state_buffer.clear()
-        if hasattr(self, 'feedback_slot_tracker'):
-            self.feedback_slot_tracker.reset()
+    def _clear_feedback_encoder_cache(self):
         if self.feedback_streaming_vae is not None:
             self.feedback_streaming_vae.clear_cache()
         if self.feedback_streaming_vae_half is not None:
             self.feedback_streaming_vae_half.clear_cache()
 
-    def _ingest_feedback_observations(self, obs_sequence):
+    def _clear_feedback_state_buffer(self, clear_stream_cache=True):
+        if hasattr(self, 'feedback_state_buffer'):
+            self.feedback_state_buffer.clear()
+        if hasattr(self, 'feedback_slot_tracker'):
+            self.feedback_slot_tracker.reset()
+        self.feedback_pending_obs = []
+        self.feedback_constraint_active = False
+        self.feedback_target_frame_st_id = self.frame_st_id
+        if clear_stream_cache:
+            self._clear_feedback_encoder_cache()
+            self.feedback_stream_seeded = False
+            self.feedback_has_received_window = False
+
+    def _start_feedback_accumulation_window(self):
+        if hasattr(self, 'feedback_state_buffer'):
+            self.feedback_state_buffer.clear()
+        if hasattr(self, 'feedback_slot_tracker'):
+            self.feedback_slot_tracker.reset()
+        self.feedback_pending_obs = []
+        self.feedback_constraint_active = True
+        self.feedback_target_frame_st_id = self.frame_st_id
+
+    def _encode_feedback_obs_chunk(self, obs_sequence):
+        return self._encode_obs_with_stream_wrappers(
+            dict(obs=obs_sequence),
+            streaming_vae=self.feedback_streaming_vae,
+            streaming_vae_half=self.feedback_streaming_vae_half,
+        )
+
+    def _prime_feedback_stream_initial_obs(self, obs):
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        if not images or self.feedback_stream_seeded:
+            return
+        latent_model_input = self._encode_feedback_obs_chunk(images[:1])
+        self.feedback_stream_seeded = True
+        self.feedback_has_received_window = False
+        logger.info(
+            "FBFM feedback stream primed: raw_obs=1 latent_frames=%s frame_st_id=%s",
+            latent_model_input.shape[2] if latent_model_input is not None else 0,
+            self.frame_st_id,
+        )
+
+    def _append_feedback_state_from_latent(self, latent_model_input, expected_slots):
+        latent_vectors = latent_to_state_vectors(
+            latent_model_input,
+            latent_channel=getattr(self.transformer.config, 'in_channels', 48),
+            latent_height=self.latent_height,
+            latent_width=self.latent_width,
+        )
+        if len(latent_vectors) != expected_slots:
+            raise RuntimeError(
+                "feedback latent/frame count mismatch: "
+                f"expected {expected_slots} latent slot(s), got {len(latent_vectors)}"
+            )
+
+        appended_states = 0
+        for latent_vector in latent_vectors:
+            local_slot = len(self.feedback_state_buffer)
+            appended = self.feedback_state_buffer.append_state(latent_vector)
+            appended_states += int(appended)
+            if appended:
+                logger.info(
+                    "FBFM feedback state aligned: local_slot=%s global_frame_id=%s frame_st_id=%s",
+                    local_slot,
+                    self.feedback_target_frame_st_id + local_slot,
+                    self.feedback_target_frame_st_id,
+                )
+        return appended_states
+
+    def _ingest_feedback_observations(self, obs_sequence, append_constraints):
         if not obs_sequence:
             return 0
-        appended_states = 0
-        for single_obs in obs_sequence:
-            latent_model_input = self._encode_obs_with_stream_wrappers(
-                dict(obs=[single_obs]),
-                streaming_vae=self.feedback_streaming_vae,
-                streaming_vae_half=self.feedback_streaming_vae_half,
+        if (
+            append_constraints
+            and hasattr(self, 'feedback_state_buffer')
+            and len(self.feedback_state_buffer) >= self.feedback_state_buffer.slot_count
+        ):
+            self.feedback_pending_obs = []
+            logger.info(
+                "FBFM feedback ignored: state slots full for target_frame_st_id=%s raw_obs=%s",
+                self.feedback_target_frame_st_id,
+                len(obs_sequence),
             )
-            new_slots = self.feedback_slot_tracker.append(1)
-            if new_slots > 0:
-                latent_vectors = latent_to_state_vectors(
+            return 0
+        appended_states = 0
+        self.feedback_pending_obs.extend(obs_sequence)
+        obs_per_state = self.feedback_obs_per_state
+        while len(self.feedback_pending_obs) >= obs_per_state:
+            obs_chunk = self.feedback_pending_obs[:obs_per_state]
+            self.feedback_pending_obs = self.feedback_pending_obs[obs_per_state:]
+            latent_model_input = self._encode_feedback_obs_chunk(obs_chunk)
+            if hasattr(self, 'feedback_slot_tracker'):
+                self.feedback_slot_tracker.append(obs_per_state)
+            if append_constraints:
+                appended_states += self._append_feedback_state_from_latent(
                     latent_model_input,
-                    latent_channel=getattr(self.transformer.config, 'in_channels', 48),
-                    latent_height=self.latent_height,
-                    latent_width=self.latent_width,
+                    expected_slots=1,
                 )
-                if latent_vectors:
-                    appended = self.feedback_state_buffer.append_state(latent_vectors[-1])
-                    appended_states += int(appended)
+                if len(self.feedback_state_buffer) >= self.feedback_state_buffer.slot_count:
+                    if len(self.feedback_pending_obs) > 0:
+                        logger.info(
+                            "FBFM feedback dropping pending obs after filling state slots: pending_obs=%s",
+                            len(self.feedback_pending_obs),
+                        )
+                    self.feedback_pending_obs = []
+                    break
+            else:
+                latent_frames = latent_model_input.shape[2] if latent_model_input is not None else 0
+                logger.info(
+                    "FBFM feedback context advanced: raw_obs=%s latent_frames=%s pending_obs=%s",
+                    len(obs_chunk),
+                    latent_frames,
+                    len(self.feedback_pending_obs),
+                )
         return appended_states
+
+    def _select_new_feedback_observations(self, images):
+        if not self.feedback_stream_seeded:
+            self._prime_feedback_stream_initial_obs(dict(obs=images[:1]))
+            self.feedback_has_received_window = True
+            return images[1:]
+
+        if not self.feedback_has_received_window:
+            self.feedback_has_received_window = True
+            return images[1:] if len(images) > 1 else []
+
+        return images[-1:] if images else []
+
+    def _feedback(self, obs):
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        new_obs = self._select_new_feedback_observations(images)
+        appended = self._ingest_feedback_observations(
+            new_obs,
+            append_constraints=self.feedback_constraint_active,
+        )
+        _, state_mask, _ = self.feedback_state_buffer.export()
+        logger.info(
+            (
+                "FBFM feedback appended: raw_window=%s new_obs=%s appended_states=%s "
+                "total_state_feedback=%s pending_obs=%s state_mask=%s frame_st_id=%s target_frame_st_id=%s"
+            ),
+            len(images),
+            len(new_obs),
+            appended,
+            len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
+            len(self.feedback_pending_obs),
+            state_mask.tolist(),
+            self.frame_st_id,
+            self.feedback_target_frame_st_id,
+        )
 
     def _export_feedback_states(self, state_num):
         if not hasattr(self, 'feedback_state_buffer'):
@@ -567,6 +704,7 @@ class VA_Server:
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+            self._prime_feedback_stream_initial_obs(obs)
 
         latents = torch.randn(1,
                               48,
@@ -682,20 +820,6 @@ class VA_Server:
         torch.cuda.empty_cache()
         return actions, latents
 
-    def _feedback(self, obs):
-        images = obs['obs']
-        if not isinstance(images, list):
-            images = [images]
-        newest_obs = images[-1:] if images else []
-        appended = self._ingest_feedback_observations(newest_obs)
-        logger.info(
-            "FBFM feedback appended: raw_obs=%s appended_states=%s total_state_feedback=%s tracker_obs_count=%s",
-            len(newest_obs),
-            appended,
-            len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
-            self.feedback_slot_tracker.obs_count if hasattr(self, 'feedback_slot_tracker') else 0,
-        )
-        
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
@@ -754,17 +878,23 @@ class VA_Server:
 
             if not self.first_epoch:
                 logger.info(f"################# Start Feedback Accumulation Window #################")
-                self._clear_feedback_state_buffer()
-                images = obs['obs']
-                if not isinstance(images, list):
-                    images = [images]
-                appended = self._ingest_feedback_observations(images)
+                if len(self.feedback_pending_obs) > 0:
+                    logger.warning(
+                        "FBFM feedback context had incomplete pending obs before accumulation: pending_obs=%s",
+                        len(self.feedback_pending_obs),
+                    )
+                self._start_feedback_accumulation_window()
+                _, state_mask, _ = self.feedback_state_buffer.export()
                 logger.info(
-                    "FBFM feedback window seeded: raw_obs=%s appended_states=%s total_state_feedback=%s tracker_obs_count=%s",
-                    len(images),
-                    appended,
+                    (
+                        "FBFM feedback accumulation started: target_frame_st_id=%s "
+                        "state_slots=%s pending_obs=%s state_mask=%s stream_seeded=%s"
+                    ),
+                    self.feedback_target_frame_st_id,
                     len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
-                    self.feedback_slot_tracker.obs_count if hasattr(self, 'feedback_slot_tracker') else 0,
+                    len(self.feedback_pending_obs),
+                    state_mask.tolist(),
+                    self.feedback_stream_seeded,
                 )
                 self.last_obs = obs
 
