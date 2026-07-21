@@ -1,5 +1,7 @@
 # DreamZero + FBFM on RoboTwin
 
+中文接入说明：[`README.zh-CN.md`](README.zh-CN.md)
+
 This directory contains the native RoboTwin bridge and the fairness tooling for
 the three constraint modes.  It intentionally refuses to serve RoboTwin with
 AgiBot or DROID normalization metadata.
