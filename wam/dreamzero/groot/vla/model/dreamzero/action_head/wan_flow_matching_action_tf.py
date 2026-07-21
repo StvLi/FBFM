@@ -42,210 +42,22 @@ from torch.distributed.device_mesh import DeviceMesh
 from torchvision.transforms import v2
 from transformers import PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
-
 from groot.vla.model.n1_5.action_head.base_action_head import ActionHead
 from groot.vla.model.dreamzero.modules.flow_match_scheduler import FlowMatchScheduler
 from groot.vla.model.dreamzero.modules.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from groot.vla.model.dreamzero.modules.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import FlowUniPCMultistepScheduler
+from groot.vla.model.dreamzero.modules.fbfm_guidance import (
+    ConstraintMode,
+    FBFMGuidanceConfig,
+    JointConstraints,
+    apply_joint_guidance,
+    prefix_constraint,
+    prepare_guided_inputs,
+)
 
 
 KVCacheType: TypeAlias = torch.Tensor
-
-class WrapperedFlowUniPCMultistepScheduler(FlowUniPCMultistepScheduler):
-    def __init__(
-            self,
-            num_train_timesteps: int = 1000,
-            solver_order: int = 2,
-            prediction_type: str = "flow_prediction",
-            shift: Optional[float] = 1.0,
-            use_dynamic_shifting=False,
-            thresholding: bool = False,
-            dynamic_thresholding_ratio: float = 0.995,
-            sample_max_value: float = 1.0,
-            predict_x0: bool = True,                    # 调用时未设置 默认为True
-            solver_type: str = "bh2",
-            lower_order_final: bool = True,
-            disable_corrector: List[int] = [],
-            solver_p: SchedulerMixin = None,
-            timestep_spacing: str = "linspace",
-            steps_offset: int = 0,
-            final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
-            fbfm_config = None,
-    ):
-            super()._init__(
-                self,
-                num_train_timesteps = num_train_timesteps,
-                solver_order = solver_order,
-                prediction_type = prediction_type,
-                shift = shift,
-                use_dynamic_shifting = use_dynamic_shifting,
-                thresholding = thresholding,
-                dynamic_thresholding_ratio = dynamic_thresholding_ratio,
-                sample_max_value = sample_max_value,
-                predict_x0 = predict_x0,                    # 调用时未设置 默认为True
-                solver_type = solver_type,
-                lower_order_final = lower_order_final,
-                disable_corrector = disable_corrector,
-                solver_p = solver_p,
-                timestep_spacing = timestep_spacing,
-                steps_offset = steps_offset,
-                final_sigmas_type = final_sigmas_type,  # "zero", "sigma_min"
-            )
-            self.fbfm_config = fbfm_config
-
-    def step(
-        self,
-        # model_output: torch.Tensor,
-        original_denoise_step_partial,
-        timestep: torch.Tensor,
-        sample: torch.Tensor,
-        step_index: int,
-        return_dict: bool = True,
-        constrained_y : Tensor | None = None,
-        weights : Tensor | None = None, 
-    ) -> SchedulerOutput | tuple:
-        
-        if self.num_inference_steps is None:
-            raise ValueError(
-                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
-            )
-
-        use_corrector = (
-            step_index > 0 and
-            step_index - 1 not in self.disable_corrector and
-            self.last_sample is not None
-        )
-
-        model_output_convert = self.convert_model_output(
-            # model_output=model_output,
-            original_denoise_step_partial,
-            sample=sample,
-            step_index=step_index,
-        ) # 流匹配算法在这一部分内部实现
-
-        # 阈值修正
-        if use_corrector:
-            sample = self.multistep_uni_c_bh_update(
-                this_model_output=model_output_convert,
-                last_sample=self.last_sample,
-                this_sample=sample,
-                order=self.this_order,
-                step_index=step_index,
-            )
-            # We must clone the outputs of a CUDA graph'd computation.
-            sample = sample.clone()
-
-        for i in range(self.config.solver_order - 1):
-            self.model_outputs[i] = self.model_outputs[i + 1]
-            self.timestep_list[i] = self.timestep_list[i + 1]
-
-        self.model_outputs[-1] = model_output_convert
-        self.timestep_list[-1] = timestep
-
-        if self.config.lower_order_final:
-            this_order = min(
-                self.config.solver_order,
-                len(self.timesteps) - step_index,
-            )
-        else:
-            this_order = self.config.solver_order
-
-        # Warmup for multistep.
-        self.this_order = min(this_order, self.lower_order_nums + 1)
-        assert self.this_order > 0
-
-        self.last_sample = sample
-        # Pass the original non-converted model output, in case solver-p is used.
-        prev_sample = self.multistep_uni_p_bh_update(
-            model_output=model_output,
-            sample=sample,
-            order=self.this_order,
-            step_index=step_index,
-        )
-        # We must clone the outputs of a CUDA graph'd computation.
-        prev_sample = prev_sample.clone()
-
-        if self.lower_order_nums < self.config.solver_order:
-            self.lower_order_nums += 1
-
-        if not return_dict:
-            return (prev_sample,)
-
-        return SchedulerOutput(prev_sample=prev_sample)
-    
-    def convert_model_output(
-        self,
-        # model_output: torch.Tensor,
-        original_denoise_step_partial,
-        prev_chunk_left_over,
-        x_t: torch.Tensor,
-        step_index: int,
-        constrained_y : torch.Tensor | None = None,
-        weights : torch.Tensor | None = None, 
-    ) -> torch.Tensor:
-        if self.predict_x0:
-            # 用于兼容不同的t设置：
-            # 外部未设置 进入本分支
-            if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[step_index]
-                tau = 1 - sigma_t
-                if prev_chunk_left_over is None:
-                    # First step, no guidance - return v_t
-                    v_t = original_denoise_step_partial(x_t)
-                    x0_pred = x_t - sigma_t * v_t
-                else:
-                    x_t = x_t.clone().detach()
-                    with torch.enable_grad():
-                        v_t = original_denoise_step_partial(x_t)
-                        x_t.requires_grad_(True)
-
-                        x1_t = x_t - sigma_t * v_t  # noqa: N806
-                        err = (prev_chunk_left_over - x1_t) * weights
-                        grad_outputs = err.clone().detach()
-                        correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
-
-                    max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
-                    tau_tensor = torch.as_tensor(tau)
-                    squared_one_minus_tau = (1 - tau_tensor) ** 2
-                    inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
-                    c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
-                    guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
-                    guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
-
-                    v_guided = v_t - guidance_weight * correction
-                    x0_pred = x_t - sigma_t * v_guided
-            else:
-                raise ValueError(
-                    f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
-                    " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
-                )
-
-            if self.config.thresholding:
-                x0_pred = self._threshold_sample(x0_pred)
-
-            return x0_pred
-        else:
-            # if self.config.prediction_type == "flow_prediction":
-            #     sigma_t = self.sigmas[step_index]
-            #     epsilon = sample - (1 - sigma_t) * model_output
-            # else:
-            #     raise ValueError(
-            #         f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
-            #         " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
-            #     )
-
-            # if self.config.thresholding:
-            #     sigma_t = self.sigmas[step_index]
-            #     x0_pred = sample - sigma_t * model_output
-            #     x0_pred = self._threshold_sample(x0_pred)
-            #     epsilon = model_output + x0_pred
-
-            # return epsilon
-            raise ValueError(
-                    f"predict_x0 given as {self.predict_x0} which is not supported for FBFM yet."
-                )
-        
 
 @dataclass
 class WANPolicyHeadConfig(PretrainedConfig):
@@ -400,6 +212,13 @@ class WANPolicyHead(ActionHead):
         
         self._device = "cuda"
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
+        self.fbfm_config = FBFMGuidanceConfig(
+            mode=ConstraintMode.parse(os.getenv("FBFM_CONSTRAINT_MODE", "None")),
+            max_guidance_weight=float(os.getenv("FBFM_MAX_GUIDANCE_WEIGHT", "10.0")),
+        )
+        self._fbfm_action_prefix: torch.Tensor | None = None
+        self._fbfm_video_prefix: torch.Tensor | None = None
+        self._fbfm_action_prefix_steps = max(0, int(os.getenv("FBFM_ACTION_PREFIX_STEPS", "0")))
 
 
         num_dit_steps = 8
@@ -516,6 +335,76 @@ class WANPolicyHead(ActionHead):
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+
+    @property
+    def fbfm_enabled(self) -> bool:
+        return self.fbfm_config.mode is not ConstraintMode.NONE
+
+    def set_fbfm_mode(self, mode: str | ConstraintMode) -> None:
+        self.fbfm_config = FBFMGuidanceConfig(
+            mode=ConstraintMode.parse(mode),
+            max_guidance_weight=self.fbfm_config.max_guidance_weight,
+        )
+        if self.fbfm_config.mode is ConstraintMode.NONE:
+            self.reset_fbfm_state()
+
+    def set_fbfm_constraints(
+        self,
+        *,
+        action_prefix: torch.Tensor | None = None,
+        video_prefix: torch.Tensor | None = None,
+    ) -> None:
+        """Set normalized action and VAE-latent prefixes for the next chunk.
+
+        Action layout is ``(B, T, D)``.  Video layout is the scheduler layout
+        ``(B, F, C, H, W)``.  The prefixes are consumed without modifying the
+        original DreamZero KV context update.
+        """
+
+        self._fbfm_action_prefix = None if action_prefix is None else action_prefix.detach().clone()
+        self._fbfm_video_prefix = None if video_prefix is None else video_prefix.detach().clone()
+
+    def set_fbfm_execution_steps(self, execute_steps: int) -> None:
+        if not 0 < execute_steps <= self.action_horizon:
+            raise ValueError(f"execute_steps must be in [1, {self.action_horizon}], got {execute_steps}")
+        self._fbfm_action_prefix_steps = self.action_horizon - execute_steps
+
+    def reset_fbfm_state(self) -> None:
+        self._fbfm_action_prefix = None
+        self._fbfm_video_prefix = None
+
+    def reset_inference_session(self) -> None:
+        """Clear every piece of causal state at an episode boundary."""
+
+        self.reset_fbfm_state()
+        self.current_start_frame = 0
+        self.language = None
+        self.kv_cache1 = None
+        self.kv_cache_neg = None
+        self.crossattn_cache = None
+        self.crossattn_cache_neg = None
+
+    def prepare_fbfm_inference(self) -> None:
+        if self.trt_engine is not None:
+            raise RuntimeError("FBFM input VJP is unavailable with the TensorRT inference path")
+        self.eval()
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def _fbfm_constraints_for(
+        self,
+        video_sample: torch.Tensor,
+        action_sample: torch.Tensor,
+    ) -> JointConstraints:
+        constraints = JointConstraints()
+        action_constraint = prefix_constraint(action_sample, self._fbfm_action_prefix, time_dim=1)
+        if action_constraint is not None:
+            constraints.action_target, constraints.action_mask = action_constraint
+        if self.fbfm_config.mode is ConstraintMode.FEEDBACK:
+            video_constraint = prefix_constraint(video_sample, self._fbfm_video_prefix, time_dim=1)
+            if video_constraint is not None:
+                constraints.video_target, constraints.video_mask = video_constraint
+        return constraints
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -1242,13 +1131,16 @@ class WANPolicyHead(ActionHead):
             print("language is None, reset current_start_frame to 0")
             self.language = data["text"]
             self.current_start_frame = 0
+            self.reset_fbfm_state()
         elif not torch.equal(self.language, data["text"]):
             print("language changed, reset current_start_frame to 0")
             self.current_start_frame = 0
             self.language = data["text"]
+            self.reset_fbfm_state()
         elif videos.shape[2] == 1:
             print("videos.shape[2] == 1, reset current_start_frame to 0")
             self.current_start_frame = 0
+            self.reset_fbfm_state()
         elif self.current_start_frame >= self.model.local_attn_size:
             print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
             self.current_start_frame = 0
@@ -1309,6 +1201,11 @@ class WANPolicyHead(ActionHead):
                 tile_size=(self.tile_size_height, self.tile_size_width),
                 tile_stride=(self.tile_stride_height, self.tile_stride_width),
             )
+
+        if self.fbfm_config.mode is ConstraintMode.FEEDBACK and self.current_start_frame != 0:
+            # Reuse DreamZero's own real-observation VAE result.  No extra VAE
+            # warmup or encoding is performed in RTC/None modes.
+            self._fbfm_video_prefix = image.transpose(1, 2).detach().clone()
 
         end_vae_event.record()
 
@@ -1455,8 +1352,26 @@ class WANPolicyHead(ActionHead):
         prev_predictions = [] 
         self.skip_countdown = 0
         dit_compute_steps = 0
+        guided_step = self.fbfm_enabled and (
+            self._fbfm_action_prefix is not None
+            or (
+                self.fbfm_config.mode is ConstraintMode.FEEDBACK
+                and self._fbfm_video_prefix is not None
+            )
+        )
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
+
+            if guided_step:
+                # This must happen before the DiT call. torch.enable_grad can
+                # escape no_grad, but not inference_mode; the policy wrapper
+                # therefore uses no_grad for guided modes.
+                with torch.enable_grad():
+                    noisy_input, noisy_input_action = prepare_guided_inputs(
+                        noisy_input,
+                        noisy_input_action,
+                    )
+                step_constraints = self._fbfm_constraints_for(noisy_input, noisy_input_action)
 
             # Get timesteps from respective schedulers
             action_timestep = sample_scheduler_action.timesteps[index]
@@ -1477,39 +1392,78 @@ class WANPolicyHead(ActionHead):
             # 3.2.3中所呈现的DIT Cache实现
             # check if we need to run the DIT step
             # 如果余弦相似度小于阈值，则运行模型推理；否则，继续使用上一轮的DIT缓存。
-            should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
+            # A reused velocity has no Jacobian with respect to the current
+            # sample. Guided steps always run DiT; KV context caches remain in use.
+            should_run_model = guided_step or self.should_run_model(index, current_timestep, prev_predictions)
             if should_run_model:
                 dit_compute_steps += 1
                 if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
-                predictions = self._run_diffusion_steps(
-                    noisy_input=noisy_input.transpose(1, 2),
-                    timestep=timestep,
-                    action=noisy_input_action,
-                    timestep_action=timestep_action,
-                    state=state_features,
-                    embodiment_id=embodiment_id,
-                    context=prompt_embs,
-                    seq_len=seq_len,
-                    y=y,
-                    clip_feature=self.clip_feas,
-                    kv_caches=kv_caches,
-                    crossattn_caches=crossattn_caches,
-                    kv_cache_metadata=dict(
-                        start_frame=self.current_start_frame,
-                        update_kv_cache=False,
-                    ),
-                )
+                with torch.set_grad_enabled(guided_step):
+                    predictions = self._run_diffusion_steps(
+                        noisy_input=noisy_input.transpose(1, 2),
+                        timestep=timestep,
+                        action=noisy_input_action,
+                        timestep_action=timestep_action,
+                        state=state_features,
+                        embodiment_id=embodiment_id,
+                        context=prompt_embs,
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        kv_cache_metadata=dict(
+                            start_frame=self.current_start_frame,
+                            update_kv_cache=False,
+                        ),
+                    )
                 flow_pred_cond, flow_pred_cond_action = predictions[0]
                 flow_pred_uncond, flow_pred_uncond_action = predictions[1]
 
                 flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
-                prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
-                max_cache_size = 2
-                if len(prev_predictions) > max_cache_size:
-                    prev_predictions.pop(0)
+                if guided_step:
+                    if self.ip_size == 1:
+                        local_video_flow = flow_pred
+                        local_action_flow = flow_pred_cond_action
+                    elif self.ip_rank == 0:
+                        local_video_flow = self.cfg_scale * flow_pred_cond
+                        local_action_flow = flow_pred_cond_action
+                    else:
+                        local_video_flow = (1.0 - self.cfg_scale) * flow_pred_uncond
+                        local_action_flow = torch.zeros_like(flow_pred_cond_action)
+
+                    reducer = None
+                    if self.ip_size > 1:
+                        reducer = lambda tensor: dist.all_reduce(
+                            tensor,
+                            op=dist.ReduceOp.SUM,
+                            group=self.ip_group,
+                        )
+                    with torch.enable_grad():
+                        guided_video_flow, guided_action_flow = apply_joint_guidance(
+                            video_sample=noisy_input,
+                            action_sample=noisy_input_action,
+                            video_flow=flow_pred.transpose(1, 2),
+                            action_flow=flow_pred_cond_action,
+                            video_local_flow=local_video_flow.transpose(1, 2),
+                            action_local_flow=local_action_flow,
+                            video_sigma=sample_scheduler.sigmas[index],
+                            action_sigma=sample_scheduler_action.sigmas[index],
+                            constraints=step_constraints,
+                            config=self.fbfm_config,
+                            world_size=self.ip_size,
+                            reduce_correction=reducer,
+                        )
+                    flow_pred = guided_video_flow.transpose(1, 2).detach()
+                    flow_pred_cond_action = guided_action_flow.detach()
+                else:
+                    prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
+                    max_cache_size = 2
+                    if len(prev_predictions) > max_cache_size:
+                        prev_predictions.pop(0)
 
             else:
                 assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
@@ -1535,9 +1489,15 @@ class WANPolicyHead(ActionHead):
                 step_index=index,
                 return_dict=False,
             )[0]
+            if guided_step:
+                noisy_input = noisy_input.detach()
+                noisy_input_action = noisy_input_action.detach()
 
         latents = noisy_input
         latents_action = noisy_input_action
+        if self.fbfm_enabled and self._fbfm_action_prefix_steps > 0:
+            prefix_steps = min(self._fbfm_action_prefix_steps, latents_action.shape[1])
+            self._fbfm_action_prefix = latents_action[:, -prefix_steps:].detach().clone()
         output = latents
 
         if self.current_start_frame == 1:

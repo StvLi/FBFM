@@ -715,8 +715,13 @@ class GrootSimPolicy(BaseGrootSimPolicy):
 
         model_start_time = time.perf_counter()
 
-        # 3. Model inference
-        with torch.inference_mode():
+        # 3. Model inference. inference_mode cannot be escaped by the local
+        # torch.enable_grad block used for FBFM's input VJP.
+        fbfm_enabled = bool(getattr(self.trained_model.action_head, "fbfm_enabled", False))
+        if fbfm_enabled:
+            self.trained_model.action_head.prepare_fbfm_inference()
+        inference_context = torch.no_grad() if fbfm_enabled else torch.inference_mode()
+        with inference_context:
             # with maybe_autocast:
             model_pred = self.trained_model.lazy_joint_video_action_causal(normalized_input, latent_video=latent_video)
         normalized_action = model_pred["action_pred"].float()
@@ -746,6 +751,24 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                   f"Untransform: {untransform_time:.3f} seconds")
 
         return batch, video_pred
+
+    def set_fbfm_mode(self, mode: str) -> None:
+        self.trained_model.action_head.set_fbfm_mode(mode)
+
+    def set_fbfm_constraints(self, *, action_prefix=None, video_prefix=None) -> None:
+        self.trained_model.action_head.set_fbfm_constraints(
+            action_prefix=action_prefix,
+            video_prefix=video_prefix,
+        )
+
+    def set_fbfm_execution_steps(self, execute_steps: int) -> None:
+        self.trained_model.action_head.set_fbfm_execution_steps(execute_steps)
+
+    def reset_fbfm_state(self) -> None:
+        self.trained_model.action_head.reset_fbfm_state()
+
+    def reset_inference_session(self) -> None:
+        self.trained_model.action_head.reset_inference_session()
     
     def lazy_joint_forward_causal_gt_cond(self, batch, video=None, latent_video=None, state=None, **kwargs):
         
