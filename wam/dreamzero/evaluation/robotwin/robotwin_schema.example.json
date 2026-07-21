@@ -1,0 +1,37 @@
+{
+  "embodiment_tag": "robotwin",
+  "camera_order": [
+    "observation.images.cam_high",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist"
+  ],
+  "video_keys": [
+    "video.cam_high",
+    "video.cam_left_wrist",
+    "video.cam_right_wrist"
+  ],
+  "state_fields": [
+    {"key": "state.left_eef_position", "start": 0, "stop": 3},
+    {"key": "state.left_eef_rotation", "start": 3, "stop": 6},
+    {"key": "state.left_gripper", "start": 6, "stop": 7},
+    {"key": "state.right_eef_position", "start": 7, "stop": 10},
+    {"key": "state.right_eef_rotation", "start": 10, "stop": 13},
+    {"key": "state.right_gripper", "start": 13, "stop": 14}
+  ],
+  "action_fields": [
+    {"key": "action.left_eef_position", "start": 0, "stop": 3},
+    {"key": "action.left_eef_rotation", "start": 3, "stop": 6},
+    {"key": "action.left_gripper", "start": 6, "stop": 7},
+    {"key": "action.right_eef_position", "start": 7, "stop": 10},
+    {"key": "action.right_eef_rotation", "start": 10, "stop": 13},
+    {"key": "action.right_gripper", "start": 13, "stop": 14}
+  ],
+  "state_dim": 14,
+  "action_dim": 14,
+  "action_horizon": 24,
+  "execute_steps": 8,
+  "frames_per_chunk": 4,
+  "normalization_metadata": "relative_stats_dreamzero.json",
+  "normalization_sha256": "REPLACE_WITH_SHA256_OF_NATIVE_ROBOTWIN_STATS",
+  "action_representation": "robotwin_native_eef_delta_euler_gripper_absolute"
+}

@@ -39,6 +39,11 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    constraint_mode: str = "None"
+    action_prefix_steps: int = 0
+    max_guidance_weight: float = 10.0
+    robotwin_schema: str | None = None
+    checkpoint_manifest: str | None = None
 
 
 class ARDroidRoboarenaPolicy:
@@ -350,6 +355,12 @@ class ARDroidRoboarenaPolicy:
         self._call_count = 0
         self._is_first_call = True
         self.video_across_time = []
+        self._policy.reset_inference_session()
+        # Workers wait on the Gloo signal group between requests. Reset their
+        # per-episode FBFM state before broadcasting the next observation.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            reset_signal = torch.full((1,), 3, dtype=torch.int32, device="cpu")
+            dist.broadcast(reset_signal, src=0, group=self._signal_group)
     
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
@@ -496,6 +507,10 @@ class WebsocketPolicyServer:
                 elif signal == 2:
                     logger.info(f"Rank {dist.get_rank()} received idle signal. Waiting for next client.")
                     # Loop back to the top and wait for the next signal
+                    continue
+                elif signal == 3:
+                    self._policy.reset_inference_session()
+                    logger.info(f"Rank {dist.get_rank()} reset DreamZero causal episode state")
                     continue
 
                 # Receive the batch data via broadcast/gather mechanism
@@ -748,8 +763,18 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
 
 
 def main(args: Args) -> None:
+    robotwin_schema = None
+    if args.robotwin_schema is not None:
+        from evaluation.robotwin.schema import RoboTwinSchema
+
+        robotwin_schema = RoboTwinSchema.load(args.robotwin_schema)
+        args.action_prefix_steps = robotwin_schema.action_tail_steps
+
     # Set environment variable for DIT cache.
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
+    os.environ["FBFM_CONSTRAINT_MODE"] = args.constraint_mode
+    os.environ["FBFM_ACTION_PREFIX_STEPS"] = str(args.action_prefix_steps)
+    os.environ["FBFM_MAX_GUIDANCE_WEIGHT"] = str(args.max_guidance_weight)
 
     # Use TE cuDNN backend for attention.
     os.environ["ATTENTION_BACKEND"] = "TE"
@@ -758,12 +783,14 @@ def main(args: Args) -> None:
     # to autoregressive nature of the model (several possible shapes).
     torch._dynamo.config.recompile_limit = 800
 
-    embodiment_tag = "oxe_droid"
+    embodiment_tag = robotwin_schema.embodiment_tag if robotwin_schema is not None else "oxe_droid"
     model_path = args.model_path    # 直接决定模型权重和配置 来自于命令行参数
     policy_metadata = {
         "embodiment": embodiment_tag,
         "model_name": "dreamzero",
         "model_path": model_path,
+        "constraint_mode": args.constraint_mode,
+        "action_prefix_steps": args.action_prefix_steps,
     }
 
     device_mesh = init_mesh()
@@ -798,6 +825,35 @@ def main(args: Args) -> None:
     else:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
+
+    if robotwin_schema is not None:
+        import json
+        from evaluation.robotwin.server import (
+            DistributedRoboTwinPolicy,
+            RoboTwinWebsocketServer,
+            worker_loop,
+        )
+
+        checkpoint_sha256 = None
+        if args.checkpoint_manifest is not None:
+            with open(args.checkpoint_manifest, "r", encoding="utf-8") as handle:
+                checkpoint_sha256 = json.load(handle)["checkpoint_sha256"]
+        if rank == 0:
+            distributed_policy = DistributedRoboTwinPolicy(
+                policy,
+                robotwin_schema,
+                args.constraint_mode,
+                signal_group,
+            )
+            RoboTwinWebsocketServer(
+                distributed_policy,
+                host="0.0.0.0",
+                port=args.port,
+                checkpoint_sha256=checkpoint_sha256,
+            ).serve_forever()
+        else:
+            asyncio.run(worker_loop(policy, robotwin_schema, args.constraint_mode, signal_group))
+        return
     
     # Create wrapper policy that converts between roboarena and AR_droid formats
     # 实现以下功能：
