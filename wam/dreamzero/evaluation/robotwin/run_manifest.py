@@ -11,6 +11,16 @@ from pathlib import Path
 from .experiment import CONFIGS, MODES, TASKS, _read_jsonl, model_noise_seed, validate_manifest
 
 
+def select_shard(episodes: list[dict], *, shard_index: int, num_shards: int) -> list[dict]:
+    """Deterministically partition an already validated canonical manifest."""
+
+    if num_shards < 1:
+        raise ValueError("num_shards must be at least 1")
+    if not 0 <= shard_index < num_shards:
+        raise ValueError(f"shard_index must be in [0, {num_shards}), got {shard_index}")
+    return episodes[shard_index::num_shards]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -21,6 +31,8 @@ def main() -> None:
     parser.add_argument("--config", choices=CONFIGS)
     parser.add_argument("--manifest-tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--manifest-configs", nargs="+", choices=CONFIGS, default=list(CONFIGS))
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -39,6 +51,15 @@ def main() -> None:
         if (args.task is None or episode["task"] == args.task)
         and (args.config is None or episode["config"] == args.config)
     ]
+    selected = select_shard(
+        selected,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
+    )
+    print(
+        f"SHARD {args.shard_index}/{args.num_shards}: "
+        f"{len(selected)} canonical episodes"
+    )
     for episode in selected:
         result_path = args.output_dir / args.mode / f"{episode['episode_id'].replace(':', '__')}.json"
         if result_path.is_file():
