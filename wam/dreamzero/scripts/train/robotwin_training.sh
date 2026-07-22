@@ -10,6 +10,8 @@ TOKENIZER_DIR=${TOKENIZER_DIR:-./checkpoints/umt5-xxl}
 PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-./checkpoints/DreamZero-AgiBot}
 NUM_GPUS=${NUM_GPUS:-4}
 MAX_STEPS=${MAX_STEPS:-100000}
+REPORT_TO=${REPORT_TO:-none}
+WANDB_PROJECT=${WANDB_PROJECT:-dreamzero_robotwin}
 
 for required in \
   "$ROBOTWIN_DATA_ROOT/meta/embodiment.json" \
@@ -17,7 +19,9 @@ for required in \
   "$ROBOTWIN_DATA_ROOT/meta/stats.json" \
   "$ROBOTWIN_DATA_ROOT/meta/relative_stats_dreamzero.json" \
   "$PRETRAINED_MODEL_PATH/model.safetensors.index.json" \
-  "$WAN_CKPT_DIR/Wan2.1_VAE.pth"; do
+  "$WAN_CKPT_DIR/Wan2.1_VAE.pth" \
+  "$WAN_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth" \
+  "$WAN_CKPT_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"; do
   if [[ ! -f "$required" ]]; then
     echo "ERROR: required file is missing: $required" >&2
     exit 1
@@ -27,9 +31,9 @@ done
 python -m evaluation.robotwin.validate_dataset "$ROBOTWIN_DATA_ROOT"
 
 torchrun --nproc_per_node "$NUM_GPUS" --standalone groot/vla/experiment/experiment.py \
-  report_to=wandb \
+  report_to="$REPORT_TO" \
   data=dreamzero/robotwin_relative \
-  wandb_project=dreamzero_robotwin \
+  wandb_project="$WANDB_PROJECT" \
   train_architecture=lora \
   num_frames=33 \
   action_horizon=24 \
