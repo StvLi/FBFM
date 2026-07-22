@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 EXCLUDED_DIRS = {"real_world_eval_gen", "runs", "logs", "__pycache__"}
+EXCLUDED_FILES = {"checkpoint_manifest.json"}
 
 
 def hash_file(path: Path) -> str:
@@ -26,9 +27,14 @@ def create_manifest(checkpoint: Path) -> dict:
         raise FileNotFoundError(checkpoint)
     files = []
     for path in sorted(checkpoint.rglob("*")):
-        if not path.is_file() or any(part in EXCLUDED_DIRS for part in path.relative_to(checkpoint).parts):
+        relative_path = path.relative_to(checkpoint)
+        if (
+            not path.is_file()
+            or path.name in EXCLUDED_FILES
+            or any(part in EXCLUDED_DIRS for part in relative_path.parts)
+        ):
             continue
-        relative = path.relative_to(checkpoint).as_posix()
+        relative = relative_path.as_posix()
         files.append({"path": relative, "size": path.stat().st_size, "sha256": hash_file(path)})
     if not files:
         raise ValueError(f"checkpoint directory contains no files: {checkpoint}")

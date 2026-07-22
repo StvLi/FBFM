@@ -10,3 +10,15 @@ def test_checkpoint_tree_hash_is_content_addressed(tmp_path):
     assert first["checkpoint_sha256"] == second["checkpoint_sha256"]
     (checkpoint / "config.json").write_text('{"changed": true}', encoding="utf-8")
     assert create_manifest(checkpoint)["checkpoint_sha256"] != first["checkpoint_sha256"]
+
+
+def test_checkpoint_manifest_does_not_hash_itself(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    first = create_manifest(checkpoint)
+    (checkpoint / "checkpoint_manifest.json").write_text("stale", encoding="utf-8")
+    second = create_manifest(checkpoint)
+
+    assert second["checkpoint_sha256"] == first["checkpoint_sha256"]
+    assert all(item["path"] != "checkpoint_manifest.json" for item in second["files"])
