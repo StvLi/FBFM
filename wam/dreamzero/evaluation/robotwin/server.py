@@ -60,7 +60,8 @@ class DistributedRoboTwinPolicy:
 
     def _forward(self, encoded: dict[str, Any]):
         self._signal(CONTINUE)
-        _broadcast_encoded(encoded)
+        inference_seed = int(self.policy.trained_model.action_head.seed)
+        _broadcast_encoded({"observation": encoded, "inference_seed": inference_seed})
         dist.barrier()
         with torch.no_grad():
             result = self.policy.lazy_joint_forward_causal(Batch(obs=encoded))
@@ -95,7 +96,11 @@ async def worker_loop(policy: Any, schema: RoboTwinSchema, mode: str, signal_gro
             continue
         if value != CONTINUE:
             raise RuntimeError(f"unknown DreamZero worker signal {value}")
-        encoded = _broadcast_encoded()
+        payload = _broadcast_encoded()
+        if not isinstance(payload, dict) or "observation" not in payload or "inference_seed" not in payload:
+            raise RuntimeError("DreamZero rank-0 request omitted observation or inference seed")
+        policy.set_inference_seed(int(payload["inference_seed"]))
+        encoded = payload["observation"]
         dist.barrier()
         with torch.no_grad():
             policy.lazy_joint_forward_causal(Batch(obs=encoded))
@@ -120,6 +125,7 @@ class RoboTwinWebsocketServer:
             "constraint_mode": distributed_policy.mode,
             "action_horizon": distributed_policy.schema.action_horizon,
             "execute_steps": distributed_policy.schema.execute_steps,
+            "frames_per_chunk": distributed_policy.schema.frames_per_chunk,
             "checkpoint_sha256": checkpoint_sha256,
         }
 

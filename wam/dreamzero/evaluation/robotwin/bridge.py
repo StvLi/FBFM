@@ -130,6 +130,10 @@ class DreamZeroRoboTwinBridge:
         active_observation = self._latest_observation
         if active_observation is None:
             raise RuntimeError("no observation available for DreamZero inference")
+        if "inference_seed" not in request:
+            raise ValueError("inference request must contain the frozen per-chunk inference_seed")
+        inference_seed = int(request["inference_seed"])
+        self.policy.set_inference_seed(inference_seed)
         encoded = self._encoded_observation(active_observation)
         if self._forward_fn is None:
             result, video = self.policy.lazy_joint_forward_causal(self._make_batch(encoded))
@@ -140,6 +144,7 @@ class DreamZeroRoboTwinBridge:
         response = {
             "action": self.schema.decode_action(result.act),
             "mode": self.mode,
+            "inference_seed": inference_seed,
         }
         if request.get("save_visualization"):
             if hasattr(video, "detach"):

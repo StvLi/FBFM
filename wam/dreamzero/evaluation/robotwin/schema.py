@@ -98,6 +98,8 @@ class RoboTwinSchema:
             raise ValueError("execute_steps must be in [1, action_horizon]")
         if self.frames_per_chunk <= 0:
             raise ValueError("frames_per_chunk must be positive")
+        if self.execute_steps % self.frames_per_chunk:
+            raise ValueError("execute_steps must be divisible by frames_per_chunk")
         if len(self.normalization_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in self.normalization_sha256.lower()):
             raise ValueError("normalization_sha256 must be a SHA-256 hex digest")
         if not self.action_representation.startswith("robotwin_native"):

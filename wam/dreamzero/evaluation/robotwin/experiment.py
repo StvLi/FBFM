@@ -86,6 +86,8 @@ def freeze_manifest(
     *,
     episodes_per_cell: int = EPISODES_PER_CELL,
     instruction_pool_size: int = INSTRUCTION_POOL_SIZE,
+    tasks: Iterable[str] = TASKS,
+    configs: Iterable[str] = CONFIGS,
 ) -> list[dict[str, Any]]:
     """Freeze the first validated candidates for every task/config cell.
 
@@ -93,6 +95,13 @@ def freeze_manifest(
     must already contain the exact chosen instruction and randomization data.
     Randomized records must also pin the background texture and its checksum.
     """
+
+    tasks = tuple(tasks)
+    configs = tuple(configs)
+    if not tasks or any(task not in TASKS for task in tasks):
+        raise ValueError(f"tasks must be a non-empty subset of {TASKS}")
+    if not configs or any(config not in CONFIGS for config in configs):
+        raise ValueError(f"configs must be a non-empty subset of {CONFIGS}")
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for candidate in candidates:
@@ -105,8 +114,8 @@ def freeze_manifest(
         grouped[(task, config)].append(dict(candidate))
 
     frozen = []
-    for task in TASKS:
-        for config in CONFIGS:
+    for task in tasks:
+        for config in configs:
             records = grouped[(task, config)]
             records.sort(key=lambda item: int(item["seed"]))
             if len(records) < episodes_per_cell:
@@ -147,13 +156,21 @@ def freeze_manifest(
                         "model_noise_seed_base": stable_seed(episode_id, "dreamzero"),
                     }
                 )
-    validate_manifest(frozen, episodes_per_cell=episodes_per_cell)
+    validate_manifest(frozen, episodes_per_cell=episodes_per_cell, tasks=tasks, configs=configs)
     return frozen
 
 
-def validate_manifest(records: Iterable[dict[str, Any]], *, episodes_per_cell: int = EPISODES_PER_CELL) -> None:
+def validate_manifest(
+    records: Iterable[dict[str, Any]],
+    *,
+    episodes_per_cell: int = EPISODES_PER_CELL,
+    tasks: Iterable[str] = TASKS,
+    configs: Iterable[str] = CONFIGS,
+) -> None:
     records = list(records)
-    expected = len(TASKS) * len(CONFIGS) * episodes_per_cell
+    tasks = tuple(tasks)
+    configs = tuple(configs)
+    expected = len(tasks) * len(configs) * episodes_per_cell
     if len(records) != expected:
         raise ValueError(f"manifest must contain {expected} episodes, found {len(records)}")
     counts: dict[tuple[str, str], int] = defaultdict(int)
@@ -164,13 +181,13 @@ def validate_manifest(records: Iterable[dict[str, Any]], *, episodes_per_cell: i
             raise ValueError(f"duplicate episode_id {episode_id}")
         episode_ids.add(episode_id)
         cell = (record["task"], record["config"])
-        if cell[0] not in TASKS or cell[1] not in CONFIGS:
+        if cell[0] not in tasks or cell[1] not in configs:
             raise ValueError(f"unknown manifest cell {cell}")
         counts[cell] += 1
         if cell[1] == "demo_randomized" and not record.get("background_texture_sha256"):
             raise ValueError(f"{episode_id}: randomized texture checksum missing")
-    for task in TASKS:
-        for config in CONFIGS:
+    for task in tasks:
+        for config in configs:
             if counts[(task, config)] != episodes_per_cell:
                 raise ValueError(f"{task}/{config}: expected {episodes_per_cell}, found {counts[(task, config)]}")
 
@@ -280,6 +297,8 @@ def _freeze_cli(args: argparse.Namespace) -> None:
         _read_jsonl(args.candidates),
         episodes_per_cell=args.episodes_per_cell,
         instruction_pool_size=args.instruction_pool_size,
+        tasks=args.tasks,
+        configs=args.configs,
     )
     _write_jsonl(args.output, records)
     digest = sha256_file(args.output)
@@ -307,6 +326,8 @@ def main() -> None:
     freeze.add_argument("--output", type=Path, required=True)
     freeze.add_argument("--episodes-per-cell", type=int, default=EPISODES_PER_CELL)
     freeze.add_argument("--instruction-pool-size", type=int, default=INSTRUCTION_POOL_SIZE)
+    freeze.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
+    freeze.add_argument("--configs", nargs="+", choices=CONFIGS, default=list(CONFIGS))
     freeze.set_defaults(handler=_freeze_cli)
     aggregate_parser = subparsers.add_parser("aggregate")
     aggregate_parser.add_argument("--manifest", type=Path, required=True)

@@ -764,6 +764,9 @@ class GrootSimPolicy(BaseGrootSimPolicy):
     def set_fbfm_execution_steps(self, execute_steps: int) -> None:
         self.trained_model.action_head.set_fbfm_execution_steps(execute_steps)
 
+    def set_inference_seed(self, seed: int) -> None:
+        self.trained_model.action_head.set_inference_seed(seed)
+
     def reset_fbfm_state(self) -> None:
         self.trained_model.action_head.reset_fbfm_state()
 

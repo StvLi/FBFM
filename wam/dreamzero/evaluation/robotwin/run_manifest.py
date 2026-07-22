@@ -19,6 +19,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--task", choices=TASKS)
     parser.add_argument("--config", choices=CONFIGS)
+    parser.add_argument("--manifest-tasks", nargs="+", choices=TASKS, default=list(TASKS))
+    parser.add_argument("--manifest-configs", nargs="+", choices=CONFIGS, default=list(CONFIGS))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -28,7 +30,7 @@ def main() -> None:
         parser.error("provide the single-episode evaluator command after --")
 
     episodes = _read_jsonl(args.manifest)
-    validate_manifest(episodes)
+    validate_manifest(episodes, tasks=args.manifest_tasks, configs=args.manifest_configs)
     checkpoint = json.loads(args.checkpoint_manifest.read_text(encoding="utf-8"))
     checkpoint_hash = checkpoint["checkpoint_sha256"]
     selected = [

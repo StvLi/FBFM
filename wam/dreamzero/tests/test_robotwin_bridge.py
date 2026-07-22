@@ -39,6 +39,7 @@ class FakePolicy:
         self.execute_steps = None
         self.reset_count = 0
         self.observations = []
+        self.inference_seeds = []
 
     def set_fbfm_mode(self, mode):
         self.mode = mode
@@ -48,6 +49,9 @@ class FakePolicy:
 
     def reset_inference_session(self):
         self.reset_count += 1
+
+    def set_inference_seed(self, seed):
+        self.inference_seeds.append(seed)
 
     def lazy_joint_forward_causal(self, batch):
         self.observations.append(batch.obs)
@@ -73,6 +77,8 @@ def test_schema_rejects_agibot_fallback_and_incomplete_action_layout():
         _schema(embodiment_tag="agibot")
     with pytest.raises(ValueError, match="cover every dimension"):
         _schema(action_fields=[{"key": "action.left", "start": 0, "stop": 2}])
+    with pytest.raises(ValueError, match="divisible"):
+        _schema(execute_steps=3, frames_per_chunk=2)
 
 
 def test_bridge_buffers_real_feedback_and_uses_native_action_tail():
@@ -87,14 +93,16 @@ def test_bridge_buffers_real_feedback_and_uses_native_action_tail():
     assert policy.execute_steps == 2
 
     bridge.handle({"reset": True, "prompt": "stack two bowls"})
-    first = bridge.handle({"obs": _observation(1)})
+    first = bridge.handle({"obs": _observation(1), "inference_seed": 123})
     assert first["action"].shape == (4, 1, 2)
+    assert first["inference_seed"] == 123
+    assert policy.inference_seeds == [123]
     assert policy.observations[-1]["video.high"].shape[0] == 1
 
     bridge.handle({"obs": _observation(2), "feedback": True})
     ack = bridge.handle({"obs": [_observation(3)], "compute_kv_cache": True})
     assert ack["kv_update"] == "deferred_to_next_joint_forward"
-    bridge.handle({"obs": _observation(4)})
+    bridge.handle({"obs": _observation(4), "inference_seed": 456})
     encoded_video = policy.observations[-1]["video.high"]
     assert encoded_video.shape[0] == 2
     assert encoded_video[0, 0, 0, 0] == 1
@@ -111,7 +119,18 @@ def test_reset_clears_feedback_frames():
     )
     bridge.handle({"obs": _observation(1), "feedback": True})
     bridge.handle({"reset": True})
-    bridge.handle({"obs": _observation(9)})
+    bridge.handle({"obs": _observation(9), "inference_seed": 789})
     assert policy.reset_count == 1
     assert policy.observations[-1]["video.high"].shape[0] == 1
     assert policy.observations[-1]["video.high"][0, 0, 0, 0] == 9
+
+
+def test_bridge_requires_a_frozen_per_chunk_noise_seed():
+    bridge = DreamZeroRoboTwinBridge(
+        policy=FakePolicy(),
+        schema=_schema(),
+        mode="None",
+        batch_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    with pytest.raises(ValueError, match="inference_seed"):
+        bridge.handle({"obs": _observation(1)})

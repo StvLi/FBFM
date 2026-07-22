@@ -41,6 +41,18 @@ def test_manifest_freezes_all_cells_and_chunk_noise_is_deterministic():
     assert model_noise_seed(manifest[0], 3) != model_noise_seed(manifest[0], 4)
 
 
+def test_manifest_can_freeze_one_task_config_for_gated_ab():
+    manifest = freeze_manifest(
+        _candidates(),
+        tasks=["adjust_bottle"],
+        configs=["demo_clean"],
+    )
+    assert len(manifest) == 20
+    assert {(item["task"], item["config"]) for item in manifest} == {
+        ("adjust_bottle", "demo_clean")
+    }
+
+
 def test_randomized_candidate_requires_background_checksum():
     candidates = _candidates()
     record = next(item for item in candidates if item["config"] == "demo_randomized")

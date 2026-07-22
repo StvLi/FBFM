@@ -10,9 +10,7 @@ relative_action: true
 relative_action_per_horizon: false
 relative_action_keys:
   - left_eef_position
-  - left_eef_rotation
   - right_eef_position
-  - right_eef_rotation
 max_chunk_size: 5
 dataset_shard_sampling_rate: 0.1
 mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec

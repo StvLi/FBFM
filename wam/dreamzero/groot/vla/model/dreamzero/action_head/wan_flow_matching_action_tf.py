@@ -369,6 +369,12 @@ class WANPolicyHead(ActionHead):
             raise ValueError(f"execute_steps must be in [1, {self.action_horizon}], got {execute_steps}")
         self._fbfm_action_prefix_steps = self.action_horizon - execute_steps
 
+    def set_inference_seed(self, seed: int) -> None:
+        seed = int(seed)
+        if not 0 <= seed < 2**63:
+            raise ValueError(f"inference seed must be in [0, 2**63), got {seed}")
+        self.seed = seed
+
     def reset_fbfm_state(self) -> None:
         self._fbfm_action_prefix = None
         self._fbfm_video_prefix = None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 
@@ -26,6 +27,8 @@ EXPECTED = {
         "right_gripper",
     ),
 }
+
+RELATIVE_ACTION_KEYS = ("left_eef_position", "right_eef_position")
 
 
 def validate_dataset(root: Path) -> None:
@@ -50,12 +53,30 @@ def validate_dataset(root: Path) -> None:
         for key in keys:
             if key not in serialized:
                 raise ValueError(f"modality.json is missing native {group} key containing {key!r}")
-    stats = json.loads((meta / "relative_stats_dreamzero.json").read_text(encoding="utf-8"))
-    serialized_stats = json.dumps(stats, sort_keys=True)
-    for group in ("state", "action"):
-        for key in EXPECTED[group]:
-            if key not in serialized_stats:
-                raise ValueError(f"relative_stats_dreamzero.json is missing {group}.{key}")
+    packed_stats = json.loads((meta / "stats.json").read_text(encoding="utf-8"))
+    for original_key in ("observation.state", "action"):
+        if original_key not in packed_stats:
+            raise ValueError(f"stats.json is missing packed feature {original_key!r}")
+        for statistic in ("mean", "std", "min", "max", "q01", "q99"):
+            values = packed_stats[original_key].get(statistic)
+            if not isinstance(values, list) or len(values) != 14:
+                raise ValueError(f"stats.json {original_key}.{statistic} must contain 14 values")
+            if not all(math.isfinite(float(value)) for value in values):
+                raise ValueError(f"stats.json {original_key}.{statistic} contains non-finite values")
+
+    relative_stats = json.loads((meta / "relative_stats_dreamzero.json").read_text(encoding="utf-8"))
+    unexpected = sorted(set(relative_stats) - set(RELATIVE_ACTION_KEYS))
+    if unexpected:
+        raise ValueError(f"relative_stats_dreamzero.json has non-positional relative keys: {unexpected}")
+    for key in RELATIVE_ACTION_KEYS:
+        if key not in relative_stats:
+            raise ValueError(f"relative_stats_dreamzero.json is missing {key}")
+        for statistic in ("mean", "std", "min", "max", "q01", "q99"):
+            values = relative_stats[key].get(statistic)
+            if not isinstance(values, list) or len(values) != 3:
+                raise ValueError(f"relative_stats_dreamzero.json {key}.{statistic} must contain 3 values")
+            if not all(math.isfinite(float(value)) for value in values):
+                raise ValueError(f"relative_stats_dreamzero.json {key}.{statistic} contains non-finite values")
 
 
 def main() -> None:

@@ -16,7 +16,7 @@ for required in \
   "$ROBOTWIN_DATA_ROOT/meta/modality.json" \
   "$ROBOTWIN_DATA_ROOT/meta/stats.json" \
   "$ROBOTWIN_DATA_ROOT/meta/relative_stats_dreamzero.json" \
-  "$PRETRAINED_MODEL_PATH/experiment_cfg/conf.yaml" \
+  "$PRETRAINED_MODEL_PATH/model.safetensors.index.json" \
   "$WAN_CKPT_DIR/Wan2.1_VAE.pth"; do
   if [[ ! -f "$required" ]]; then
     echo "ERROR: required file is missing: $required" >&2

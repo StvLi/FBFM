@@ -2,7 +2,7 @@
 
 本文说明 `feature/dreamzero-fbfm-robotwin` 分支中的实现、运行方式、数据与权重门槛，以及三模式公平评测协议。
 
-当前状态：代码接入和 CPU 验证已经完成；DreamZero-RoboTwin post-training、GPU smoke 和完整评测尚未完成。远端目前缺少原生 RoboTwin LeRobot 数据、可用 checkpoint 和完整 DreamZero 环境，并且无法连接 Hugging Face。禁止用 FastWAM、LingBot 或仅含 `config.json` 的目录冒充 DreamZero-RoboTwin 权重。
+当前状态：代码接入、原生 RoboTwin EEF 数据转换和 CPU 验证已经完成；DreamZero-RoboTwin post-training、GPU smoke 和正式评测尚未完成。远端已下载 DreamZero-AgiBot、UMT5 与 `adjust_bottle` clean 50 条演示，Wan2.1 和独立 DreamZero 环境仍在完成下载/安装。禁止用 FastWAM、LingBot 或仅含 `config.json` 的目录冒充 DreamZero-RoboTwin 权重。
 
 ## 1. 接入目标
 
@@ -416,7 +416,7 @@ Task | Baseline Clean | RTC Clean | Ours Clean |
 7. 全部 17 个任务；
 8. 三模式共 2040 个有效 episode 后再生成最终表格。
 
-当前已经完成第 1–3 项的 CPU 部分，共 16 个测试通过。第 4 项及以后必须等待 checkpoint、数据、环境和可用 GPU。
+当前已经完成第 1–3 项的 CPU 部分，共 27 个测试通过。第 4 项及以后必须等待 post-training checkpoint、完整环境和可用 GPU。
 
 ## 16. 测试命令
 
@@ -425,29 +425,24 @@ cd /mnt/project_eai_hs/zrm/FBFM-DreamZero-FBFM
 export PYTHONDONTWRITEBYTECODE=1
 
 /mnt/project_eai_hs/zrm/miniconda3/envs/fastwam/bin/python -m pytest -q \
-  -p no:cacheprovider \
-  wam/dreamzero/tests/test_fbfm_guidance.py \
-  wam/dreamzero/tests/test_none_scheduler_equivalence.py \
-  wam/dreamzero/tests/test_robotwin_bridge.py \
-  wam/dreamzero/tests/test_robotwin_experiment.py \
-  wam/dreamzero/tests/test_checkpoint_manifest.py
+  -p no:cacheprovider wam/dreamzero/tests
 ```
 
 当前结果：
 
 ```text
-16 passed
+27 passed
 ```
 
 ## 17. 当前未解决问题
 
 截至当前提交：
 
-- 远端没有 DreamZero-RoboTwin checkpoint；
-- 没有发现可直接训练的原生 RoboTwin LeRobot 数据；
-- `fastwam`、`lingbot-va`、`robotwin-lingbot` 都不是完整 DreamZero 环境；
-- Hugging Face 经 7890、直连和 mirror 均失败；
+- 远端仍没有 post-training 后的 DreamZero-RoboTwin checkpoint；
+- 原生数据已转换为 50 episodes、7188 帧的 EEF14 LeRobot 数据并通过 metadata 校验；
+- 独立 Python 3.11 DreamZero 环境正在安装，Wan2.1 大文件仍在断点续传；
 - 4 张 H100 仍有其他 LingBot 任务，不允许停止；
+- Feedback 把真实观测 latent 对齐到下一 future video block 的时序语义，必须在真实两 chunk GPU smoke 中确认，不能只凭 CPU mask 测试判定正确；
 - 因此尚无 baseline success、三模式 A/B 或完整 SR 数据。
 
 服务成功启动、通过 health check 或完成一次 websocket 通信都不能替代策略成功率。只有在相同 checkpoint、canonical manifest 和 RoboTwin evaluator 下完成的有效 episode 才能进入最终结果。
