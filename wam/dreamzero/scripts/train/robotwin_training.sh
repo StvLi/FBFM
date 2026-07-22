@@ -10,6 +10,7 @@ TOKENIZER_DIR=${TOKENIZER_DIR:-./checkpoints/umt5-xxl}
 PRETRAINED_MODEL_PATH=${PRETRAINED_MODEL_PATH:-./checkpoints/DreamZero-AgiBot}
 NUM_GPUS=${NUM_GPUS:-4}
 MAX_STEPS=${MAX_STEPS:-100000}
+SAVE_STEPS=${SAVE_STEPS:-1000}
 REPORT_TO=${REPORT_TO:-none}
 WANDB_PROJECT=${WANDB_PROJECT:-dreamzero_robotwin}
 
@@ -47,7 +48,7 @@ torchrun --nproc_per_node "$NUM_GPUS" --standalone groot/vla/experiment/experime
   seed=42 \
   training_args.learning_rate=1e-5 \
   training_args.deepspeed=groot/vla/configs/deepspeed/zero2.json \
-  save_steps=10000 \
+  save_steps="$SAVE_STEPS" \
   training_args.warmup_ratio=0.05 \
   output_dir="$OUTPUT_DIR" \
   per_device_train_batch_size=1 \
