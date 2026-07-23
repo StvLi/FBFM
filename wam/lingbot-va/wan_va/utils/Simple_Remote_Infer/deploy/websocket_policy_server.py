@@ -60,7 +60,10 @@ class WebsocketPolicyServer:
                 obs = unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                # Keep the asyncio loop responsive so a second connection can
+                # enqueue feedback while a long-running inference owns the
+                # model/distributed worker thread.
+                action = await asyncio.to_thread(self._policy.infer, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

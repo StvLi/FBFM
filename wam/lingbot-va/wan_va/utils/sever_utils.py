@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import torch
 import torch.distributed as dist
+import threading
 
 from .logging import logger
 from .Simple_Remote_Infer.deploy.websocket_policy_server import WebsocketPolicyServer
@@ -14,9 +15,25 @@ class DistributedModelWrapper:
     def __init__(self, model, local_rank):
         self.model = model
         self.local_rank = local_rank
+        self._distributed_request_lock = threading.Lock()
 
     def infer(self, obs):
-        return distributed_infer(self.model, obs, self.local_rank)
+        if (
+            obs.get("reset", False)
+            and hasattr(self.model, "is_inference_running")
+            and self.model.is_inference_running()
+        ):
+            # Ask all solver ranks to leave at their next step boundary, then
+            # wait for the distributed request lock and perform the real reset.
+            self.model.request_inference_cancel()
+        if obs.get("feedback", False):
+            # Never run VAE/CUDA work on a websocket worker. The inference
+            # owner drains feedback at a deterministic solver boundary.
+            return self.model.enqueue_live_feedback(obs)
+        # Non-feedback requests own the distributed process group until the
+        # request completes. Live feedback is drained inside solver steps.
+        with self._distributed_request_lock:
+            return distributed_infer(self.model, obs, self.local_rank)
 
 
 def distributed_infer(model, obs, local_rank):

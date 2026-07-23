@@ -1,7 +1,9 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import queue
 import sys
+import threading
 import time
 from functools import partial
 from PIL import Image
@@ -10,6 +12,7 @@ from diffusers.utils import export_to_video
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
@@ -40,6 +43,8 @@ from utils import (
 # FBFM核心组件
 from lingbot_va_bridge import FeedbackSlotTracker
 from lingbot_va_bridge import SlotAlignedStateBuffer
+from lingbot_va_bridge import ChunkConstraintContext
+from lingbot_va_bridge import ConstraintMode
 from lingbot_va_bridge import latent_to_state_vectors
 from lingbot_va_bridge import VA_PrevChunkAdapter as PrevChunkAdapter           # 跨Chunk数据维护
 from lingbot_va_bridge import WrapperedFlowMatchScheduler as FlowMatchScheduler # FBFM流匹配实现
@@ -53,6 +58,11 @@ class VA_Server:
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
+        self._live_feedback_queue = queue.Queue()
+        self._inference_state_lock = threading.RLock()
+        self._inference_running = False
+        self._solver_phase = "idle"
+        self._cancel_requested = threading.Event()
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
         self.rtc_config = RTCConfig(
@@ -407,6 +417,18 @@ class VA_Server:
         self.last_action = None
         self.last_obs = None
         self.first_epoch = True
+        if getattr(self, 'active_constraint_context', None) is not None:
+            self.active_constraint_context.close()
+        self.active_constraint_context = None
+        with self._inference_state_lock:
+            self._inference_running = False
+            self._solver_phase = "idle"
+        self._cancel_requested.clear()
+        while True:
+            try:
+                self._live_feedback_queue.get_nowait()
+            except queue.Empty:
+                break
         if hasattr(self, 'prev_chunk_left_over'):
             delattr(self, 'prev_chunk_left_over')
         #### clean vae and transformer cache
@@ -488,6 +510,8 @@ class VA_Server:
         self.feedback_has_received_window = False
         self.feedback_constraint_active = False
         self.feedback_target_frame_st_id = self.frame_st_id
+        self.feedback_last_observation_action_step = None
+        self.feedback_window_start_action_step = None
         self._clear_feedback_encoder_cache()
 
     def _clear_feedback_encoder_cache(self):
@@ -504,12 +528,13 @@ class VA_Server:
         self.feedback_pending_obs = []
         self.feedback_constraint_active = False
         self.feedback_target_frame_st_id = self.frame_st_id
+        self.feedback_window_start_action_step = None
         if clear_stream_cache:
             self._clear_feedback_encoder_cache()
             self.feedback_stream_seeded = False
             self.feedback_has_received_window = False
 
-    def _start_feedback_accumulation_window(self):
+    def _start_feedback_accumulation_window(self, start_action_step=None):
         if hasattr(self, 'feedback_state_buffer'):
             self.feedback_state_buffer.clear()
         if hasattr(self, 'feedback_slot_tracker'):
@@ -517,6 +542,7 @@ class VA_Server:
         self.feedback_pending_obs = []
         self.feedback_constraint_active = True
         self.feedback_target_frame_st_id = self.frame_st_id
+        self.feedback_window_start_action_step = start_action_step
 
     def _encode_feedback_obs_chunk(self, obs_sequence):
         return self._encode_obs_with_stream_wrappers(
@@ -556,14 +582,29 @@ class VA_Server:
         appended_states = 0
         for latent_vector in latent_vectors:
             local_slot = len(self.feedback_state_buffer)
+            global_slot_id = self.feedback_target_frame_st_id + local_slot
             appended = self.feedback_state_buffer.append_state(latent_vector)
             appended_states += int(appended)
             if appended:
+                live_appended = False
+                context = getattr(self, "active_constraint_context", None)
+                if (
+                    context is not None
+                    and getattr(self.job_config, "feedback_live_enabled", True)
+                    and getattr(self, "_solver_phase", "idle") == "video"
+                ):
+                    live_appended = context.update_state_slot(
+                        global_slot_id=global_slot_id,
+                        state=latent_vector,
+                    )
                 logger.info(
-                    "FBFM feedback state aligned: local_slot=%s global_frame_id=%s frame_st_id=%s",
+                    "FBFM feedback state aligned: local_slot=%s global_frame_id=%s "
+                    "frame_st_id=%s live=%s context_version=%s",
                     local_slot,
-                    self.feedback_target_frame_st_id + local_slot,
+                    global_slot_id,
                     self.feedback_target_frame_st_id,
+                    live_appended,
+                    context.version if context is not None else None,
                 )
         return appended_states
 
@@ -627,19 +668,36 @@ class VA_Server:
         return images[-1:] if images else []
 
     def _feedback(self, obs):
+        self.feedback_last_observation_action_step = obs.get(
+            'observation_action_step',
+            getattr(self, 'feedback_last_observation_action_step', None),
+        )
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
         new_obs = self._select_new_feedback_observations(images)
+        observation_action_step = obs.get('observation_action_step')
+        window_start_action_step = getattr(
+            self, 'feedback_window_start_action_step', None
+        )
+        is_after_window_start = (
+            observation_action_step is None
+            or window_start_action_step is None
+            or observation_action_step > window_start_action_step
+        )
         appended = self._ingest_feedback_observations(
             new_obs,
-            append_constraints=self.feedback_constraint_active,
+            append_constraints=(
+                self.feedback_constraint_active and is_after_window_start
+            ),
         )
         _, state_mask, _ = self.feedback_state_buffer.export()
         logger.info(
             (
                 "FBFM feedback appended: raw_window=%s new_obs=%s appended_states=%s "
-                "total_state_feedback=%s pending_obs=%s state_mask=%s frame_st_id=%s target_frame_st_id=%s"
+                "total_state_feedback=%s pending_obs=%s state_mask=%s frame_st_id=%s "
+                "target_frame_st_id=%s observation_action_step=%s "
+                "window_start_action_step=%s after_window_start=%s context_chunk_id=%s"
             ),
             len(images),
             len(new_obs),
@@ -649,7 +707,61 @@ class VA_Server:
             state_mask.tolist(),
             self.frame_st_id,
             self.feedback_target_frame_st_id,
+            self.feedback_last_observation_action_step,
+            window_start_action_step,
+            is_after_window_start,
+            getattr(getattr(self, 'active_constraint_context', None), 'chunk_id', None),
         )
+
+    def is_inference_running(self):
+        with self._inference_state_lock:
+            return self._inference_running
+
+    def enqueue_live_feedback(self, obs):
+        """Queue raw feedback without touching CUDA or distributed collectives."""
+        self._live_feedback_queue.put(obs)
+        return {
+            "feedback_queued": True,
+            "feedback_queue_size": self._live_feedback_queue.qsize(),
+        }
+
+    def request_inference_cancel(self):
+        self._cancel_requested.set()
+        return {"cancel_requested": True}
+
+    def _drain_live_feedback(self):
+        """Apply queued feedback at a solver-step boundary on every rank."""
+        feedback_batch = []
+        cancel_requested = False
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            cancel_requested = self._cancel_requested.is_set()
+            while True:
+                try:
+                    feedback_batch.append(self._live_feedback_queue.get_nowait())
+                except queue.Empty:
+                    break
+        if dist.is_initialized():
+            payload = [
+                (feedback_batch, cancel_requested)
+                if dist.get_rank() == 0 else None
+            ]
+            dist.broadcast_object_list(payload, src=0)
+            feedback_batch, cancel_requested = payload[0]
+        for feedback_obs in feedback_batch:
+            self._feedback(feedback_obs)
+        return len(feedback_batch), cancel_requested
+
+    def _sync_cancel_requested(self):
+        cancel_requested = (
+            self._cancel_requested.is_set()
+            if not dist.is_initialized() or dist.get_rank() == 0
+            else False
+        )
+        if dist.is_initialized():
+            payload = [cancel_requested if dist.get_rank() == 0 else None]
+            dist.broadcast_object_list(payload, src=0)
+            cancel_requested = payload[0]
+        return cancel_requested
 
     def _export_feedback_states(self, state_num):
         if not hasattr(self, 'feedback_state_buffer'):
@@ -661,13 +773,30 @@ class VA_Server:
             )
         return states, state_mask, constrained_num
 
-    def _make_prev_chunk_adapter(self, constrain_mode: str):
+    def _make_prev_chunk_adapter(
+        self,
+        constrain_mode: str,
+        *,
+        inference_delay: int | None = None,
+        execution_horizon: int | None = None,
+    ):
         frame_chunk_size = self.job_config.frame_chunk_size
         action_per_frame = self.action_per_frame
         action_num = frame_chunk_size * action_per_frame
         latent_channel = getattr(self.transformer.config, 'in_channels', 48)
         state_num = frame_chunk_size
         state_dim = latent_channel * self.latent_height * self.latent_width
+        default_delay = min(16, action_num // 2)
+        if inference_delay is None:
+            inference_delay = getattr(
+                self.job_config, 'rtc_inference_delay', default_delay
+            )
+        if execution_horizon is None:
+            execution_horizon = getattr(
+                self.job_config,
+                'rtc_execution_horizon',
+                action_num - inference_delay,
+            )
         prev_states, prev_state_mask, prev_state_constrained_num = self._export_feedback_states(state_num)
 
         adapter = PrevChunkAdapter(
@@ -688,16 +817,96 @@ class VA_Server:
             prev_state_mask=prev_state_mask,
             device=self.device,
             dtype=self.dtype,
-            inference_delay=16,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+            rtc_attention_schedule=getattr(
+                self.job_config, 'rtc_attention_schedule', 'EXP'
+            ),
         )
         logger.info(
-            "FBFM adapter summary: state_count=%s action_count=%s feedback_buffer_len=%s state_mask=%s",
+            "FBFM adapter summary: mode=%s state_count=%s action_target_count=%s "
+            "feedback_buffer_len=%s state_mask=%s H=%s d=%s s=%s action_mask=%s",
+            adapter.constraint_mode.value,
             adapter.state_constrained_num,
             adapter.action_constrained_num,
             len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
             prev_state_mask.tolist() if prev_state_mask is not None else None,
+            action_num,
+            inference_delay,
+            execution_horizon,
+            adapter.get_action_prefix_weights().flatten().tolist(),
         )
         return adapter
+
+    def _make_constraint_context(self, adapter):
+        state_targets = adapter.get_constrained_states()
+        # Read the raw feedback mask here. ChunkConstraintContext owns mode gating.
+        if adapter._explicit_state_mask is None:
+            raw_state_mask = torch.zeros(
+                adapter._state_num, device=self.device, dtype=self.dtype
+            )
+        else:
+            raw_state_mask = adapter._explicit_state_mask
+        state_mask = raw_state_mask[None, None, :, None, None].contiguous()
+        context = ChunkConstraintContext(
+            mode=adapter.constraint_mode,
+            chunk_id=self.frame_st_id,
+            target_frame_st_id=self.feedback_target_frame_st_id,
+            action_targets=adapter.get_constrained_actions(),
+            action_mask=adapter._rtc_action_mask.reshape(
+                adapter._frame_chunk_size, adapter._action_per_frame
+            )[None, None, :, :, None],
+            state_targets=state_targets,
+            state_mask=state_mask,
+        )
+        old_context = getattr(self, 'active_constraint_context', None)
+        if old_context is not None:
+            old_context.close()
+        self.active_constraint_context = context
+        return context
+
+    def _run_chunk_inference(self, obs):
+        constraint_mode = ConstraintMode.parse(
+            getattr(self.job_config, 'constraint_mode', 'NONE')
+        )
+        if not getattr(self.job_config, "feedback_live_enabled", True):
+            drained_feedback, cancel_requested = self._drain_live_feedback()
+            if cancel_requested:
+                return {"cancelled": True}
+            if drained_feedback:
+                logger.info(
+                    "FBFM-static snapshot prepared before context creation: count=%s",
+                    drained_feedback,
+                )
+        self.prev_chunk_left_over = self._make_prev_chunk_adapter(
+            constraint_mode.value,
+            inference_delay=obs.get('rtc_inference_delay'),
+            execution_horizon=obs.get('rtc_execution_horizon'),
+        )
+        self._make_constraint_context(self.prev_chunk_left_over)
+        logger.info(
+            "FBFM chunk inference starting: chunk_id=%s mode=%s state_version=%s",
+            self.frame_st_id,
+            constraint_mode.value,
+            self.active_constraint_context.version,
+        )
+        with self._inference_state_lock:
+            was_running = self._inference_running
+            self._inference_running = True
+        if not was_running:
+            self._cancel_requested.clear()
+        try:
+            self._solver_phase = "video"
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+        finally:
+            self._solver_phase = "idle"
+            with self._inference_state_lock:
+                self._inference_running = False
+        if action is None:
+            return {"cancelled": True}
+        self.last_action = action
+        self.first_epoch = False
+        return dict(action=action)
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
@@ -744,6 +953,10 @@ class VA_Server:
     
         # 1. Video Generation Loop
         for i, t in enumerate(tqdm(timesteps)):
+            drained_feedback, cancel_requested = self._drain_live_feedback()
+            if cancel_requested:
+                logger.info("Chunk inference cancelled at video solver step %s", i)
+                return None, None
             last_step = i == len(timesteps) - 1
             latent_cond = init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
             
@@ -763,21 +976,44 @@ class VA_Server:
                 need_patch=True
             )
             
+            state_targets, state_weights, state_version = (
+                self.active_constraint_context.snapshot_state_constraints()
+            )
+            logger.debug(
+                "FBFM solver state snapshot: chunk_id=%s solver_step=%s version=%s mask=%s",
+                self.active_constraint_context.chunk_id,
+                i,
+                state_version,
+                state_weights.flatten().tolist(),
+            )
+            if drained_feedback:
+                logger.info(
+                    "FBFM live feedback consumed: chunk_id=%s solver_step=%s count=%s version=%s",
+                    self.active_constraint_context.chunk_id,
+                    i,
+                    drained_feedback,
+                    state_version,
+                )
             latents = self.scheduler.step(
                 original_denoise_step_partial=denoise_fn,
                 x_t=latents,
                 timestep=t,
                 sample=latents,
                 to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None,
-                weights=self.prev_chunk_left_over.get_state_prefix_weights() if hasattr(self, 'prev_chunk_left_over') else None,
+                constrained_y=state_targets,
+                weights=state_weights,
                 device=self.device
             )
             
             latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
         
         # 2. Action Generation Loop
+        self._solver_phase = "action"
         for i, t in enumerate(tqdm(action_timesteps)):
+            cancel_requested = self._sync_cancel_requested()
+            if cancel_requested:
+                logger.info("Chunk inference cancelled at action solver step %s", i)
+                return None, None
             last_step = i == len(action_timesteps) - 1
             action_cond = torch.zeros(
                 [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
@@ -798,14 +1034,17 @@ class VA_Server:
                 need_patch=False
             )
             
+            action_targets, action_weights, _ = (
+                self.active_constraint_context.snapshot_action_constraints()
+            )
             actions = self.action_scheduler.step(
                 original_denoise_step_partial=denoise_fn,
                 x_t=actions,
                 timestep=t,
                 sample=actions,
                 to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_actions(),
-                weights=self.prev_chunk_left_over.get_action_prefix_weights(),
+                constrained_y=action_targets,
+                weights=action_weights,
                 device=self.device
             )
 
@@ -859,6 +1098,7 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        generate_after_kv_cache = obs.get('generate_after_kv_cache', False)
         feedback = obs.get('feedback', False)    # 状态反馈标志
         immediate_return = obs.get('immediate_return', False)
 
@@ -874,7 +1114,17 @@ class VA_Server:
             return dict()
         elif compute_kv_cache:
             logger.info(f"################# Compute KV Cache #################")
-            self._compute_kv_cache(obs)
+            if generate_after_kv_cache:
+                self._cancel_requested.clear()
+                with self._inference_state_lock:
+                    self._inference_running = True
+            try:
+                self._compute_kv_cache(obs)
+            except Exception:
+                if generate_after_kv_cache:
+                    with self._inference_state_lock:
+                        self._inference_running = False
+                raise
 
             if not self.first_epoch:
                 logger.info(f"################# Start Feedback Accumulation Window #################")
@@ -883,7 +1133,11 @@ class VA_Server:
                         "FBFM feedback context had incomplete pending obs before accumulation: pending_obs=%s",
                         len(self.feedback_pending_obs),
                     )
-                self._start_feedback_accumulation_window()
+                self._start_feedback_accumulation_window(
+                    start_action_step=obs.get(
+                        'feedback_window_start_action_step'
+                    )
+                )
                 _, state_mask, _ = self.feedback_state_buffer.export()
                 logger.info(
                     (
@@ -898,24 +1152,13 @@ class VA_Server:
                 )
                 self.last_obs = obs
 
+            if generate_after_kv_cache:
+                return self._run_chunk_inference(obs)
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            self.prev_chunk_left_over = self._make_prev_chunk_adapter("None")
             if immediate_return:
-                if self.first_epoch:
-                    # 第一epoch
-                    logger.info(f"################# Init First PrevChunkAdapter with None #################")
-                    self.prev_chunk_left_over = self._make_prev_chunk_adapter("None")
-                    action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-                    self.last_action = action
-                    self.first_epoch = False
-                    return dict(action=action)
-                else:
-                    # 后续epoch
-                    action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-                    self.last_action = action
-                    return dict(action=action)
+                return self._run_chunk_inference(obs)
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
