@@ -32,11 +32,6 @@ import importlib
 import argparse
 import pdb
 from evaluation.robotwin.geometry import euler2quat
-from evaluation.robotwin.pseudo_async import (
-    should_receive_async_result,
-    should_request_next_kv_cache,
-    should_wait_for_async_result,
-)
 import numpy as np
 
 from description.utils.generate_episode_instructions import *
@@ -560,7 +555,6 @@ def eval_policy(task_name,
         prompt = TASK_ENV.get_instruction()
         ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
         
-        first = True
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
@@ -575,96 +569,136 @@ def eval_policy(task_name,
         full_obs_list.append(initial_formatted_obs)
         first_obs = None
 
-        # DEBUG: Pseudo-Asynchronous
-        INFER_DELAY_STEPS = 16
-        pseudo_async_steps_count = 0
+        # True asynchronous rollout: infer the next chunk while the current
+        # chunk's executable suffix is being applied to the environment.
+        INFER_DELAY_STEPS = int(os.environ.get("LINGBOT_VA_RTC_DELAY", "16"))
+        EXECUTION_HORIZON = int(
+            os.environ.get("LINGBOT_VA_RTC_EXECUTION_HORIZON", "16")
+        )
+        rtc_delay_estimate = INFER_DELAY_STEPS
         key_frame_list = []
 
+        observation = TASK_ENV.get_obs()
+        first_obs = format_obs(observation, prompt)
+        ret = model.infer(dict(
+            obs=first_obs,
+            prompt=prompt,
+            save_visualization=save_visualization,
+            video_guidance_scale=video_guidance_scale,
+            action_guidance_scale=action_guidance_scale,
+            immediate_return=True,
+        ))
+        action = ret['action']
+        # The main streaming VAE has already consumed the initial observation.
+        # Its next cache update requires four *new* control observations.  The
+        # first transition is therefore a causal warm-up; later transitions can
+        # launch immediately and overlap inference with execution.
+        action_per_frame = 4
+        new_observations_since_initial = 0
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
-            if first:
-                observation = TASK_ENV.get_obs()
-                first_obs = format_obs(observation, prompt)
-
-            # DEBUG: Pseudo-Asynchronous
-            if first:
-                ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale,
-                                    immediate_return = first,    # 只有在第一轮时候才返回
-                                    )) #(TASK_ENV, model, observation)
-                action = ret['action']
+            # This request owns the distributed inference worker but runs in a
+            # client background thread. Feedback uses a second websocket and
+            # is drained by the running solver at denoising-step boundaries.
+            inference_started = new_observations_since_initial >= action_per_frame
+            if inference_started:
+                model.start_infer(dict(
+                    obs=full_obs_list[-action_per_frame:],
+                    compute_kv_cache=True,
+                    generate_after_kv_cache=True,
+                    imagine=False,
+                    save_visualization=save_visualization,
+                    state=action,
+                    immediate_return=True,
+                    rtc_inference_delay=rtc_delay_estimate,
+                    rtc_execution_horizon=EXECUTION_HORIZON,
+                    feedback_window_start_action_step=TASK_ENV.take_action_cnt,
+                ))
 
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
-            
-            # DEBUG: Pseudo-Asynchronous
-            # key_frame_list = []
 
             assert action.shape[2] % 4 == 0
-            action_per_frame = 4
-            chunk_size = action.shape[1] * action.shape[2] # 2*16 = 32
+            chunk_size = action.shape[1] * action.shape[2]
+            if EXECUTION_HORIZON > chunk_size:
+                raise ValueError(
+                    f"execution horizon {EXECUTION_HORIZON} exceeds chunk size {chunk_size}"
+                )
+            execute_from = chunk_size - EXECUTION_HORIZON
+            observed_delay_steps = None
 
-            start_idx = 1 if first else 0
-            # 动作执行循环
-            for i in range(start_idx, action.shape[1]): # 这个循环是遍历各个chunk
-                for j in range(action.shape[2]):        # 这个循环是遍历一个chunk的每一action
-                    
-                    # DEBUG: Pseudo-Asynchronous
-                    pseudo_async_steps_count += 1
-                    if should_wait_for_async_result(first, pseudo_async_steps_count, INFER_DELAY_STEPS):
-                        # Skip the first INFER_DELAY_STEPS steps
-                        continue
-                    if should_receive_async_result(first, pseudo_async_steps_count, INFER_DELAY_STEPS):
-                        ret = model.infer(dict(
-                            obs=first_obs,
-                            immediate_return=True,    # 此时返回并接收
-                        ))
-                        action = ret['action']                             # 接收到下一题chunk的action
+            for executed_step, flat_action_id in enumerate(
+                range(execute_from, chunk_size), start=1
+            ):
+                i, j = divmod(flat_action_id, action.shape[2])
+                raw_action_step = action[:, i, j].flatten()
+                full_action_history.append(raw_action_step)
 
-
-                    raw_action_step = action[:, i, j].flatten() 
-                    full_action_history.append(raw_action_step)
-
-                    ee_action = action[:, i, j]
-                    if action.shape[0] == 14:
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                            ee_action[6:10],
-                            euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                            ee_action[13:14]
-                        ])
-                    elif action.shape[0] == 16:
-                        ee_action =  add_init_pose(ee_action, inint_eef_pose)
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
-                            ee_action[7:11],
-                            ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
-                            ee_action[15:16]
-                        ])
-                    else:
-                        raise NotImplementedError
-                    TASK_ENV.take_action(ee_action, action_type='ee')
+                ee_action = action[:, i, j]
+                if action.shape[0] == 14:
+                    ee_action = np.concatenate([
+                        ee_action[:3],
+                        euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                        ee_action[6:10],
+                        euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                        ee_action[13:14]
+                    ])
+                elif action.shape[0] == 16:
+                    ee_action = add_init_pose(ee_action, inint_eef_pose)
+                    ee_action = np.concatenate([
+                        ee_action[:3],
+                        ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                        ee_action[7:11],
+                        ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                        ee_action[15:16]
+                    ])
+                else:
+                    raise NotImplementedError
+                TASK_ENV.take_action(ee_action, action_type='ee')
+                if observed_delay_steps is None and model.inference_done():
+                    observed_delay_steps = executed_step
                    
-                    if (j+1) % action_per_frame == 0:
-                        # 对obs的处理 获取obs - 发送server - （server: VAE编码）
-                        obs = format_obs(TASK_ENV.get_obs(), prompt)
-                        full_obs_list.append(obs)
-                        key_frame_list.append(obs)
-                        if len(full_obs_list) >= action_per_frame:  
-                                # 将最新4帧观测发送到server 进行FBFM 
-                                # 这一逻辑仅进行反馈 不考虑正常推理obs
-                                model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))
+                if (j+1) % action_per_frame == 0:
+                    # 对obs的处理 获取obs - 发送server - （server: VAE编码）
+                    obs = format_obs(TASK_ENV.get_obs(), prompt)
+                    full_obs_list.append(obs)
+                    new_observations_since_initial += 1
+                    key_frame_list.append(obs)
+                    if len(full_obs_list) >= action_per_frame:
+                        # 将最新4帧观测发送到server 进行FBFM
+                        model.infer(dict(
+                            obs=full_obs_list[-action_per_frame:],
+                            feedback=True,
+                            observation_action_step=TASK_ENV.take_action_cnt,
+                        ))
 
-                    if should_request_next_kv_cache(first, pseudo_async_steps_count, chunk_size, INFER_DELAY_STEPS):
-                        # 提前触发推理逻辑
-                        first = False
-                        model.infer(dict(obs = full_obs_list[-action_per_frame:], compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action,
-                                        immediate_return = False,  # 不直接返回 在下一周期中if pseudo_async_steps_count == INFER_DELAY_STEPS 分支中返回
-                                        ))
-            
-            # DEBUG: Pseudo-Asynchronous
-            pseudo_async_steps_count = 0 # Reset
+            if not inference_started:
+                if new_observations_since_initial < action_per_frame:
+                    raise RuntimeError(
+                        "first async transition did not collect four new observations"
+                    )
+                model.start_infer(dict(
+                    obs=full_obs_list[-action_per_frame:],
+                    compute_kv_cache=True,
+                    generate_after_kv_cache=True,
+                    imagine=False,
+                    save_visualization=save_visualization,
+                    state=action,
+                    immediate_return=True,
+                    rtc_inference_delay=EXECUTION_HORIZON,
+                    rtc_execution_horizon=EXECUTION_HORIZON,
+                    feedback_window_start_action_step=TASK_ENV.take_action_cnt,
+                ))
+
+            # If inference is slower than execution, block only at the switch
+            # boundary; otherwise this returns immediately.  The first causal
+            # warm-up always blocks here because its request starts at boundary.
+            ret = model.receive_infer()
+            action = ret['action']
+            rtc_delay_estimate = min(
+                observed_delay_steps or EXECUTION_HORIZON,
+                chunk_size - EXECUTION_HORIZON,
+            )
             overlap_frame_num = INFER_DELAY_STEPS // action_per_frame
             key_frame_list = full_obs_list[-overlap_frame_num:]
   
