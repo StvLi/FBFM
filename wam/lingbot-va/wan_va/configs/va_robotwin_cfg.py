@@ -31,6 +31,23 @@ va_robotwin_cfg.action_guidance_scale = 1
 va_robotwin_cfg.num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
+va_robotwin_cfg.constraint_mode = os.environ.get("LINGBOT_VA_CONSTRAINT_MODE", "FBFM").upper()
+va_robotwin_cfg.rtc_inference_delay = int(os.environ.get("LINGBOT_VA_RTC_DELAY", "16"))
+va_robotwin_cfg.rtc_execution_horizon = int(
+    os.environ.get("LINGBOT_VA_RTC_EXECUTION_HORIZON", "16")
+)
+va_robotwin_cfg.rtc_attention_schedule = os.environ.get(
+    "LINGBOT_VA_RTC_ATTENTION_SCHEDULE", "EXP"
+).upper()
+va_robotwin_cfg.feedback_obs_per_state = int(
+    os.environ.get("LINGBOT_VA_FEEDBACK_OBS_PER_STATE", "4")
+)
+# Diagnostic ablation only: mode remains FBFM, but feedback arriving after the
+# current chunk starts is retained for the next chunk instead of being injected
+# into the running ChunkConstraintContext.
+va_robotwin_cfg.feedback_live_enabled = os.environ.get(
+    "LINGBOT_VA_FEEDBACK_LIVE", "1"
+) != "0"
 va_robotwin_cfg.enable_offload = os.environ.get("LINGBOT_VA_ENABLE_OFFLOAD",
                                                 "1") != "0"
 

@@ -1,9 +1,163 @@
+import math
+import threading
+from enum import Enum
+
 import torch
 from torch import Tensor
 import numpy as np
 import fbfm.policies.fbfm.modeling_rtc_fbfm as FBFM
 from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 from utils import FlowMatchScheduler
+
+
+class ConstraintMode(str, Enum):
+    """Constraint modes share one solver path and differ only by their masks."""
+
+    NONE = "NONE"
+    RTC = "RTC"
+    FBFM = "FBFM"
+
+    @classmethod
+    def parse(cls, value: "ConstraintMode | str") -> "ConstraintMode":
+        if isinstance(value, cls):
+            return value
+        normalized = str(value).strip().upper()
+        # ``Feedback`` is the historical name used by FBFM.PrevChunk.
+        if normalized == "FEEDBACK":
+            normalized = cls.FBFM.value
+        return cls(normalized)
+
+
+def build_rtc_action_mask(
+    *,
+    total: int,
+    inference_delay: int,
+    execution_horizon: int,
+    schedule: str = "EXP",
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Build the RTC mask from the paper's ``H``/``d``/``s`` coordinates.
+
+    The frozen region is ``[0, d)``, the soft overlap is ``[d, H-s)``, and
+    the freely generated suffix is ``[H-s, H)``.  ``LINEAR`` and ``EXP``
+    match the schedules in :mod:`fbfm.policies.fbfm.modeling_rtc`.
+    """
+    if total <= 0:
+        raise ValueError(f"total must be positive, got {total}")
+    if not 0 <= inference_delay <= total:
+        raise ValueError(
+            f"inference_delay must be in [0, {total}], got {inference_delay}"
+        )
+    if not 0 <= execution_horizon <= total:
+        raise ValueError(
+            f"execution_horizon must be in [0, {total}], got {execution_horizon}"
+        )
+
+    overlap_end = total - execution_horizon
+    if inference_delay > overlap_end:
+        raise ValueError(
+            "RTC requires inference_delay <= H - execution_horizon, got "
+            f"d={inference_delay}, H={total}, s={execution_horizon}"
+        )
+
+    schedule = str(getattr(schedule, "value", schedule)).upper()
+    weights = torch.zeros(total, device=device, dtype=dtype)
+    weights[:inference_delay] = 1
+    soft_len = overlap_end - inference_delay
+    if soft_len == 0:
+        return weights
+    if schedule == "ZEROS":
+        return weights
+    if schedule == "ONES":
+        weights[inference_delay:overlap_end] = 1
+        return weights
+
+    soft = torch.linspace(
+        1, 0, soft_len + 2, device=device, dtype=dtype
+    )[1:-1]
+    if schedule == "EXP":
+        soft = soft * torch.expm1(soft) / (math.e - 1)
+    elif schedule != "LINEAR":
+        raise ValueError(f"Unknown RTC attention schedule: {schedule}")
+    weights[inference_delay:overlap_end] = soft
+    return weights
+
+
+class ChunkConstraintContext:
+    """Thread-safe, versioned constraints for one running generation chunk.
+
+    Action constraints are installed when the chunk starts.  State constraints
+    can be filled while flow matching is running; the video solver obtains a
+    fresh snapshot at every denoising step.  All modes maintain the same target
+    tensors, and mode selection only gates the returned masks.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: ConstraintMode | str,
+        chunk_id: int,
+        target_frame_st_id: int,
+        action_targets: Tensor,
+        action_mask: Tensor,
+        state_targets: Tensor,
+        state_mask: Tensor,
+    ):
+        self.mode = ConstraintMode.parse(mode)
+        self.chunk_id = int(chunk_id)
+        self.target_frame_st_id = int(target_frame_st_id)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._version = 0
+        self._action_targets = action_targets.clone().detach()
+        self._action_mask = action_mask.clone().detach()
+        self._state_targets = state_targets.clone().detach()
+        self._state_mask = state_mask.clone().detach()
+        self._state_slot_versions = torch.zeros(
+            state_targets.shape[2], dtype=torch.int64, device=state_mask.device
+        )
+
+    @property
+    def version(self) -> int:
+        with self._lock:
+            return self._version
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def update_state_slot(self, *, global_slot_id: int, state: Tensor) -> bool:
+        """Install one observed latent using an explicit global slot id."""
+        local_slot = int(global_slot_id) - self.target_frame_st_id
+        with self._lock:
+            if self._closed or not 0 <= local_slot < self._state_targets.shape[2]:
+                return False
+            if self._state_mask[:, :, local_slot, :, :].gt(0).any():
+                return False
+            target = state.to(
+                device=self._state_targets.device,
+                dtype=self._state_targets.dtype,
+            ).reshape_as(self._state_targets[:, :, local_slot, :, :])
+            self._state_targets[:, :, local_slot, :, :].copy_(target)
+            self._state_mask[:, :, local_slot, :, :] = 1
+            self._version += 1
+            self._state_slot_versions[local_slot] = self._version
+            return True
+
+    def snapshot_state_constraints(self) -> tuple[Tensor, Tensor, int]:
+        with self._lock:
+            mask = self._state_mask.clone()
+            if self.mode is not ConstraintMode.FBFM:
+                mask.zero_()
+            return self._state_targets.clone(), mask, self._version
+
+    def snapshot_action_constraints(self) -> tuple[Tensor, Tensor, int]:
+        with self._lock:
+            mask = self._action_mask.clone()
+            if self.mode is ConstraintMode.NONE:
+                mask.zero_()
+            return self._action_targets.clone(), mask, self._version
 
 
 def latent_to_state_vectors(
@@ -200,7 +354,9 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
                     prev_state_mask: Tensor | None = None,
                     device: torch.device,
                     dtype: torch.dtype,
-                    inference_delay: int = 0):
+                    inference_delay: int = 0,
+                    execution_horizon: int | None = None,
+                    rtc_attention_schedule: str = "EXP"):
         """
         初始化约束模块，配置动作与状态的空间维度、设备类型及历史动作数据。
 
@@ -240,6 +396,21 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
         self._device = device
         self._dtype = dtype
         self._used_action_channel_ids = used_action_channel_ids
+        self.constraint_mode = ConstraintMode.parse(constrain_mode)
+        if execution_horizon is None:
+            # Backward-compatible degenerate RTC mask: only the frozen prefix.
+            execution_horizon = max(action_num - inference_delay, 0)
+        self._execution_horizon = int(execution_horizon)
+        self._inference_delay = int(inference_delay)
+        self._rtc_attention_schedule = rtc_attention_schedule
+        self._rtc_action_mask = build_rtc_action_mask(
+            total=action_num,
+            inference_delay=self._inference_delay,
+            execution_horizon=self._execution_horizon,
+            schedule=rtc_attention_schedule,
+            device=device,
+            dtype=dtype,
+        )
 
         # 初始化历史动作转换变量，若存在历史动作则进行格式转换并计算受约束数量
         actions_2d = None
@@ -252,16 +423,23 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
                 frame_chunk_size=frame_chunk_size,
                 action_per_frame=action_per_frame,
             )
-            if inference_delay is not None and inference_delay > 0:
-                action_constrained_num = min(inference_delay, full_action_num, action_num)
+            overlap_num = action_num - self._execution_horizon
+            if overlap_num > 0:
+                action_constrained_num = min(overlap_num, full_action_num, action_num)
                 actions_2d = full_actions_2d[-action_constrained_num:].contiguous()
             else:
                 action_constrained_num = min(full_action_num, action_num)
                 actions_2d = full_actions_2d[:action_constrained_num].contiguous()
+        else:
+            # The first generated chunk has no previous-action target.
+            self._rtc_action_mask.zero_()
 
         # 调用父类构造函数，传入处理后的动作数据、状态占位符及各项配置参数以完成基础初始化
         super().__init__(
-            constrain_mode=constrain_mode,
+            constrain_mode=(
+                "Feedback" if self.constraint_mode is ConstraintMode.FBFM
+                else self.constraint_mode.value.title()
+            ),
             actions=actions_2d,
             action_constrained_num=action_constrained_num,
             action_num=action_num,
@@ -445,7 +623,11 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
 
     def get_state_prefix_weights(self) -> Tensor:
         # (B=1, 1, F, 1, 1)
-        if self._explicit_state_mask is not None:
+        if self.constraint_mode is not ConstraintMode.FBFM:
+            w_1d = torch.zeros(
+                self._state_num, device=self._device, dtype=self._dtype
+            )
+        elif self._explicit_state_mask is not None:
             w_1d = self._explicit_state_mask
         else:
             w_1d = super().get_state_prefix_weights().to(device=self._device,
@@ -461,8 +643,10 @@ class VA_PrevChunkAdapter(FBFM.PrevChunk):
 
     def get_action_prefix_weights(self) -> Tensor:
         # (B=1, 1, F, N, 1)
-        w_1d = super().get_action_prefix_weights().to(device=self._device,
-                                                     dtype=self._dtype)
+        if self.constraint_mode is ConstraintMode.NONE:
+            w_1d = torch.zeros_like(self._rtc_action_mask)
+        else:
+            w_1d = self._rtc_action_mask
         w_2d = w_1d.reshape(self._frame_chunk_size, self._action_per_frame)
         return w_2d[None, None, :, :, None].contiguous()
 
@@ -524,7 +708,12 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
         # 转换为RTC中 由1到0的虚时间轴 由tau表示
         tau = 1 - sigma
 
-        if constrained_y is not None and weights is not None:
+        has_guidance = (
+            constrained_y is not None
+            and weights is not None
+            and bool(torch.any(weights).item())
+        )
+        if has_guidance:
             x_t = x_t.clone().detach().requires_grad_(True)
 
             # 疑似没有用 weights 已经自动过了
