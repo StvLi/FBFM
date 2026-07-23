@@ -1,5 +1,12 @@
 # Robotwin FBFM success eval record
 
+> Historical record (June 6, 2026).  The pseudo-async implementation described
+> below is **not** the current runtime and must not be used as the specification
+> for NONE/RTC/FBFM.  It has been replaced by two-WebSocket background
+> inference plus solver-step feedback.  See `docs/fbfm_runtime_modes.md` for the
+> current semantics, configuration, tests, and ablation entry point.  The old
+> output remains useful only as provenance and is intentionally preserved.
+
 This document records the code changes that led to the first successful
 Robotwin eval with FBFM enabled on June 6, 2026.
 

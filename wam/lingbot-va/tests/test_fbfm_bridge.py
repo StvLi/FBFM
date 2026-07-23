@@ -1,5 +1,7 @@
 from pathlib import Path
+import queue
 import sys
+import threading
 from types import SimpleNamespace
 
 import torch
@@ -15,15 +17,18 @@ if str(LINGBOT_VA_ROOT) not in sys.path:
 if str(WAN_VA_ROOT) not in sys.path:
     sys.path.insert(0, str(WAN_VA_ROOT))
 
-from evaluation.robotwin.pseudo_async import should_request_next_kv_cache
 from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 from lingbot_va_bridge import FeedbackStateBuffer
 from lingbot_va_bridge import FeedbackSlotTracker
 from lingbot_va_bridge import SlotAlignedStateBuffer
+from lingbot_va_bridge import ChunkConstraintContext
+from lingbot_va_bridge import ConstraintMode
 from lingbot_va_bridge import VA_PrevChunkAdapter
 from lingbot_va_bridge import WrapperedFlowMatchScheduler
+from lingbot_va_bridge import build_rtc_action_mask
+from fbfm.configs.types import RTCAttentionSchedule
+from fbfm.policies.fbfm.modeling_rtc import RTCProcessor
 from utils import FlowMatchScheduler
-from wan_va_server import VA_Server
 
 
 def test_wrapper_scheduler_matches_base_without_guidance():
@@ -57,6 +62,16 @@ def test_wrapper_scheduler_matches_base_without_guidance():
     )
     base_out = base.step(denoise_fn(x_t), timestep=timestep, sample=sample)
     assert torch.allclose(wrapped_out, base_out)
+
+    wrapped_zero_mask_out = wrapped.step(
+        original_denoise_step_partial=denoise_fn,
+        x_t=x_t,
+        timestep=timestep,
+        sample=sample,
+        constrained_y=torch.full_like(x_t, 999.0),
+        weights=torch.zeros_like(x_t),
+    )
+    assert torch.equal(wrapped_zero_mask_out, base_out)
 
 
 def test_wrapper_scheduler_guidance_changes_with_target_and_weights():
@@ -129,30 +144,6 @@ def test_feedback_slot_tracker_emits_one_slot_every_four_observations():
     assert tracker.obs_count == 8
     tracker.reset()
     assert tracker.obs_count == 0
-
-
-def test_pseudo_async_requests_next_kv_cache_after_each_executable_segment():
-    chunk_size = 32
-    infer_delay_steps = 16
-
-    assert should_request_next_kv_cache(
-        first=True,
-        step_count=16,
-        chunk_size=chunk_size,
-        infer_delay_steps=infer_delay_steps,
-    )
-    assert not should_request_next_kv_cache(
-        first=False,
-        step_count=16,
-        chunk_size=chunk_size,
-        infer_delay_steps=infer_delay_steps,
-    )
-    assert should_request_next_kv_cache(
-        first=False,
-        step_count=32,
-        chunk_size=chunk_size,
-        infer_delay_steps=infer_delay_steps,
-    )
 
 
 def test_slot_aligned_state_buffer_exports_state_and_mask():
@@ -245,7 +236,263 @@ def test_prev_chunk_adapter_uses_explicit_state_mask_not_prefix_mask():
     assert torch.equal(constrained_states, torch.tensor([1.0, 2.0], dtype=torch.float32))
 
 
+def _make_mode_adapter(mode):
+    return VA_PrevChunkAdapter(
+        constrain_mode=mode,
+        prev_actions=torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
+        used_action_channel_ids=[0],
+        action_num=8,
+        action_dim=1,
+        frame_chunk_size=2,
+        action_per_frame=4,
+        state_num=2,
+        latent_channel=1,
+        latent_height=1,
+        latent_width=1,
+        state_dim=1,
+        prev_states=torch.tensor([[1.0], [2.0]]),
+        prev_state_constrained_num=2,
+        prev_state_mask=torch.tensor([1.0, 1.0]),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        inference_delay=2,
+        execution_horizon=3,
+        rtc_attention_schedule="EXP",
+    )
+
+
+def test_constraint_modes_only_gate_masks():
+    none = _make_mode_adapter("NONE")
+    rtc = _make_mode_adapter("RTC")
+    fbfm = _make_mode_adapter("FBFM")
+
+    none_state = none.get_state_prefix_weights()
+    rtc_state = rtc.get_state_prefix_weights()
+    fbfm_state = fbfm.get_state_prefix_weights()
+    none_action = none.get_action_prefix_weights()
+    rtc_action = rtc.get_action_prefix_weights()
+    fbfm_action = fbfm.get_action_prefix_weights()
+
+    assert torch.count_nonzero(none_state) == 0
+    assert torch.count_nonzero(none_action) == 0
+    assert torch.count_nonzero(rtc_state) == 0
+    assert torch.equal(rtc_action, fbfm_action)
+    assert torch.equal(fbfm_state[0, 0, :, 0, 0], torch.ones(2))
+    assert torch.equal(none.get_constrained_actions(), rtc.get_constrained_actions())
+    assert torch.equal(rtc.get_constrained_actions(), fbfm.get_constrained_actions())
+    assert torch.equal(none.get_constrained_states(), fbfm.get_constrained_states())
+
+
+def test_rtc_action_mask_matches_core_implementation():
+    for schedule in (RTCAttentionSchedule.LINEAR, RTCAttentionSchedule.EXP):
+        expected = RTCProcessor(
+            RTCConfig(prefix_attention_schedule=schedule)
+        ).get_prefix_weights(start=4, end=20, total=32)
+        actual = build_rtc_action_mask(
+            total=32,
+            inference_delay=4,
+            execution_horizon=12,
+            schedule=schedule,
+        )
+        assert torch.allclose(actual, expected)
+
+
+def test_rtc_action_mask_degenerate_boundary():
+    mask = build_rtc_action_mask(
+        total=32,
+        inference_delay=16,
+        execution_horizon=16,
+        schedule="EXP",
+    )
+    assert torch.equal(mask[:16], torch.ones(16))
+    assert torch.equal(mask[16:], torch.zeros(16))
+
+
+def test_rtc_masks_timesteps_and_preserves_each_16d_action_vector():
+    used_channels = list(range(7)) + [28] + list(range(7, 14)) + [29]
+    # Robotwin layout: 16 action-vector components x 2 latent frames x
+    # 16 control steps.  Values uniquely identify (time, component).
+    previous = torch.empty(16, 2, 16)
+    for component in range(16):
+        for frame in range(2):
+            for within_frame in range(16):
+                time_step = frame * 16 + within_frame
+                previous[component, frame, within_frame] = (
+                    time_step * 100 + component
+                )
+
+    adapter = VA_PrevChunkAdapter(
+        constrain_mode="RTC",
+        prev_actions=previous,
+        used_action_channel_ids=used_channels,
+        action_num=32,
+        action_dim=30,
+        frame_chunk_size=2,
+        action_per_frame=16,
+        state_num=2,
+        latent_channel=1,
+        latent_height=1,
+        latent_width=1,
+        state_dim=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        inference_delay=4,
+        execution_horizon=12,
+        rtc_attention_schedule="LINEAR",
+    )
+
+    targets = adapter.get_constrained_actions()
+    weights = adapter.get_action_prefix_weights()
+    assert targets.shape == (1, 30, 2, 16, 1)
+    assert weights.shape == (1, 1, 2, 16, 1)
+
+    flat_targets = targets[0, :, :, :, 0].reshape(30, 32).T
+    flat_weights = weights.flatten()
+    # The overlap target is the previous chunk's final H-s=20 vectors.
+    for target_step in range(20):
+        source_step = target_step + 12
+        expected_vector = torch.zeros(30)
+        for component, channel in enumerate(used_channels):
+            expected_vector[channel] = source_step * 100 + component
+        assert torch.equal(flat_targets[target_step], expected_vector)
+
+    # One scalar RTC weight is broadcast over all 30 internal channels, hence
+    # over all 16 effective output components of the same action timestep.
+    expanded = weights.expand_as(targets)
+    for time_step in range(32):
+        frame, within_frame = divmod(time_step, 16)
+        assert torch.unique(expanded[0, :, frame, within_frame, 0]).numel() == 1
+        assert expanded[0, 0, frame, within_frame, 0] == flat_weights[time_step]
+
+
+def test_rtc_preserves_14d_action_vectors_without_flattening_components():
+    previous = torch.arange(14 * 2 * 16, dtype=torch.float32).reshape(14, 2, 16)
+    adapter = VA_PrevChunkAdapter(
+        constrain_mode="RTC",
+        prev_actions=previous,
+        used_action_channel_ids=list(range(14)),
+        action_num=32,
+        action_dim=14,
+        frame_chunk_size=2,
+        action_per_frame=16,
+        state_num=2,
+        latent_channel=1,
+        latent_height=1,
+        latent_width=1,
+        state_dim=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        inference_delay=4,
+        execution_horizon=12,
+        rtc_attention_schedule="EXP",
+    )
+    targets = adapter.get_constrained_actions()
+    weights = adapter.get_action_prefix_weights()
+    assert targets.shape == (1, 14, 2, 16, 1)
+    assert weights.shape == (1, 1, 2, 16, 1)
+    assert weights.expand_as(targets).shape == targets.shape
+    for frame in range(2):
+        for within_frame in range(16):
+            assert torch.unique(
+                weights.expand_as(targets)[0, :, frame, within_frame, 0]
+            ).numel() == 1
+
+
+def test_rtc_without_previous_action_degenerates_to_none():
+    adapter = _make_mode_adapter("RTC")
+    adapter_without_previous = VA_PrevChunkAdapter(
+        constrain_mode="RTC",
+        prev_actions=None,
+        used_action_channel_ids=[0],
+        action_num=8,
+        action_dim=1,
+        frame_chunk_size=2,
+        action_per_frame=4,
+        state_num=2,
+        latent_channel=1,
+        latent_height=1,
+        latent_width=1,
+        state_dim=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        inference_delay=2,
+        execution_horizon=3,
+    )
+    assert torch.count_nonzero(adapter.get_action_prefix_weights()) > 0
+    assert torch.count_nonzero(
+        adapter_without_previous.get_action_prefix_weights()
+    ) == 0
+
+
+def test_chunk_constraint_context_exposes_live_state_only_to_fbfm():
+    def make_context(mode):
+        return ChunkConstraintContext(
+            mode=mode,
+            chunk_id=7,
+            target_frame_st_id=10,
+            action_targets=torch.zeros(1, 1, 2, 2, 1),
+            action_mask=torch.ones(1, 1, 2, 2, 1),
+            state_targets=torch.zeros(1, 1, 2, 1, 1),
+            state_mask=torch.zeros(1, 1, 2, 1, 1),
+        )
+
+    for mode in ConstraintMode:
+        context = make_context(mode)
+        _, before, version = context.snapshot_state_constraints()
+        assert version == 0
+        assert torch.count_nonzero(before) == 0
+        assert context.update_state_slot(
+            global_slot_id=10, state=torch.tensor([[[[3.0]]]])
+        )
+        states, state_mask, version = context.snapshot_state_constraints()
+        _, action_mask, _ = context.snapshot_action_constraints()
+        assert version == 1
+        assert states[0, 0, 0, 0, 0] == 3
+        if mode is ConstraintMode.FBFM:
+            assert state_mask[0, 0, 0, 0, 0] == 1
+        else:
+            assert torch.count_nonzero(state_mask) == 0
+        if mode is ConstraintMode.NONE:
+            assert torch.count_nonzero(action_mask) == 0
+        else:
+            assert torch.equal(action_mask, torch.ones_like(action_mask))
+
+        assert not context.update_state_slot(
+            global_slot_id=10, state=torch.tensor([[[[4.0]]]])
+        )
+        assert not context.update_state_slot(
+            global_slot_id=99, state=torch.tensor([[[[4.0]]]])
+        )
+
+
+def test_running_solver_can_observe_feedback_added_between_steps():
+    context = ChunkConstraintContext(
+        mode="FBFM",
+        chunk_id=1,
+        target_frame_st_id=5,
+        action_targets=torch.zeros(1, 1, 1, 1, 1),
+        action_mask=torch.zeros(1, 1, 1, 1, 1),
+        state_targets=torch.zeros(1, 1, 1, 1, 1),
+        state_mask=torch.zeros(1, 1, 1, 1, 1),
+    )
+    targets_0, mask_0, version_0 = context.snapshot_state_constraints()
+    assert version_0 == 0
+    assert torch.count_nonzero(mask_0) == 0
+
+    assert context.update_state_slot(
+        global_slot_id=5, state=torch.tensor([[[[2.5]]]])
+    )
+
+    targets_1, mask_1, version_1 = context.snapshot_state_constraints()
+    assert version_1 == 1
+    assert targets_0[0, 0, 0, 0, 0] == 0
+    assert targets_1[0, 0, 0, 0, 0] == 2.5
+    assert mask_1[0, 0, 0, 0, 0] == 1
+
+
 def _make_fake_feedback_server(latent_frames=1):
+    from wan_va_server import VA_Server
+
     server = object.__new__(VA_Server)
     server.device = torch.device("cpu")
     server.dtype = torch.float32
@@ -269,6 +516,13 @@ def _make_fake_feedback_server(latent_frames=1):
     server.feedback_has_received_window = False
     server.feedback_constraint_active = False
     server.feedback_target_frame_st_id = 0
+    server.feedback_last_observation_action_step = None
+    server._live_feedback_queue = queue.Queue()
+    server._inference_state_lock = threading.RLock()
+    server._inference_running = True
+    server._solver_phase = "video"
+    server._cancel_requested = threading.Event()
+    server.active_constraint_context = None
 
     encode_calls = []
 
@@ -377,3 +631,92 @@ def test_feedback_stream_rejects_latent_frame_count_mismatch():
         assert "feedback latent/frame count mismatch" in str(exc)
     else:
         raise AssertionError("expected feedback latent/frame count mismatch")
+
+
+def test_feedback_window_cutoff_keeps_history_out_of_future_state_mask():
+    server, _ = _make_fake_feedback_server()
+    server.feedback_stream_seeded = True
+    server.feedback_has_received_window = True
+    server.feedback_constraint_active = True
+    server.feedback_window_start_action_step = 16
+
+    server.feedback_pending_obs = ["obs4", "obs8", "obs12"]
+    server._feedback({
+        "obs": ["obs4", "obs8", "obs12", "obs16"],
+        "observation_action_step": 16,
+    })
+    _, mask, count = server.feedback_state_buffer.export()
+    assert count == 0
+    assert torch.count_nonzero(mask) == 0
+
+    server.feedback_pending_obs = ["obs17", "obs18", "obs19"]
+    server._feedback({
+        "obs": ["obs17", "obs18", "obs19", "obs20"],
+        "observation_action_step": 20,
+    })
+    _, mask, count = server.feedback_state_buffer.export()
+    assert count == 1
+    assert torch.equal(mask, torch.tensor([1.0, 0.0]))
+
+
+def test_solver_boundary_drains_feedback_into_active_context():
+    server, _ = _make_fake_feedback_server()
+    server.feedback_stream_seeded = True
+    server.feedback_has_received_window = True
+    server.feedback_constraint_active = True
+    server.feedback_pending_obs = ["obs20", "obs24", "obs28"]
+    server.active_constraint_context = ChunkConstraintContext(
+        mode="FBFM",
+        chunk_id=0,
+        target_frame_st_id=0,
+        action_targets=torch.zeros(1, 1, 2, 1, 1),
+        action_mask=torch.zeros(1, 1, 2, 1, 1),
+        state_targets=torch.zeros(1, 1, 2, 1, 1),
+        state_mask=torch.zeros(1, 1, 2, 1, 1),
+    )
+
+    queued = server.enqueue_live_feedback({
+        "obs": ["obs20", "obs24", "obs28", "obs32"],
+        "feedback": True,
+        "observation_action_step": 16,
+    })
+    assert queued["feedback_queued"]
+    count, cancelled = server._drain_live_feedback()
+    states, mask, version = (
+        server.active_constraint_context.snapshot_state_constraints()
+    )
+    assert count == 1
+    assert not cancelled
+    assert version == 1
+    assert states[0, 0, 0, 0, 0] == 1
+    assert mask[0, 0, 0, 0, 0] == 1
+    assert server.feedback_last_observation_action_step == 16
+
+
+def test_static_ablation_retains_feedback_without_mutating_running_context():
+    server, _ = _make_fake_feedback_server()
+    server.job_config.feedback_live_enabled = False
+    server.feedback_stream_seeded = True
+    server.feedback_has_received_window = True
+    server.feedback_constraint_active = True
+    server.feedback_pending_obs = ["obs20", "obs24", "obs28"]
+    server.active_constraint_context = ChunkConstraintContext(
+        mode="FBFM",
+        chunk_id=0,
+        target_frame_st_id=0,
+        action_targets=torch.zeros(1, 1, 2, 1, 1),
+        action_mask=torch.zeros(1, 1, 2, 1, 1),
+        state_targets=torch.zeros(1, 1, 2, 1, 1),
+        state_mask=torch.zeros(1, 1, 2, 1, 1),
+    )
+
+    server._feedback({"obs": ["obs20", "obs24", "obs28", "obs32"]})
+
+    _, context_mask, version = (
+        server.active_constraint_context.snapshot_state_constraints()
+    )
+    _, buffered_mask, buffered_count = server.feedback_state_buffer.export()
+    assert version == 0
+    assert torch.count_nonzero(context_mask) == 0
+    assert buffered_count == 1
+    assert torch.equal(buffered_mask, torch.tensor([1.0, 0.0]))
