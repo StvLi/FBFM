@@ -93,6 +93,108 @@ This processes the example data from `examples/0/` and saves visualizations to `
 
 ### Evaluation on RoboTwin-2.0
 
+#### NONE / RTC / FBFM formal evaluation on this workspace
+
+The three modes use one implementation and one orchestration path.  They differ
+only in the masks exposed to the flow-matching solver:
+
+| launcher | state mask | action mask |
+|---|---:|---:|
+| `script/run_robotwin_none.sh` | all zero | all zero |
+| `script/run_robotwin_rtc.sh` | all zero | RTC previous-action mask |
+| `script/run_robotwin_fbfm.sh` | live observed slots | the same RTC mask |
+
+An action at one control step is a complete 14D or 16D vector, not a scalar.
+`H`, `d`, and `s` count control steps.  The time mask has layout
+`(B,1,F,N,1)` and broadcasts over every component of the model action target
+`(B,D,F,N,1)`.
+
+The checked formal setup is:
+
+```text
+LingBot-VA source  /mnt/project_eai_hs/zrm2/FBFM/wam/lingbot-va
+RoboTwin           /mnt/project_eai_hs/zrm/RoboTwin
+policy Python      /mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/bin/python
+RoboTwin Python    /mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/bin/python
+checkpoint         /mnt/project_eai_hs/zrm/lingbot-va/checkpoints/lingbot-va-posttrain-robotwin
+```
+
+The policy environment uses Python 3.10.16, PyTorch 2.9.0+cu126,
+torchvision 0.24.0+cu126, diffusers 0.36.0, transformers 4.55.2,
+flash-attn 2.8.3.post1, and NumPy 1.26.4.  The independent RoboTwin client
+environment uses SAPIEN 3.0.0b1.  The checkpoint directory must contain
+`transformer/`, `vae/`, `text_encoder/`, and `tokenizer/`; for inference,
+`transformer/config.json` must use `"attn_mode": "torch"` or
+`"attn_mode": "flashattn"`, not `"flex"`.
+
+No environment activation is required by the launchers because they invoke the
+two Python executables above explicitly.  To inspect the policy environment
+interactively, use:
+
+```bash
+source /mnt/project_eai_hs/zrm/miniconda3/etc/profile.d/conda.sh
+conda activate lingbot-va
+```
+
+From the LingBot-VA repository root, launch one mode as follows.  The optional
+positional argument is the number of RoboTwin episodes and defaults to 1:
+
+```bash
+# LingBot-VA baseline: both constraint masks are zero
+bash script/run_robotwin_none.sh 1
+
+# RTC: state mask is zero; previous complete action vectors are constrained
+bash script/run_robotwin_rtc.sh 1
+
+# FBFM: RTC action constraint plus live solver-step state feedback
+bash script/run_robotwin_fbfm.sh 1
+```
+
+The launchers run the policy server and RoboTwin client together, validate that
+`res.json` was produced, and always stop their own server on exit.  Defaults are
+GPU 0 for the policy server, GPU 1 for RoboTwin/CuRobo, WebSocket port 29156,
+and torch master port 29161.  Server and client must use different physical
+GPUs because RTC/FBFM guidance has a much higher FSDP unshard peak than NONE.
+Override any machine-specific path or allocation before the command:
+
+```bash
+export LINGBOT_VA_MODEL=/mnt/project_eai_hs/zrm/lingbot-va/checkpoints/lingbot-va-posttrain-robotwin
+export ROBOTWIN_ROOT=/mnt/project_eai_hs/zrm/RoboTwin
+export LINGBOT_SERVER_PYTHON=/mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/bin/python
+export ROBOTWIN_CLIENT_PYTHON=/mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/bin/python
+export LINGBOT_SERVER_GPU=0
+export ROBOTWIN_CLIENT_GPU=1
+export LINGBOT_VA_PORT=29156
+export LINGBOT_VA_MASTER_PORT=29161
+export LINGBOT_VA_ENABLE_OFFLOAD=1
+bash script/run_robotwin_fbfm.sh 1
+```
+
+RTC parameters are shared by RTC and FBFM.  With action horizon `H=32`, the
+default `d=16,s=16` has a hard prefix and no soft interval.  This example uses
+a non-degenerate EXP soft interval `[d,H-s)=[4,20)`:
+
+```bash
+export LINGBOT_VA_RTC_DELAY=4
+export LINGBOT_VA_RTC_EXECUTION_HORIZON=12
+export LINGBOT_VA_RTC_ATTENTION_SCHEDULE=EXP  # or LINEAR
+bash script/run_robotwin_rtc.sh 1
+```
+
+During asynchronous rollout the client reports the measured inference delay,
+so later requests use the dynamic `d`; the environment value is the initial and
+fallback value.  FBFM live feedback is enabled by its launcher.  For the
+diagnostic FBFM-static ablation only, use
+`bash script/run_constraint_ablation.sh FBFM-static 1`.
+
+The scripts use headless Mesa `llvmpipe`, not H100 Vulkan ray tracing.  They set
+`ROBOTWIN_RENDER_BACKEND=default`, `SAPIEN_DISABLE_RAY_TRACING=1`, and the Mesa
+Vulkan ICD; neither Xorg nor `DISPLAY` is needed.  Outputs and complete logs are
+written under `robotwin_outputs/adjust_bottle_<mode>_<timestamp>/`.
+
+Detailed timing semantics, deterministic replay, tests, and troubleshooting are
+documented in [`docs/fbfm_runtime_modes.md`](docs/fbfm_runtime_modes.md).
+
 **Preparing the Environment**
 
 You can follow the official instructions from the original RoboTwin-2.0 repository:  

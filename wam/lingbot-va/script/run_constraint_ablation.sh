@@ -24,8 +24,9 @@ case "$variant" in
     ;;
 esac
 
-workspace=/mnt/project_eai_hs/zrm2/FBFM
-lingbot="$workspace/wam/lingbot-va"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+lingbot=$(cd -- "$script_dir/.." && pwd)
+workspace=$(cd -- "$lingbot/../.." && pwd)
 robotwin=${ROBOTWIN_ROOT:-/mnt/project_eai_hs/zrm/RoboTwin}
 server_python=${LINGBOT_SERVER_PYTHON:-/mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/bin/python}
 client_python=${ROBOTWIN_CLIENT_PYTHON:-/mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/bin/python}
@@ -52,6 +53,7 @@ trap cleanup EXIT INT TERM
 common_env=(
   PYTHONDONTWRITEBYTECODE=1
   PYTHONHASHSEED=0
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   PYTHONPATH="$workspace:$lingbot:$robotwin"
   LINGBOT_VA_MODEL="$model"
   LINGBOT_VA_ENABLE_OFFLOAD="${LINGBOT_VA_ENABLE_OFFLOAD:-1}"
