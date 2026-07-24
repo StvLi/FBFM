@@ -102,6 +102,13 @@ PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   --output $REPO/results/smoke_fbfm
 ```
 
+For a true upstream-style control, launch the server with `--mode NONE` and run
+the client with `--mode NONE --rollout-protocol native_sync`. This replans from
+the latest observation and executes `chunk[:8]` without calling the overlap,
+feedback, or pseudo-clock APIs. The default `pseudo_async_overlap` protocol is
+the matched `NONE` / `RTC` / `FBFM` ablation path and must not be reported as
+the native DreamZero base.
+
 Run CPU regressions with:
 
 ```bash
