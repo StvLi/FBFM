@@ -31,7 +31,7 @@ def test_constraint_modes_only_gate_masks():
     assert torch.equal(snapshots[ConstraintMode.FBFM][3], action_mask)
 
 
-def test_state_slots_are_single_assignment_and_versioned():
+def test_state_slots_are_refreshable_and_versioned():
     context = ChunkConstraints(
         mode="FBFM",
         action_targets=torch.zeros(1, 4, 3),
@@ -40,10 +40,10 @@ def test_state_slots_are_single_assignment_and_versioned():
         state_mask=torch.zeros(1, 1, 2, 1, 1),
     )
     assert context.update_state_slot(0, torch.tensor([[[[2.0]]], [[[3.0]]]]))
-    assert not context.update_state_slot(0, torch.zeros(1, 2, 1, 1))
+    assert context.update_state_slot(0, torch.tensor([[[[4.0]]], [[[5.0]]]]))
     targets, mask, _, _, version = context.snapshot()
-    assert version == 1
-    assert torch.equal(targets[:, :, 0], torch.tensor([[[[2.0]], [[3.0]]]]))
+    assert version == 2
+    assert torch.equal(targets[:, :, 0], torch.tensor([[[[4.0]], [[5.0]]]]))
     assert mask[:, :, 0].item() == 1
 
 

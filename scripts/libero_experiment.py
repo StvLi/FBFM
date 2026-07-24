@@ -60,7 +60,7 @@ def main() -> None:
     parser.add_argument(
         "--solver-release-policy",
         choices=("uniform", "after_feedback"),
-        default="after_feedback",
+        default="uniform",
     )
     parser.add_argument(
         "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
@@ -195,6 +195,8 @@ def main() -> None:
                     "solver_release_policy": args.solver_release_policy,
                     "model_seed_rule": args.model_seed_rule,
                     "max_steps": args.max_steps,
+                    "feedback_observation_stride": 1,
+                    "feedback_encoding": "causal_rolling_hold",
                 },
             }
             trajectory_path = args.output / "trajectories" / f"trial_{trial_id:03d}.npz"

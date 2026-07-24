@@ -12,7 +12,7 @@ time using measured latency. It adds:
 
 - one block-diagonal state/action constraint at each joint solver evaluation;
 - endpoint VJP guidance with the paper's clipped few-step schedule;
-- native DreamZero VAE encoding for live visual feedback;
+- native DreamZero VAE encoding for per-action rolling visual feedback;
 - a deterministic pseudo-clock linking 8 executed actions to the checkpoint's
   8 native DiT evaluations across 16 UniPC scheduler steps;
 - a localhost protocol between the Python 3.11 model and Python 3.8 simulator;
@@ -98,7 +98,7 @@ PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/libero_experiment.py \
   --base-workspace $BASE --mode FBFM --suite libero_spatial --task-id 0 \
   --trial-start 0 --trials 1 --max-steps 480 --port 18766 \
-  --model-seed-rule fixed --solver-release-policy after_feedback \
+  --model-seed-rule fixed --solver-release-policy uniform \
   --output $REPO/results/smoke_fbfm
 ```
 
@@ -122,7 +122,7 @@ CODE_COMMIT=$(git -C "$FBFM_ROOT" rev-parse --short HEAD)
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/run_libero_benchmark.py \
   --base-workspace $BASE --mode FBFM --trials 20 --max-steps 480 \
-  --model-seed-rule fixed --solver-release-policy after_feedback \
+  --model-seed-rule fixed --solver-release-policy uniform \
   --code-commit "$CODE_COMMIT" --port 18766 \
   --output $REPO/results/libero_all_fbfm_20_$CODE_COMMIT
 ```
@@ -135,10 +135,14 @@ after every task.
 
 The comparison protocol uses a uniform 480-step episode horizon for every
 suite. This intentionally caps LIBERO-10 below RLinf's 520-step reference so
-all suites share one limit; the manifest records this choice. `after_feedback`
-executes the eight committed overlap actions first, then releases all eight native DreamZero DiT
-evaluations after the first aligned state latent is available. This protocol is
-for deterministic pseudo-asynchronous method evaluation, not wall-clock latency.
+all suites share one limit; the manifest records this choice. The default
+`uniform` pseudo-clock executes one committed overlap action, refreshes the
+aligned latent target from the newest causal observation window, and then
+releases one native DreamZero DiT evaluation. Incomplete four-frame VAE blocks
+are completed by holding the latest real observation forward; the target is
+re-encoded and versioned after every action, and equals the native complete
+block encoding at the final sample. This protocol is for deterministic
+pseudo-asynchronous method evaluation, not wall-clock latency.
 
 `sync_libero_ledger.py` can mirror those four ledger files into a paper
 repository at a fixed interval. It exits automatically after all 130 task rows

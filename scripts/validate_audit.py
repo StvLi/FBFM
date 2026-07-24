@@ -18,14 +18,15 @@ def main() -> None:
 
     records = [json.loads(line) for line in args.audit.read_text(encoding="utf-8").splitlines()]
     steps = [record for record in records if record.get("event") == "solver_step"]
-    if len(steps) < 16 * (args.minimum_async_chunks + 1):
+    evaluations_per_chunk = 8
+    if len(steps) < evaluations_per_chunk * (args.minimum_async_chunks + 1):
         raise AssertionError(f"too few solver records: {len(steps)}")
     for record in steps:
         for key, value in record.items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise AssertionError(f"non-finite {key}: {record}")
 
-    async_steps = steps[16:]
+    async_steps = steps[evaluations_per_chunk:]
     if args.mode == "NONE":
         if any(
             record["guided"]
@@ -45,6 +46,18 @@ def main() -> None:
         state_steps = [record for record in async_steps if record["state_mask_nonzero"]]
         if not state_steps:
             raise AssertionError("FBFM did not expose any state feedback")
+        for start in range(0, len(async_steps), evaluations_per_chunk):
+            chunk = async_steps[start : start + evaluations_per_chunk]
+            if len(chunk) < evaluations_per_chunk:
+                continue
+            if [record.get("context_version") for record in chunk] != list(range(1, 9)):
+                raise AssertionError("FBFM must refresh its state target once per evaluation")
+            if [record.get("feedback_action_offsets") for record in chunk] != [
+                [offset] for offset in range(1, 9)
+            ]:
+                raise AssertionError("FBFM feedback offsets must progress from 1 through 8")
+            if any(record.get("feedback_state_slots") != [0] for record in chunk):
+                raise AssertionError("the active overlap wave must revise latent slot 0")
         if not any(record["action_correction_norm"] > 0 for record in state_steps):
             raise AssertionError("state feedback produced no action-coordinate correction")
 

@@ -116,8 +116,6 @@ class ChunkConstraints:
         with self._lock:
             if self._closed or not 0 <= slot < self._state_targets.shape[2]:
                 return False
-            if self._state_mask[:, :, slot].gt(0).any():
-                return False
             target = latent.detach().to(
                 device=self._state_targets.device, dtype=self._state_targets.dtype
             )
