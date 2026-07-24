@@ -32,12 +32,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
     parser.add_argument("--launcher-pid", type=int, required=True)
+    parser.add_argument("--launcher-script", type=Path)
+    parser.add_argument("--max-relaunches", type=int, default=3)
     parser.add_argument("--aggregate-script", type=Path, required=True)
     parser.add_argument("--import-adjust", type=Path, required=True)
     parser.add_argument("--paper-dir", type=Path, required=True)
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument("--interval-seconds", type=int, default=1800)
     args = parser.parse_args()
+    launcher_pid = args.launcher_pid
+    relaunches = 0
 
     while True:
         subprocess.run(
@@ -73,7 +77,9 @@ def main() -> None:
             args.root / "status_reports.jsonl",
             {
                 "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "launcher_alive": alive(args.launcher_pid),
+                "launcher_alive": alive(launcher_pid),
+                "launcher_pid": launcher_pid,
+                "relaunches": relaunches,
                 "status": aggregate["status"],
                 "tasks_complete": aggregate["tasks_complete"],
                 "tasks_requested": aggregate["tasks_requested"],
@@ -84,8 +90,33 @@ def main() -> None:
                 "gpu_csv": gpu.stdout.strip() if gpu.returncode == 0 else None,
             },
         )
-        if aggregate["status"] == "complete" or not alive(args.launcher_pid):
+        if aggregate["status"] == "complete":
             break
+        if not alive(launcher_pid):
+            if args.launcher_script and relaunches < args.max_relaunches:
+                relaunches += 1
+                launcher_log = (args.root / "logs" / "launcher.log").open(
+                    "a", encoding="utf-8"
+                )
+                process = subprocess.Popen(
+                    [str(args.launcher_script)],
+                    stdout=launcher_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                launcher_log.close()
+                launcher_pid = process.pid
+                append_jsonl(
+                    args.root / "status_reports.jsonl",
+                    {
+                        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "event": "launcher_restarted",
+                        "launcher_pid": launcher_pid,
+                        "relaunches": relaunches,
+                    },
+                )
+            else:
+                break
         time.sleep(args.interval_seconds)
 
 
