@@ -36,15 +36,18 @@ master_port=${LINGBOT_VA_MASTER_PORT:-29161}
 server_gpu=${LINGBOT_SERVER_GPU:-0}
 client_gpu=${ROBOTWIN_CLIENT_GPU:-$server_gpu}
 eval_seed=${ROBOTWIN_EVAL_SEED:-0}
+task_name=${ROBOTWIN_TASK_NAME:-adjust_bottle}
+task_config=${ROBOTWIN_TASK_CONFIG:-demo_clean}
 server_prefix=$(cd -- "$(dirname -- "$server_python")/.." && pwd)
 client_prefix=$(cd -- "$(dirname -- "$client_python")/.." && pwd)
-output=${LINGBOT_VA_ABLATION_ROOT:-$lingbot/robotwin_outputs}/adjust_bottle_${variant}_$(date +%Y%m%d_%H%M%S)
+output=${LINGBOT_VA_RUN_OUTPUT:-${LINGBOT_VA_ABLATION_ROOT:-$lingbot/robotwin_outputs}/${task_name}_${variant}_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$output/logs" "$output/server_debug"
 
 server_pid=""
 cleanup() {
   if [[ -n "$server_pid" ]]; then
     kill -TERM -- "-$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -91,14 +94,14 @@ env "${common_env[@]}" CUDA_VISIBLE_DEVICES="$client_gpu" \
   HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy= \
   "$client_python" -u -m evaluation.robotwin.eval_polict_client_openpi \
   --config "$robotwin/policy/ACT/deploy_policy.yml" --overrides \
-  --task_name adjust_bottle --task_config demo_clean --train_config_name 0 \
+  --task_name "$task_name" --task_config "$task_config" --train_config_name 0 \
   --model_name 0 --ckpt_setting 0 --seed "$eval_seed" --policy_name ACT \
   --save_root "$output/client" --video_guidance_scale 5 \
   --action_guidance_scale 1 --test_num "$test_num" --port "$port" \
   >"$output/logs/client.log" 2>&1
 
 st_seed=$((10000 * (1 + eval_seed)))
-result="$output/client/stseed-${st_seed}/metrics/adjust_bottle/res.json"
+result="$output/client/stseed-${st_seed}/metrics/${task_name}/res.json"
 [[ -s "$result" ]] || {
   echo "RoboTwin did not produce $result" >&2
   exit 4
