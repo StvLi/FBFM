@@ -6,7 +6,7 @@ import csv
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -91,6 +91,7 @@ def collect_rows(
         )
         for record in records:
             waves = [float(value) for value in record.get("inference_wave_seconds", [])]
+            protocol = record.get("protocol", {})
             trial_rows.append(
                 {
                     "suite": spec.suite,
@@ -104,6 +105,9 @@ def collect_rows(
                     "actions_finite": bool(record["actions_finite"]),
                     "model_seed": int(record["model_seed"]),
                     "environment_seed": int(record["environment_seed"]),
+                    "max_steps": protocol.get("max_steps"),
+                    "solver_release_policy": protocol.get("solver_release_policy"),
+                    "model_seed_rule": protocol.get("model_seed_rule"),
                     "task_description": record["task_description"],
                     "trajectory": record["trajectory"],
                 }
@@ -144,6 +148,21 @@ def write_tables(
     total_trials = sum(row["trials"] for row in task_rows)
     total_successes = sum(row["successes"] for row in task_rows)
     complete_tasks = sum(row["status"] == "complete" for row in task_rows)
+    target_episodes = len(task_rows) * target_trials
+    total_elapsed_seconds = sum(
+        (row["mean_elapsed_seconds"] or 0.0) * row["trials"] for row in task_rows
+    )
+    mean_episode_seconds = total_elapsed_seconds / total_trials if total_trials else None
+    remaining_seconds = (
+        mean_episode_seconds * (target_episodes - total_trials)
+        if mean_episode_seconds is not None
+        else None
+    )
+    estimated_finish = (
+        datetime.now().astimezone() + timedelta(seconds=remaining_seconds)
+        if remaining_seconds is not None
+        else None
+    )
     lines = [
         "# DreamZero + FBFM LIBERO live results",
         "",
@@ -153,7 +172,15 @@ def write_tables(
         "",
         "| Complete tasks | Episodes | Success | Micro rate |",
         "| ---: | ---: | ---: | ---: |",
-        f"| {complete_tasks}/{len(task_rows)} | {total_trials}/{len(task_rows) * target_trials} | {total_successes} | {_format_rate(total_successes / total_trials if total_trials else None)} |",
+        f"| {complete_tasks}/{len(task_rows)} | {total_trials}/{target_episodes} | {total_successes} | {_format_rate(total_successes / total_trials if total_trials else None)} |",
+        "",
+        (
+            f"Observed mean episode time: `{mean_episode_seconds:.2f}s`; "
+            f"estimated remaining time: `{remaining_seconds / 3600:.1f}h`; "
+            f"estimated finish: `{estimated_finish.isoformat(timespec='minutes')}`."
+            if mean_episode_seconds is not None
+            else "Estimated finish: pending the first completed episode."
+        ),
         "",
         "## Suite progress",
         "",

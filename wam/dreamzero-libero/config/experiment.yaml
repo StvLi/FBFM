@@ -2,7 +2,13 @@ mode: FBFM
 suite: libero_spatial
 task_id: 0
 trials: 20
-max_steps: 220
+max_steps_by_suite:
+  libero_spatial: 480
+  libero_object: 480
+  libero_goal: 480
+  libero_10: 480
+  libero_90: 480
+horizon_policy: uniform_480_for_cross_suite_comparison
 seed: 0
 
 protocol:
@@ -11,7 +17,9 @@ protocol:
   execution_horizon: 8
   scheduler_steps: 16
   dit_evaluations: 8
-  solver_grants_per_environment_step: [1, 1, 1, 1, 1, 1, 1, 1]
+  solver_release_policy: after_feedback
+  solver_grants_per_environment_step: [0, 0, 0, 0, 0, 0, 0, 8]
+  model_seed_rule: fixed
   feedback_observation_stride: 2
   feedback_observations_per_latent: 4
   state_weight: 0.005833333333333334

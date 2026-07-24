@@ -19,6 +19,15 @@ from dreamzero_fbfm.client import FBFMClient
 from dreamzero_fbfm.pseudo_clock import solver_grants
 
 
+DEFAULT_MAX_STEPS = {
+    "libero_spatial": 480,
+    "libero_object": 480,
+    "libero_goal": 480,
+    "libero_10": 480,
+    "libero_90": 480,
+}
+
+
 def append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -43,14 +52,24 @@ def main() -> None:
     parser.add_argument("--trial-start", type=int, default=0)
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=220)
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--mode", choices=("NONE", "RTC", "FBFM"), required=True)
+    parser.add_argument(
+        "--solver-release-policy",
+        choices=("uniform", "after_feedback"),
+        default="after_feedback",
+    )
+    parser.add_argument(
+        "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
+    )
     parser.add_argument("--state-weight", type=float, default=56 / 9600)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.max_steps is None:
+        args.max_steps = DEFAULT_MAX_STEPS[args.suite]
     if args.trials <= 0 or args.max_steps <= 0:
         raise ValueError("trials and max-steps must be positive")
 
@@ -73,7 +92,11 @@ def main() -> None:
     bddl_path = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     # DreamZero keeps 16 native UniPC scheduler steps but evaluates the DiT only
     # eight times according to its released cache mask.
-    grants = solver_grants(simulation_steps=8, solver_steps=8)
+    grants = solver_grants(
+        simulation_steps=8,
+        solver_steps=8,
+        release_policy=args.solver_release_policy,
+    )
     client = FBFMClient(args.host, args.port)
     episode_path = args.output / "episodes.jsonl"
     existing_records = load_jsonl(episode_path)
@@ -85,7 +108,8 @@ def main() -> None:
     records: list[dict] = []
     try:
         for trial_id in range(args.trial_start, args.trial_start + args.trials):
-            client.reset(task.language, args.seed + trial_id)
+            model_seed = args.seed if args.model_seed_rule == "fixed" else args.seed + trial_id
+            client.reset(task.language, model_seed)
             env = OffScreenRenderEnv(
                 bddl_file_name=str(bddl_path), camera_heights=256, camera_widths=256
             )
@@ -129,7 +153,8 @@ def main() -> None:
                             feedback["wrist_image"],
                             feedback["state"],
                         )
-                        client.grant(grant_count)
+                        if grant_count:
+                            client.grant(grant_count)
                         success = bool(done or reward > 0)
                         if success or len(executed) >= args.max_steps:
                             client.cancel()
@@ -151,7 +176,7 @@ def main() -> None:
                 "task_id": args.task_id,
                 "trial_id": trial_id,
                 "environment_seed": args.seed,
-                "model_seed": args.seed + trial_id,
+                "model_seed": model_seed,
                 "task_description": task.language,
                 "success": success,
                 "executed_steps": len(executed),
@@ -167,6 +192,9 @@ def main() -> None:
                     "dit_evaluations": 8,
                     "state_weight": args.state_weight,
                     "solver_grants": list(grants),
+                    "solver_release_policy": args.solver_release_policy,
+                    "model_seed_rule": args.model_seed_rule,
+                    "max_steps": args.max_steps,
                 },
             }
             trajectory_path = args.output / "trajectories" / f"trial_{trial_id:03d}.npz"

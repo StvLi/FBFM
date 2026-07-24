@@ -97,7 +97,8 @@ BASE=${DREAMZERO_BASE_WORKSPACE:-/home/deepcybo-lite/fbfm_ws}
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/libero_experiment.py \
   --base-workspace $BASE --mode FBFM --suite libero_spatial --task-id 0 \
-  --trial-start 0 --trials 1 --max-steps 220 --port 18766 \
+  --trial-start 0 --trials 1 --max-steps 480 --port 18766 \
+  --model-seed-rule fixed --solver-release-policy after_feedback \
   --output $REPO/results/smoke_fbfm
 ```
 
@@ -120,7 +121,8 @@ server reports ready:
 CODE_COMMIT=$(git -C "$FBFM_ROOT" rev-parse --short HEAD)
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/run_libero_benchmark.py \
-  --base-workspace $BASE --mode FBFM --trials 20 --max-steps 220 \
+  --base-workspace $BASE --mode FBFM --trials 20 --max-steps 480 \
+  --model-seed-rule fixed --solver-release-policy after_feedback \
   --code-commit "$CODE_COMMIT" --port 18766 \
   --output $REPO/results/libero_all_fbfm_20_$CODE_COMMIT
 ```
@@ -130,6 +132,13 @@ The launcher covers `libero_spatial`, `libero_object`, `libero_goal`,
 from a contiguous prefix of official trial IDs, refuses duplicate records, and
 atomically refreshes `task_summary.csv`, `trials.csv`, and `live_status.md`
 after every task.
+
+The comparison protocol uses a uniform 480-step episode horizon for every
+suite. This intentionally caps LIBERO-10 below RLinf's 520-step reference so
+all suites share one limit; the manifest records this choice. `after_feedback`
+executes the eight committed overlap actions first, then releases all eight native DreamZero DiT
+evaluations after the first aligned state latent is available. This protocol is
+for deterministic pseudo-asynchronous method evaluation, not wall-clock latency.
 
 `sync_libero_ledger.py` can mirror those four ledger files into a paper
 repository at a fixed interval. It exits automatically after all 130 task rows
