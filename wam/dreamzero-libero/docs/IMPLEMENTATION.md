@@ -39,13 +39,16 @@ coordinates; only the first 8x7 coordinates are masked. The generated prefix is
 therefore aligned to actions executed during the virtual delay, and slots 8:16 are
 the next executable suffix.
 
-One native DiT evaluation is completed after each simulated action. Feedback is
-sampled after action offsets 2, 4, 6 and 8. The chunk-start anchor and four
-transformed feedback frames are encoded together by the checkpoint's frozen causal
-WAN VAE; the anchor latent is discarded and the final latent is assigned to the
-first of the two predicted latent slots. The second slot remains governed by the
-pretrained prior. A state target never enters solver-start history in that same
-generation.
+One native DiT evaluation is completed after each simulated action. Every action
+produces a feedback observation. DreamZero's frozen causal WAN VAE maps an anchor
+plus four sampled frames to one future latent, while one predicted latent spans
+eight actions. At intermediate actions, the latest real observation is held into
+the not-yet-observed sample positions and the five-frame causal window is
+re-encoded. The first predicted latent slot is therefore refreshed eight times;
+at offsets 2, 4, 6 and 8 another real sample replaces the held value, and the
+offset-8 target exactly equals the complete anchor-plus-four-frame encoding. The
+second slot remains governed by the pretrained prior. A state target never enters
+solver-start history in that same generation.
 
 The active action overlap contains `8x7=56` physical coordinates, whereas one
 state latent contains `48x10x20=9600` coordinates. The fixed state block weight is

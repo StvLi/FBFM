@@ -60,7 +60,7 @@ def main() -> None:
     parser.add_argument(
         "--solver-release-policy",
         choices=("uniform", "after_feedback"),
-        default="after_feedback",
+        default="uniform",
     )
     parser.add_argument(
         "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
@@ -93,6 +93,8 @@ def main() -> None:
         "environment_seed": args.seed,
         "model_seed_rule": args.model_seed_rule,
         "solver_release_policy": args.solver_release_policy,
+        "feedback_observation_stride": 1,
+        "feedback_encoding": "causal_rolling_hold",
         "state_weight": args.state_weight,
         "code_commit": args.code_commit,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),

@@ -30,43 +30,104 @@ class FeedbackObservation:
     task_description: str
 
 
-class DreamZeroFeedbackEncoder:
-    """Encode four aligned LIBERO observations into one native DreamZero latent."""
+@dataclass(frozen=True)
+class EncodedFeedback:
+    """One causal refresh of an aligned DreamZero video-latent slot."""
 
-    def __init__(self, policy: Any, *, stride: int = 2, observations_per_latent: int = 4) -> None:
-        if stride <= 0 or observations_per_latent <= 0:
-            raise ValueError("feedback encoder cadence must be positive")
+    slot: int
+    latent: Tensor
+    action_offset: int
+    source_offsets: tuple[int, ...]
+    complete: bool
+
+
+class DreamZeroFeedbackEncoder:
+    """Refresh native DreamZero latents after every executed action.
+
+    DreamZero's causal VAE emits one future latent for four input video frames.
+    During an incomplete four-frame block, the latest real observation is held
+    forward into the not-yet-observed sample positions. This gives a causal
+    provisional target after every action and becomes exactly the native
+    anchor-plus-four-frame encoding when the block is complete.
+    """
+
+    def __init__(self, policy: Any, *, observations_per_latent: int = 4) -> None:
+        if observations_per_latent <= 0:
+            raise ValueError("observations_per_latent must be positive")
         self.policy = policy
         self.head = policy.action_head
-        self.stride = stride
         self.observations_per_latent = observations_per_latent
+        latent_slots = int(self.head.num_frame_per_block)
+        action_horizon = int(self.head.action_horizon)
+        if latent_slots <= 0 or action_horizon % latent_slots:
+            raise ValueError("DreamZero action horizon must divide into video-latent slots")
+        self.actions_per_latent = action_horizon // latent_slots
+        if self.actions_per_latent % observations_per_latent:
+            raise ValueError("actions per latent must divide into VAE observation samples")
+        self.observation_interval = self.actions_per_latent // observations_per_latent
+        self.latent_slots = latent_slots
         self.reset()
 
     def reset(self) -> None:
-        self._frames: list[Tensor] = []
-        self._anchor: Tensor | None = None
+        self._slot_anchor: Tensor | None = None
+        self._slot_anchor_offset = 0
+        self._sampled_frames: list[Tensor] = []
+        self._sampled_offsets: list[int] = []
+        self._last_frame: Tensor | None = None
+        self._last_offset = 0
+        self._active_slot = 0
 
     def set_anchor(self, feedback: FeedbackObservation) -> None:
         """Set the causal keyframe preceding the first feedback VAE block."""
         if feedback.action_offset != 0:
             raise ValueError("feedback anchor must have action_offset=0")
-        self._anchor = self._transform_frame(feedback)
+        self._slot_anchor = self._transform_frame(feedback)
+        self._last_frame = self._slot_anchor
 
-    def add(self, feedback: FeedbackObservation) -> list[Tensor]:
-        if feedback.action_offset <= 0 or feedback.action_offset % self.stride:
-            return []
-        if self._anchor is None:
+    def add(self, feedback: FeedbackObservation) -> list[EncodedFeedback]:
+        if self._slot_anchor is None:
             raise RuntimeError("feedback encoder anchor was not initialized")
-        self._frames.append(self._transform_frame(feedback))
-        encoded: list[Tensor] = []
-        while len(self._frames) >= self.observations_per_latent:
-            group = self._frames[: self.observations_per_latent]
-            del self._frames[: self.observations_per_latent]
-            # Wan's first causal latent is a keyframe. Prefix the observation
-            # available at launch so the final latent represents this block.
-            encoded.append(self._encode(torch.cat([self._anchor, *group], dim=1)))
-            self._anchor = group[-1]
-        return encoded
+        if feedback.action_offset != self._last_offset + 1:
+            raise ValueError(
+                "feedback action offsets must be consecutive: "
+                f"last={self._last_offset} current={feedback.action_offset}"
+            )
+
+        slot = (feedback.action_offset - 1) // self.actions_per_latent
+        if slot >= self.latent_slots:
+            return []
+        if slot != self._active_slot:
+            if self._last_frame is None:
+                raise RuntimeError("feedback encoder cannot advance without a slot anchor")
+            self._active_slot = slot
+            self._slot_anchor = self._last_frame
+            self._slot_anchor_offset = self._last_offset
+            self._sampled_frames = []
+            self._sampled_offsets = []
+
+        frame = self._transform_frame(feedback)
+        self._last_frame = frame
+        self._last_offset = feedback.action_offset
+        position = (feedback.action_offset - 1) % self.actions_per_latent + 1
+        if position % self.observation_interval == 0:
+            self._sampled_frames.append(frame)
+            self._sampled_offsets.append(feedback.action_offset)
+
+        missing = self.observations_per_latent - len(self._sampled_frames)
+        if missing < 0:
+            raise RuntimeError("feedback encoder collected too many samples for one latent")
+        future_frames = [*self._sampled_frames, *([frame] * missing)]
+        future_offsets = [*self._sampled_offsets, *([feedback.action_offset] * missing)]
+        images = torch.cat([self._slot_anchor, *future_frames], dim=1)
+        return [
+            EncodedFeedback(
+                slot=slot,
+                latent=self._encode(images),
+                action_offset=feedback.action_offset,
+                source_offsets=(self._slot_anchor_offset, *future_offsets),
+                complete=position == self.actions_per_latent,
+            )
+        ]
 
     def _transform_frame(self, feedback: FeedbackObservation) -> Tensor:
         env_obs = {
@@ -171,7 +232,6 @@ class DreamZeroFBFMRuntime:
         self._action_targets: Tensor | None = None
         self._action_mask: Tensor | None = None
         self._step = 0
-        self._next_state_slot = 0
         self._lock = threading.RLock()
         self._install_hook()
 
@@ -202,7 +262,6 @@ class DreamZeroFBFMRuntime:
             if first_parameter is not None and first_parameter.is_cuda:
                 torch.cuda.reset_peak_memory_stats(first_parameter.device)
             self._step = 0
-            self._next_state_slot = 0
             self._constraints = None
             self.feedback_encoder.reset()
             if pseudo_async:
@@ -259,19 +318,21 @@ class DreamZeroFBFMRuntime:
             )
         return self._constraints
 
-    def _drain_feedback(self, constraints: ChunkConstraints) -> int:
+    def _drain_feedback(
+        self, constraints: ChunkConstraints
+    ) -> tuple[int, list[EncodedFeedback]]:
         drained = 0
+        updates: list[EncodedFeedback] = []
         while True:
             try:
                 item = self._feedback.get_nowait()
             except queue.Empty:
                 break
             drained += 1
-            for latent in self.feedback_encoder.add(item):
-                accepted = constraints.update_state_slot(self._next_state_slot, latent)
-                if accepted:
-                    self._next_state_slot += 1
-        return drained
+            for update in self.feedback_encoder.add(item):
+                if constraints.update_state_slot(update.slot, update.latent):
+                    updates.append(update)
+        return drained, updates
 
     def _install_hook(self) -> None:
         original: Callable[..., Any] = self.head._run_diffusion_steps
@@ -292,7 +353,7 @@ class DreamZeroFBFMRuntime:
             video = kwargs["noisy_input"].detach().clone().requires_grad_(True)
             action = kwargs["action"].detach().clone().requires_grad_(True)
             constraints = self._ensure_constraints(video, action)
-            drained = self._drain_feedback(constraints)
+            drained, feedback_updates = self._drain_feedback(constraints)
             state_target, state_mask, action_target, action_mask, version = constraints.snapshot()
             state_mask.mul_(self.state_weight)
             has_guidance = bool(torch.any(state_mask).item() or torch.any(action_mask).item())
@@ -347,6 +408,17 @@ class DreamZeroFBFMRuntime:
                 sigma=sigma,
                 context_version=version,
                 feedback_drained=drained,
+                state_target_updates=len(feedback_updates),
+                feedback_action_offsets=[
+                    update.action_offset for update in feedback_updates
+                ],
+                feedback_state_slots=[update.slot for update in feedback_updates],
+                feedback_source_offsets=[
+                    list(update.source_offsets) for update in feedback_updates
+                ],
+                feedback_blocks_complete=[
+                    update.complete for update in feedback_updates
+                ],
                 gpu_allocated_bytes=(
                     torch.cuda.memory_allocated(video.device) if video.is_cuda else 0
                 ),
