@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run matched pseudo-asynchronous DreamZero FBFM episodes in LIBERO."""
+"""Run native or matched pseudo-asynchronous DreamZero episodes in LIBERO."""
 
 from __future__ import annotations
 
@@ -58,6 +58,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--mode", choices=("NONE", "RTC", "FBFM"), required=True)
     parser.add_argument(
+        "--rollout-protocol",
+        choices=("pseudo_async_overlap", "native_sync"),
+        default="pseudo_async_overlap",
+    )
+    parser.add_argument(
         "--solver-release-policy",
         choices=("uniform", "after_feedback"),
         default="uniform",
@@ -72,6 +77,8 @@ def main() -> None:
         args.max_steps = DEFAULT_MAX_STEPS[args.suite]
     if args.trials <= 0 or args.max_steps <= 0:
         raise ValueError("trials and max-steps must be positive")
+    if args.rollout_protocol == "native_sync" and args.mode != "NONE":
+        raise ValueError("native_sync is an unguided base and requires --mode NONE")
 
     workspace = args.base_workspace.resolve()
     import_paths = [
@@ -124,48 +131,69 @@ def main() -> None:
                 observation = env.set_init_state(initial_states[trial_id])
                 for _ in range(args.settle_steps):
                     observation, _, _, _ = env.step(LIBERO_DUMMY_ACTION.tolist())
-                model_observation = extract_libero_observation(observation)
-                inference_started = time.perf_counter()
-                initial_chunk = client.predict_sync(
-                    model_observation["main_image"],
-                    model_observation["wrist_image"],
-                    model_observation["state"],
-                )
-                inference_seconds.append(time.perf_counter() - inference_started)
-                execution_actions = initial_chunk[:8]
-
-                while len(executed) < args.max_steps and not success:
-                    anchor = extract_libero_observation(observation)
-                    client.start_predict(
-                        anchor["main_image"], anchor["wrist_image"], anchor["state"], execution_actions
-                    )
-                    wave_started = time.perf_counter()
-                    interrupted = False
-                    for offset, (action, grant_count) in enumerate(
-                        zip(execution_actions, grants), start=1
-                    ):
-                        observation, reward, done, _ = env.step(action.tolist())
-                        executed.append(np.asarray(action, dtype=np.float32))
-                        feedback = extract_libero_observation(observation)
-                        client.feedback(
-                            offset,
-                            feedback["main_image"],
-                            feedback["wrist_image"],
-                            feedback["state"],
+                if args.rollout_protocol == "native_sync":
+                    while len(executed) < args.max_steps and not success:
+                        model_observation = extract_libero_observation(observation)
+                        inference_started = time.perf_counter()
+                        action_chunk = client.predict_sync(
+                            model_observation["main_image"],
+                            model_observation["wrist_image"],
+                            model_observation["state"],
                         )
-                        if grant_count:
-                            client.grant(grant_count)
-                        success = bool(done or reward > 0)
-                        if success or len(executed) >= args.max_steps:
-                            client.cancel()
-                            interrupted = True
+                        inference_seconds.append(time.perf_counter() - inference_started)
+                        waves += 1
+                        for action in action_chunk[:8]:
+                            observation, reward, done, _ = env.step(action.tolist())
+                            executed.append(np.asarray(action, dtype=np.float32))
+                            success = bool(done or reward > 0)
+                            if success or len(executed) >= args.max_steps:
+                                break
+                else:
+                    model_observation = extract_libero_observation(observation)
+                    inference_started = time.perf_counter()
+                    initial_chunk = client.predict_sync(
+                        model_observation["main_image"],
+                        model_observation["wrist_image"],
+                        model_observation["state"],
+                    )
+                    inference_seconds.append(time.perf_counter() - inference_started)
+                    execution_actions = initial_chunk[:8]
+
+                    while len(executed) < args.max_steps and not success:
+                        anchor = extract_libero_observation(observation)
+                        client.start_predict(
+                            anchor["main_image"],
+                            anchor["wrist_image"],
+                            anchor["state"],
+                            execution_actions,
+                        )
+                        wave_started = time.perf_counter()
+                        interrupted = False
+                        for offset, (action, grant_count) in enumerate(
+                            zip(execution_actions, grants), start=1
+                        ):
+                            observation, reward, done, _ = env.step(action.tolist())
+                            executed.append(np.asarray(action, dtype=np.float32))
+                            feedback = extract_libero_observation(observation)
+                            client.feedback(
+                                offset,
+                                feedback["main_image"],
+                                feedback["wrist_image"],
+                                feedback["state"],
+                            )
+                            if grant_count:
+                                client.grant(grant_count)
+                            success = bool(done or reward > 0)
+                            if success or len(executed) >= args.max_steps:
+                                client.cancel()
+                                interrupted = True
+                                break
+                        inference_seconds.append(time.perf_counter() - wave_started)
+                        waves += 1
+                        if interrupted:
                             break
-                    inference_seconds.append(time.perf_counter() - wave_started)
-                    waves += 1
-                    if interrupted:
-                        break
-                    next_chunk = client.result()
-                    execution_actions = next_chunk[8:16]
+                        next_chunk = client.result()
+                        execution_actions = next_chunk[8:16]
             finally:
                 env.close()
 
@@ -185,6 +213,7 @@ def main() -> None:
                 "inference_wave_seconds": inference_seconds,
                 "actions_finite": bool(np.isfinite(np.asarray(executed)).all()),
                 "protocol": {
+                    "rollout_protocol": args.rollout_protocol,
                     "H": 16,
                     "d": 8,
                     "s": 8,
@@ -195,8 +224,14 @@ def main() -> None:
                     "solver_release_policy": args.solver_release_policy,
                     "model_seed_rule": args.model_seed_rule,
                     "max_steps": args.max_steps,
-                    "feedback_observation_stride": 1,
-                    "feedback_encoding": "causal_rolling_hold",
+                    "feedback_observation_stride": (
+                        1 if args.rollout_protocol == "pseudo_async_overlap" else None
+                    ),
+                    "feedback_encoding": (
+                        "causal_rolling_hold"
+                        if args.rollout_protocol == "pseudo_async_overlap"
+                        else None
+                    ),
                 },
             }
             trajectory_path = args.output / "trajectories" / f"trial_{trial_id:03d}.npz"
@@ -223,6 +258,7 @@ def main() -> None:
         "mode": args.mode,
         "suite": args.suite,
         "task_id": args.task_id,
+        "rollout_protocol": args.rollout_protocol,
         "trials": len(all_records),
         "successes": successes,
         "success_rate": successes / len(all_records),
