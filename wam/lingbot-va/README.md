@@ -1,3 +1,9 @@
+> **FBFM route:** this directory is the LingBot-VA x FBFM x RoboTwin
+> implementation. The sibling DreamZero x LIBERO route lives at
+> [`../dreamzero-libero`](../dreamzero-libero/README.md). FBFM-specific runtime,
+> validation, and launch instructions are maintained in the RoboTwin evaluation
+> section below and in [`docs/fbfm_runtime_modes.md`](docs/fbfm_runtime_modes.md).
+
 <h1 align="center">LingBot-VA: Causal World Modeling for Robot Control</h1>
 
 <p align="center">
