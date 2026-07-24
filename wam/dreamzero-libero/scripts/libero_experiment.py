@@ -207,7 +207,7 @@ def main() -> None:
                 success=np.asarray(success),
                 trial_id=np.asarray(trial_id),
                 environment_seed=np.asarray(args.seed),
-                model_seed=np.asarray(args.seed + trial_id),
+                model_seed=np.asarray(model_seed),
                 task_description=np.asarray(task.language),
             )
             record["trajectory"] = str(trajectory_path.resolve())

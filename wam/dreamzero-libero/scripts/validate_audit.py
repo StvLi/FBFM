@@ -17,16 +17,33 @@ def main() -> None:
     args = parser.parse_args()
 
     records = [json.loads(line) for line in args.audit.read_text(encoding="utf-8").splitlines()]
-    steps = [record for record in records if record.get("event") == "solver_step"]
     evaluations_per_chunk = 8
-    if len(steps) < evaluations_per_chunk * (args.minimum_async_chunks + 1):
-        raise AssertionError(f"too few solver records: {len(steps)}")
+    chunks: list[dict] = []
+    current_chunk: dict | None = None
+    for record in records:
+        if record.get("event") == "chunk_begin":
+            current_chunk = {"begin": record, "steps": []}
+            chunks.append(current_chunk)
+        elif record.get("event") == "solver_step" and current_chunk is not None:
+            current_chunk["steps"].append(record)
+
+    steps = [step for chunk in chunks for step in chunk["steps"]]
+    async_chunks = [chunk for chunk in chunks if chunk["begin"].get("pseudo_async")]
+    complete_async_chunks = [
+        chunk for chunk in async_chunks if len(chunk["steps"]) == evaluations_per_chunk
+    ]
+    if len(complete_async_chunks) < args.minimum_async_chunks:
+        raise AssertionError(
+            f"too few complete async chunks: {len(complete_async_chunks)}"
+        )
+    if any(len(chunk["steps"]) > evaluations_per_chunk for chunk in chunks):
+        raise AssertionError("a chunk contains more than eight native DiT evaluations")
     for record in steps:
         for key, value in record.items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise AssertionError(f"non-finite {key}: {record}")
 
-    async_steps = steps[evaluations_per_chunk:]
+    async_steps = [step for chunk in async_chunks for step in chunk["steps"]]
     if args.mode == "NONE":
         if any(
             record["guided"]
@@ -46,16 +63,17 @@ def main() -> None:
         state_steps = [record for record in async_steps if record["state_mask_nonzero"]]
         if not state_steps:
             raise AssertionError("FBFM did not expose any state feedback")
-        for start in range(0, len(async_steps), evaluations_per_chunk):
-            chunk = async_steps[start : start + evaluations_per_chunk]
-            if len(chunk) < evaluations_per_chunk:
+        for chunk_record in async_chunks:
+            chunk = chunk_record["steps"]
+            if not chunk:
                 continue
-            if [record.get("context_version") for record in chunk] != list(range(1, 9)):
+            expected = list(range(1, len(chunk) + 1))
+            if [record.get("context_version") for record in chunk] != expected:
                 raise AssertionError("FBFM must refresh its state target once per evaluation")
             if [record.get("feedback_action_offsets") for record in chunk] != [
-                [offset] for offset in range(1, 9)
+                [offset] for offset in expected
             ]:
-                raise AssertionError("FBFM feedback offsets must progress from 1 through 8")
+                raise AssertionError("FBFM feedback offsets must progress from 1 in each chunk")
             if any(record.get("feedback_state_slots") != [0] for record in chunk):
                 raise AssertionError("the active overlap wave must revise latent slot 0")
         if not any(record["action_correction_norm"] > 0 for record in state_steps):
@@ -64,6 +82,9 @@ def main() -> None:
     summary = {
         "status": "ok",
         "mode": args.mode,
+        "chunks": len(chunks),
+        "async_chunks": len(async_chunks),
+        "complete_async_chunks": len(complete_async_chunks),
         "solver_steps": len(steps),
         "guided_steps": sum(int(record["guided"]) for record in steps),
         "state_guided_steps": sum(int(record["state_mask_nonzero"] > 0) for record in steps),
