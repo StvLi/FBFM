@@ -1,0 +1,16 @@
+mode: FBFM
+suite: libero_spatial
+task_id: 0
+trials: 20
+max_steps: 220
+seed: 0
+
+protocol:
+  action_horizon: 16
+  inference_delay: 8
+  execution_horizon: 8
+  solver_evaluations: 16
+  solver_grants_per_environment_step: [2, 2, 2, 2, 2, 2, 2, 2]
+  feedback_observation_stride: 2
+  feedback_observations_per_latent: 4
+  max_guidance_weight: 10.0
