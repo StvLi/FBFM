@@ -2,6 +2,7 @@
 import argparse
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -43,6 +44,7 @@ from utils import (
 # FBFM核心组件
 from lingbot_va_bridge import FeedbackSlotTracker
 from lingbot_va_bridge import SlotAlignedStateBuffer
+from lingbot_va_bridge import SolverStepClock
 from lingbot_va_bridge import ChunkConstraintContext
 from lingbot_va_bridge import ConstraintMode
 from lingbot_va_bridge import latent_to_state_vectors
@@ -63,6 +65,7 @@ class VA_Server:
         self._inference_running = False
         self._solver_phase = "idle"
         self._cancel_requested = threading.Event()
+        self._solver_step_clock = SolverStepClock()
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
         self.rtc_config = RTCConfig(
@@ -122,6 +125,9 @@ class VA_Server:
         self.streaming_vae_half = None
         self.feedback_streaming_vae = None
         self.feedback_streaming_vae_half = None
+        feedback_enabled = ConstraintMode.parse(
+            getattr(self.job_config, 'constraint_mode', 'NONE')
+        ) is ConstraintMode.FBFM
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -130,8 +136,10 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
-            self.feedback_streaming_vae_half = WanVAEStreamingWrapper(vae_half)
-        self.feedback_streaming_vae = WanVAEStreamingWrapper(self.vae)
+            if feedback_enabled:
+                self.feedback_streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+        if feedback_enabled:
+            self.feedback_streaming_vae = WanVAEStreamingWrapper(self.vae)
 
     def _encode_obs_with_stream_wrappers(self, obs, streaming_vae, streaming_vae_half):
         images = obs['obs']
@@ -408,8 +416,12 @@ class VA_Server:
             streaming_vae_half=self.streaming_vae_half,
         )
 
-    def _reset(self, prompt=None):
-        logger.info('Reset.')
+    def _reset(self, prompt=None, seed=None):
+        logger.info('Reset. seed=%s', seed)
+        self.noise_generator = None
+        if seed is not None:
+            self.noise_generator = torch.Generator(device=self.device)
+            self.noise_generator.manual_seed(int(seed))
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -424,6 +436,7 @@ class VA_Server:
             self._inference_running = False
             self._solver_phase = "idle"
         self._cancel_requested.clear()
+        self._solver_step_clock.start(clock_id=None, enabled=False)
         while True:
             try:
                 self._live_feedback_queue.get_nowait()
@@ -719,6 +732,15 @@ class VA_Server:
 
     def enqueue_live_feedback(self, obs):
         """Queue raw feedback without touching CUDA or distributed collectives."""
+        constraint_mode = ConstraintMode.parse(
+            getattr(self.job_config, 'constraint_mode', 'NONE')
+        )
+        if constraint_mode is not ConstraintMode.FBFM:
+            return {
+                "feedback_queued": False,
+                "feedback_ignored_mode": constraint_mode.value,
+                "feedback_queue_size": self._live_feedback_queue.qsize(),
+            }
         self._live_feedback_queue.put(obs)
         return {
             "feedback_queued": True,
@@ -727,7 +749,27 @@ class VA_Server:
 
     def request_inference_cancel(self):
         self._cancel_requested.set()
+        self._solver_step_clock.wake()
         return {"cancel_requested": True}
+
+    def advance_solver_steps(self, obs):
+        """Grant deterministic video-flow progress from the simulation clock."""
+        return self._solver_step_clock.grant_and_wait(
+            clock_id=obs.get('solver_clock_id'),
+            count=int(obs.get('solver_step_grant', 0)),
+            timeout=obs.get('solver_clock_timeout'),
+        )
+
+    def _wait_for_solver_step_grant(self):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            proceed = self._solver_step_clock.consume(self._cancel_requested)
+        else:
+            proceed = False
+        if dist.is_initialized():
+            payload = [proceed if dist.get_rank() == 0 else None]
+            dist.broadcast_object_list(payload, src=0)
+            proceed = payload[0]
+        return proceed
 
     def _drain_live_feedback(self):
         """Apply queued feedback at a solver-step boundary on every rank."""
@@ -773,6 +815,14 @@ class VA_Server:
             )
         return states, state_mask, constrained_num
 
+    def _preprocess_previous_action_target(self):
+        """Map the public action chunk back to Lingbot's model coordinates."""
+        if self.last_action is None:
+            return None
+        action_model_input = self.preprocess_action(self.last_action)
+        action_model_input[:, ~self.action_mask] = 0
+        return action_model_input[0, ..., 0].contiguous()
+
     def _make_prev_chunk_adapter(
         self,
         constrain_mode: str,
@@ -801,7 +851,7 @@ class VA_Server:
 
         adapter = PrevChunkAdapter(
             constrain_mode=constrain_mode,
-            prev_actions=self.last_action,
+            prev_actions=self._preprocess_previous_action_target(),
             used_action_channel_ids=self.job_config.used_action_channel_ids,
             action_num=action_num,
             action_dim=self.job_config.action_dim,
@@ -848,14 +898,18 @@ class VA_Server:
         else:
             raw_state_mask = adapter._explicit_state_mask
         state_mask = raw_state_mask[None, None, :, None, None].contiguous()
+        temporal_action_mask = adapter._rtc_action_mask.reshape(
+            adapter._frame_chunk_size, adapter._action_per_frame
+        )[None, None, :, :, None]
+        channel_action_mask = self.action_mask.to(
+            device=self.device, dtype=self.dtype
+        )[None, :, None, None, None]
         context = ChunkConstraintContext(
             mode=adapter.constraint_mode,
             chunk_id=self.frame_st_id,
             target_frame_st_id=self.feedback_target_frame_st_id,
             action_targets=adapter.get_constrained_actions(),
-            action_mask=adapter._rtc_action_mask.reshape(
-                adapter._frame_chunk_size, adapter._action_per_frame
-            )[None, None, :, :, None],
+            action_mask=temporal_action_mask * channel_action_mask,
             state_targets=state_targets,
             state_mask=state_mask,
         )
@@ -869,6 +923,11 @@ class VA_Server:
         constraint_mode = ConstraintMode.parse(
             getattr(self.job_config, 'constraint_mode', 'NONE')
         )
+        cuda_memory_enabled = (
+            self.device.type == "cuda" and torch.cuda.is_available()
+        )
+        if cuda_memory_enabled:
+            torch.cuda.reset_peak_memory_stats(self.device)
         if not getattr(self.job_config, "feedback_live_enabled", True):
             drained_feedback, cancel_requested = self._drain_live_feedback()
             if cancel_requested:
@@ -899,21 +958,83 @@ class VA_Server:
             self._solver_phase = "video"
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
         finally:
+            self._solver_step_clock.close()
             self._solver_phase = "idle"
             with self._inference_state_lock:
                 self._inference_running = False
+            if cuda_memory_enabled:
+                mib = 1024**2
+                logger.info(
+                    "FBFM GPU memory chunk_id=%s mode=%s allocated_mib=%.1f "
+                    "reserved_mib=%.1f peak_allocated_mib=%.1f "
+                    "peak_reserved_mib=%.1f",
+                    self.frame_st_id,
+                    constraint_mode.value,
+                    torch.cuda.memory_allocated(self.device) / mib,
+                    torch.cuda.memory_reserved(self.device) / mib,
+                    torch.cuda.max_memory_allocated(self.device) / mib,
+                    torch.cuda.max_memory_reserved(self.device) / mib,
+                )
         if action is None:
             return {"cancelled": True}
         self.last_action = action
         self.first_epoch = False
         return dict(action=action)
 
+    def _log_solver_diagnostics(
+        self,
+        *,
+        phase,
+        scheduler,
+        step,
+        total_steps,
+        chunk_id,
+        state_version=0,
+        drained_feedback=0,
+    ):
+        diagnostics = getattr(scheduler, "last_step_diagnostics", {})
+        if not diagnostics or diagnostics.get("cache_only", False):
+            return
+        last_numerical_step = max(total_steps - 2, 0)
+        should_log = (
+            step == 0
+            or step == last_numerical_step
+            or bool(drained_feedback)
+            or (phase == "video" and diagnostics.get("has_guidance", False))
+        )
+        if not should_log:
+            return
+        logger.info(
+            "FBFM solver diagnostics phase=%s chunk_id=%s step=%s/%s "
+            "state_version=%s feedback_count=%s guided=%s mask_nonzero=%s "
+            "sigma=%.6f tau=%.6f error_norm=%.6f correction_norm=%.6f "
+            "guidance_weight=%.6f base_velocity_norm=%.6f guided_velocity_norm=%.6f",
+            phase,
+            chunk_id,
+            step,
+            last_numerical_step,
+            state_version,
+            drained_feedback,
+            diagnostics.get("has_guidance", False),
+            diagnostics.get("mask_nonzero", 0),
+            diagnostics.get("sigma", 0.0),
+            diagnostics.get("tau", 0.0),
+            diagnostics.get("error_norm", 0.0),
+            diagnostics.get("correction_norm", 0.0),
+            diagnostics.get("guidance_weight", 0.0),
+            diagnostics.get("base_velocity_norm", 0.0),
+            diagnostics.get("guided_velocity_norm", 0.0),
+        )
+
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
-            self._prime_feedback_stream_initial_obs(obs)
+            if ConstraintMode.parse(
+                getattr(self.job_config, 'constraint_mode', 'NONE')
+            ) is ConstraintMode.FBFM:
+                self._prime_feedback_stream_initial_obs(obs)
 
         latents = torch.randn(1,
                               48,
@@ -921,14 +1042,16 @@ class VA_Server:
                               self.latent_height,
                               self.latent_width,
                               device=self.device,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              generator=getattr(self, 'noise_generator', None))
         actions = torch.randn(1,
                               self.job_config.action_dim,
                               frame_chunk_size,
                               self.action_per_frame,
                               1,
                               device=self.device,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              generator=getattr(self, 'noise_generator', None))
 
         video_inference_step = self.job_config.num_inference_steps
         action_inference_step = self.job_config.action_num_inference_steps
@@ -950,9 +1073,22 @@ class VA_Server:
              1),  # pad 1 element at the end (right side) of the last dimension
             mode='constant',
             value=0)
+        expected_pseudo_steps = obs.get('pseudo_video_solver_steps')
+        if (
+            obs.get('pseudo_async_clock', False)
+            and expected_pseudo_steps is not None
+            and int(expected_pseudo_steps) != len(timesteps)
+        ):
+            raise ValueError(
+                "pseudo video solver budget mismatch: "
+                f"client={expected_pseudo_steps}, server={len(timesteps)}"
+            )
     
         # 1. Video Generation Loop
         for i, t in enumerate(tqdm(timesteps)):
+            if not self._wait_for_solver_step_grant():
+                logger.info("Chunk inference cancelled at virtual solver step %s", i)
+                return None, None
             drained_feedback, cancel_requested = self._drain_live_feedback()
             if cancel_requested:
                 logger.info("Chunk inference cancelled at video solver step %s", i)
@@ -999,10 +1135,19 @@ class VA_Server:
                 x_t=latents,
                 timestep=t,
                 sample=latents,
-                to_final=last_step,
+                cache_only=last_step,
                 constrained_y=state_targets,
                 weights=state_weights,
                 device=self.device
+            )
+            self._log_solver_diagnostics(
+                phase="video",
+                scheduler=self.scheduler,
+                step=i,
+                total_steps=len(timesteps),
+                chunk_id=frame_st_id,
+                state_version=state_version,
+                drained_feedback=drained_feedback,
             )
             
             latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
@@ -1042,14 +1187,29 @@ class VA_Server:
                 x_t=actions,
                 timestep=t,
                 sample=actions,
-                to_final=last_step,
+                cache_only=last_step,
                 constrained_y=action_targets,
                 weights=action_weights,
                 device=self.device
             )
+            self._log_solver_diagnostics(
+                phase="action",
+                scheduler=self.action_scheduler,
+                step=i,
+                total_steps=len(action_timesteps),
+                chunk_id=frame_st_id,
+            )
 
             actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
+        if not torch.isfinite(latents).all().item():
+            raise FloatingPointError(
+                f"non-finite video latent detected for chunk {frame_st_id}"
+            )
+        if not torch.isfinite(actions).all().item():
+            raise FloatingPointError(
+                f"non-finite action latent detected for chunk {frame_st_id}"
+            )
         actions[:, ~self.action_mask] *= 0
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
@@ -1069,7 +1229,15 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
+        if latent_model_input is None:
+            raise ValueError("KV-cache update did not produce a real observation latent")
         action_model_input = self.preprocess_action(obs['state'])
+        if action_model_input.shape[2] != latent_model_input.shape[2]:
+            raise ValueError(
+                "real KV-cache update requires time-aligned observation/action "
+                f"frames, got observations={latent_model_input.shape[2]} "
+                f"actions={action_model_input.shape[2]} frame_st_id={self.frame_st_id}"
+            )
         action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
@@ -1097,6 +1265,7 @@ class VA_Server:
     def infer(self, obs):
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
+        seed = obs.get('seed', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
         generate_after_kv_cache = obs.get('generate_after_kv_cache', False)
         feedback = obs.get('feedback', False)    # 状态反馈标志
@@ -1104,9 +1273,17 @@ class VA_Server:
 
         if reset:
             logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
+            self._reset(prompt=prompt, seed=seed)
             return dict()
         elif feedback:
+            constraint_mode = ConstraintMode.parse(
+                getattr(self.job_config, 'constraint_mode', 'NONE')
+            )
+            if constraint_mode is not ConstraintMode.FBFM:
+                return {
+                    "feedback_queued": False,
+                    "feedback_ignored_mode": constraint_mode.value,
+                }
             # FBFM 处理中间帧逻辑
             # 第4帧获取到之后才会进入这个循环
             logger.info(f"################# Feedback #################")
@@ -1116,12 +1293,17 @@ class VA_Server:
             logger.info(f"################# Compute KV Cache #################")
             if generate_after_kv_cache:
                 self._cancel_requested.clear()
+                self._solver_step_clock.start(
+                    clock_id=obs.get('solver_clock_id'),
+                    enabled=bool(obs.get('pseudo_async_clock', False)),
+                )
                 with self._inference_state_lock:
                     self._inference_running = True
             try:
                 self._compute_kv_cache(obs)
             except Exception:
                 if generate_after_kv_cache:
+                    self._solver_step_clock.close()
                     with self._inference_state_lock:
                         self._inference_running = False
                 raise
@@ -1158,6 +1340,7 @@ class VA_Server:
         else:
             logger.info(f"################# Infer One Chunk #################")
             if immediate_return:
+                self._solver_step_clock.start(clock_id=None, enabled=False)
                 return self._run_chunk_inference(obs)
     
     def decode_one_video(self, latents, output_type):
@@ -1278,6 +1461,14 @@ def run(args):
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     init_distributed(world_size, local_rank, rank)
+    startup_seed = os.environ.get("LINGBOT_VA_STARTUP_SEED")
+    if startup_seed is not None:
+        startup_seed = int(startup_seed)
+        random.seed(startup_seed)
+        np.random.seed(startup_seed)
+        torch.manual_seed(startup_seed)
+        torch.cuda.manual_seed_all(startup_seed)
+        logger.info("LingBot server startup seed=%s", startup_seed)
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size

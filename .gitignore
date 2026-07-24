@@ -22,3 +22,6 @@ wheels/
 
 # 显式取消跟踪所有 .pyc 文件 (确保此行存在且未被注释)
 *.pyc
+
+# Local simulator outputs and videos
+wam/lingbot-va/robotwin_outputs/

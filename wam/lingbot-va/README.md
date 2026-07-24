@@ -112,15 +112,15 @@ An action at one control step is a complete 14D or 16D vector, not a scalar.
 The checked formal setup is:
 
 ```text
-LingBot-VA source  /mnt/project_eai_hs/zrm2/FBFM/wam/lingbot-va
-RoboTwin           /mnt/project_eai_hs/zrm/RoboTwin
-policy Python      /mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/bin/python
-RoboTwin Python    /mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/bin/python
-checkpoint         /mnt/project_eai_hs/zrm/lingbot-va/checkpoints/lingbot-va-posttrain-robotwin
+LingBot-VA source  /home/oem/tmp_ws/FBFM/wam/lingbot-va
+RoboTwin           /home/oem/tmp_ws/RoboTwin
+policy Python      /home/oem/tmp_ws/conda-envs/fbfm-lingbot-va/bin/python
+RoboTwin Python    /home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python
+checkpoint         /home/oem/tmp_ws/checkpoints/lingbot-va-posttrain-robotwin
 ```
 
-The policy environment uses Python 3.10.16, PyTorch 2.9.0+cu126,
-torchvision 0.24.0+cu126, diffusers 0.36.0, transformers 4.55.2,
+The policy environment uses Python 3.10.16, PyTorch 2.9.0+cu129,
+torchvision 0.24.0+cu129, diffusers 0.36.0, transformers 4.55.2,
 flash-attn 2.8.3.post1, and NumPy 1.26.4.  The independent RoboTwin client
 environment uses SAPIEN 3.0.0b1.  The checkpoint directory must contain
 `transformer/`, `vae/`, `text_encoder/`, and `tokenizer/`; for inference,
@@ -132,8 +132,7 @@ two Python executables above explicitly.  To inspect the policy environment
 interactively, use:
 
 ```bash
-source /mnt/project_eai_hs/zrm/miniconda3/etc/profile.d/conda.sh
-conda activate lingbot-va
+source /home/oem/tmp_ws/environment/activate-lingbot-va.sh
 ```
 
 From the LingBot-VA repository root, launch one mode as follows.  The optional
@@ -151,19 +150,19 @@ bash script/run_robotwin_fbfm.sh 1
 ```
 
 The launchers run the policy server and RoboTwin client together, validate that
-`res.json` was produced, and always stop their own server on exit.  Defaults are
-GPU 0 for the policy server, GPU 1 for RoboTwin/CuRobo, WebSocket port 29156,
-and torch master port 29161.  Server and client must use different physical
-GPUs because RTC/FBFM guidance has a much higher FSDP unshard peak than NONE.
+`res.json` was produced, and always stop their own server on exit. Defaults are
+the single GPU 0 for both policy and RoboTwin/CuRobo, WebSocket port 29156, and
+torch master port 29161. The RTX PRO 6000 has enough memory for both processes;
+RoboTwin uses the NVIDIA Vulkan raster backend with ray tracing disabled.
 Override any machine-specific path or allocation before the command:
 
 ```bash
-export LINGBOT_VA_MODEL=/mnt/project_eai_hs/zrm/lingbot-va/checkpoints/lingbot-va-posttrain-robotwin
-export ROBOTWIN_ROOT=/mnt/project_eai_hs/zrm/RoboTwin
-export LINGBOT_SERVER_PYTHON=/mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/bin/python
-export ROBOTWIN_CLIENT_PYTHON=/mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/bin/python
+export LINGBOT_VA_MODEL=/home/oem/tmp_ws/checkpoints/lingbot-va-posttrain-robotwin
+export ROBOTWIN_ROOT=/home/oem/tmp_ws/RoboTwin
+export LINGBOT_SERVER_PYTHON=/home/oem/tmp_ws/conda-envs/fbfm-lingbot-va/bin/python
+export ROBOTWIN_CLIENT_PYTHON=/home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python
 export LINGBOT_SERVER_GPU=0
-export ROBOTWIN_CLIENT_GPU=1
+export ROBOTWIN_CLIENT_GPU=0
 export LINGBOT_VA_PORT=29156
 export LINGBOT_VA_MASTER_PORT=29161
 export LINGBOT_VA_ENABLE_OFFLOAD=1
@@ -181,16 +180,30 @@ export LINGBOT_VA_RTC_ATTENTION_SCHEDULE=EXP  # or LINEAR
 bash script/run_robotwin_rtc.sh 1
 ```
 
-During asynchronous rollout the client reports the measured inference delay,
-so later requests use the dynamic `d`; the environment value is the initial and
-fallback value.  FBFM live feedback is enabled by its launcher.  For the
+RoboTwin uses a deterministic pseudo-asynchronous schedule: 16 simulation steps
+release exactly 26 video-flow evaluations by default. No measured wall-clock
+delay changes `d` or the solver schedule. Override the solver budget with
+`LINGBOT_VA_PSEUDO_VIDEO_SOLVER_STEPS` only when the configured number of video
+inference steps also changes. FBFM live feedback is enabled by its launcher. For the
 diagnostic FBFM-static ablation only, use
 `bash script/run_constraint_ablation.sh FBFM-static 1`.
 
-The scripts use headless Mesa `llvmpipe`, not H100 Vulkan ray tracing.  They set
-`ROBOTWIN_RENDER_BACKEND=default`, `SAPIEN_DISABLE_RAY_TRACING=1`, and the Mesa
-Vulkan ICD; neither Xorg nor `DISPLAY` is needed.  Outputs and complete logs are
-written under `robotwin_outputs/adjust_bottle_<mode>_<timestamp>/`.
+The scripts use headless NVIDIA Vulkan rasterization rather than SAPIEN ray
+tracing. They set `ROBOTWIN_RENDER_BACKEND=default`,
+`SAPIEN_DISABLE_RAY_TRACING=1`, and the NVIDIA Vulkan ICD; neither Xorg nor
+`DISPLAY` is needed. Outputs and complete logs are written under
+`robotwin_outputs/adjust_bottle_<mode>_<timestamp>/`.
+
+The current RoboTwin task base unconditionally selects the ray-tracing shader.
+On a deployment where SAPIEN cannot expose ray tracing, apply the included
+compatibility patch from the RoboTwin repository root:
+
+```bash
+git apply /path/to/FBFM/wam/lingbot-va/patches/robotwin_raster_backend.patch
+```
+
+The patch preserves RoboTwin's upstream `rt` default and only selects the raster
+path when `ROBOTWIN_RENDER_BACKEND=default` is explicitly set by these launchers.
 
 Detailed timing semantics, deterministic replay, tests, and troubleshooting are
 documented in [`docs/fbfm_runtime_modes.md`](docs/fbfm_runtime_modes.md).

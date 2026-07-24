@@ -3,6 +3,9 @@ from pathlib import Path
 import sys
 import time
 
+import numpy as np
+import pytest
+
 
 LINGBOT_VA_ROOT = Path(__file__).resolve().parents[1]
 WAN_VA_ROOT = LINGBOT_VA_ROOT / "wan_va"
@@ -14,6 +17,7 @@ from utils.Simple_Remote_Infer.deploy.websocket_policy_server import (
     WebsocketPolicyServer,
 )
 from utils.sever_utils import DistributedModelWrapper
+from evaluation.robotwin.pseudo_async import PseudoAsyncHistory, solver_step_grant
 
 
 class _SlowPolicy:
@@ -100,3 +104,52 @@ def test_distributed_wrapper_also_queues_feedback_between_inferences():
     result = wrapper.infer({"feedback": True, "obs": [1, 2, 3, 4]})
     assert result == {"feedback_queued": True}
     assert model.queued == [{"feedback": True, "obs": [1, 2, 3, 4]}]
+
+
+def test_pseudo_async_grants_cover_solver_trajectory_exactly():
+    grants = [
+        solver_step_grant(
+            step,
+            total_simulation_steps=16,
+            total_solver_steps=26,
+        )
+        for step in range(1, 17)
+    ]
+    assert sum(grants) == 26
+    assert set(grants) == {1, 2}
+    assert sum(grants[:4]) == 6
+    assert sum(grants[:8]) == 13
+    assert sum(grants[:12]) == 19
+
+
+def test_pseudo_async_history_commits_each_segment_once_and_in_order():
+    initial_action = np.arange(2 * 2 * 4).reshape(2, 2, 4)
+    history = PseudoAsyncHistory(initial_action)
+
+    observations, action_frames = history.take()
+    assert observations == []
+    assert np.array_equal(action_frames, initial_action[:, :1])
+    with pytest.raises(RuntimeError, match="already been consumed"):
+        history.take()
+
+    executed_observations = ["obs-1", "obs-2", "obs-3", "obs-4"]
+    history.stage_execution(
+        executed_observations,
+        initial_action,
+        execution_horizon=4,
+    )
+    executed_observations.append("late-mutation")
+    observations, action_frames = history.take()
+    assert observations == ["obs-1", "obs-2", "obs-3", "obs-4"]
+    assert np.array_equal(action_frames, initial_action[:, -1:])
+
+
+def test_pseudo_async_history_rejects_unaligned_or_overwritten_segments():
+    action = np.zeros((2, 2, 4))
+    history = PseudoAsyncHistory(action)
+    with pytest.raises(RuntimeError, match="consume pending history"):
+        history.stage_execution([], action, execution_horizon=4)
+
+    history.take()
+    with pytest.raises(ValueError, match="complete Lingbot action frames"):
+        history.stage_execution([], action, execution_horizon=3)

@@ -30,6 +30,10 @@ class DistributedModelWrapper:
             # Never run VAE/CUDA work on a websocket worker. The inference
             # owner drains feedback at a deterministic solver boundary.
             return self.model.enqueue_live_feedback(obs)
+        if obs.get("solver_step_grant") is not None:
+            # This control request blocks until the exact granted number of
+            # solver evaluations has completed. No collective is started here.
+            return self.model.advance_solver_steps(obs)
         # Non-feedback requests own the distributed process group until the
         # request completes. Live feedback is drained inside solver steps.
         with self._distributed_request_lock:

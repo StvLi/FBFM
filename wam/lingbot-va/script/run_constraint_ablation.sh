@@ -27,18 +27,17 @@ esac
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 lingbot=$(cd -- "$script_dir/.." && pwd)
 workspace=$(cd -- "$lingbot/../.." && pwd)
-robotwin=${ROBOTWIN_ROOT:-/mnt/project_eai_hs/zrm/RoboTwin}
-server_python=${LINGBOT_SERVER_PYTHON:-/mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/bin/python}
-client_python=${ROBOTWIN_CLIENT_PYTHON:-/mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/bin/python}
-model=${LINGBOT_VA_MODEL:-/mnt/project_eai_hs/zrm/lingbot-va/checkpoints/lingbot-va-posttrain-robotwin}
+robotwin=${ROBOTWIN_ROOT:-/home/oem/tmp_ws/RoboTwin}
+server_python=${LINGBOT_SERVER_PYTHON:-/home/oem/tmp_ws/conda-envs/fbfm-lingbot-va/bin/python}
+client_python=${ROBOTWIN_CLIENT_PYTHON:-/home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python}
+model=${LINGBOT_VA_MODEL:-/home/oem/tmp_ws/checkpoints/lingbot-va-posttrain-robotwin}
 port=${LINGBOT_VA_PORT:-29156}
 master_port=${LINGBOT_VA_MASTER_PORT:-29161}
 server_gpu=${LINGBOT_SERVER_GPU:-0}
-client_gpu=${ROBOTWIN_CLIENT_GPU:-$(( (server_gpu + 1) % 4 ))}
-[[ "$server_gpu" != "$client_gpu" ]] || {
-  echo "policy server and RoboTwin client must use different GPUs" >&2
-  exit 2
-}
+client_gpu=${ROBOTWIN_CLIENT_GPU:-$server_gpu}
+eval_seed=${ROBOTWIN_EVAL_SEED:-0}
+server_prefix=$(cd -- "$(dirname -- "$server_python")/.." && pwd)
+client_prefix=$(cd -- "$(dirname -- "$client_python")/.." && pwd)
 output=${LINGBOT_VA_ABLATION_ROOT:-$lingbot/robotwin_outputs}/adjust_bottle_${variant}_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$output/logs" "$output/server_debug"
 
@@ -56,12 +55,15 @@ common_env=(
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   PYTHONPATH="$workspace:$lingbot:$robotwin"
   LINGBOT_VA_MODEL="$model"
+  LINGBOT_VA_STARTUP_SEED="${LINGBOT_VA_STARTUP_SEED:-0}"
   LINGBOT_VA_ENABLE_OFFLOAD="${LINGBOT_VA_ENABLE_OFFLOAD:-1}"
   LINGBOT_VA_CONSTRAINT_MODE="$constraint_mode"
   LINGBOT_VA_FEEDBACK_LIVE="$feedback_live"
   LINGBOT_VA_RTC_DELAY="${LINGBOT_VA_RTC_DELAY:-16}"
   LINGBOT_VA_RTC_EXECUTION_HORIZON="${LINGBOT_VA_RTC_EXECUTION_HORIZON:-16}"
   LINGBOT_VA_RTC_ATTENTION_SCHEDULE="${LINGBOT_VA_RTC_ATTENTION_SCHEDULE:-EXP}"
+  LINGBOT_VA_FEEDBACK_OBS_PER_STATE="${LINGBOT_VA_FEEDBACK_OBS_PER_STATE:-4}"
+  LINGBOT_VA_PSEUDO_VIDEO_SOLVER_STEPS="${LINGBOT_VA_PSEUDO_VIDEO_SOLVER_STEPS:-26}"
 )
 
 cd "$lingbot"
@@ -79,18 +81,18 @@ for _ in {1..180}; do
 done
 ss -ltn | rg -q ":${port} "
 
-# Rendering uses llvmpipe, but RoboTwin's planner import still requires CUDA.
-# Put that small CUDA context on a different physical GPU from the policy.
+# Rendering, CuRobo, and the policy server share the single RTX PRO 6000. The
+# mathematical pseudo-clock is fixed and does not model their wall-clock latency.
 env "${common_env[@]}" CUDA_VISIBLE_DEVICES="$client_gpu" \
   ROBOTWIN_ROOT="$robotwin" NO_PROXY=127.0.0.1,localhost,0.0.0.0 \
   ROBOTWIN_RENDER_BACKEND=default SAPIEN_DISABLE_RAY_TRACING=1 \
-  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
-  LD_LIBRARY_PATH="/mnt/project_eai_hs/zrm/venvs/robotwin-lingbot/lib/python3.10/site-packages/sapien/oidn_library:/mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/targets/x86_64-linux/lib:/mnt/project_eai_hs/zrm/miniconda3/envs/lingbot-va/lib" \
+  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  LD_LIBRARY_PATH="$client_prefix/lib/python3.10/site-packages/sapien/oidn_library:$server_prefix/targets/x86_64-linux/lib:$server_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= http_proxy= https_proxy= all_proxy= \
   "$client_python" -u -m evaluation.robotwin.eval_polict_client_openpi \
   --config "$robotwin/policy/ACT/deploy_policy.yml" --overrides \
   --task_name adjust_bottle --task_config demo_clean --train_config_name 0 \
-  --model_name 0 --ckpt_setting 0 --seed 0 --policy_name ACT \
+  --model_name 0 --ckpt_setting 0 --seed "$eval_seed" --policy_name ACT \
   --save_root "$output/client" --video_guidance_scale 5 \
   --action_guidance_scale 1 --test_num "$test_num" --port "$port" \
   >"$output/logs/client.log" 2>&1

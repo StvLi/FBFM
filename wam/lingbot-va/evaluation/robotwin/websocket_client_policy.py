@@ -69,7 +69,11 @@ class WebsocketClientPolicy:
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        is_control = bool(obs.get("feedback", False) or obs.get("reset", False))
+        is_control = bool(
+            obs.get("feedback", False)
+            or obs.get("reset", False)
+            or obs.get("solver_step_grant") is not None
+        )
         packer = self._feedback_packer if is_control else self._packer
         data = packer.pack(obs)
         ws = self._feedback_ws if is_control else self._ws

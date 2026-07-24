@@ -1,5 +1,6 @@
 import math
 import threading
+import time
 from enum import Enum
 
 import torch
@@ -26,6 +27,95 @@ class ConstraintMode(str, Enum):
         if normalized == "FEEDBACK":
             normalized = cls.FBFM.value
         return cls(normalized)
+
+
+class SolverStepClock:
+    """Deterministically gate solver evaluations with simulation-step grants."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self.start(clock_id=None, enabled=False)
+
+    def start(self, *, clock_id: str | int | None, enabled: bool) -> None:
+        with self._condition:
+            self._clock_id = None if clock_id is None else str(clock_id)
+            self._enabled = bool(enabled)
+            self._closed = False
+            self._available = 0
+            self._issued = 0
+            self._consumed = 0
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def wake(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def consume(self, cancel_event: threading.Event | None = None) -> bool:
+        with self._condition:
+            if not self._enabled:
+                return not self._closed
+            while self._available == 0 and not self._closed:
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
+                self._condition.wait(timeout=0.1)
+            if self._closed or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                return False
+            self._available -= 1
+            self._consumed += 1
+            self._condition.notify_all()
+            return True
+
+    def grant_and_wait(
+        self,
+        *,
+        clock_id: str | int,
+        count: int,
+        timeout: float | None = None,
+    ) -> dict:
+        if count <= 0:
+            raise ValueError(f"solver step grant count must be positive, got {count}")
+        requested_id = str(clock_id)
+        with self._condition:
+            if not self._enabled or self._closed:
+                return self.snapshot(accepted=False, reason="clock_not_running")
+            if requested_id != self._clock_id:
+                return self.snapshot(accepted=False, reason="clock_id_mismatch")
+
+            self._available += int(count)
+            self._issued += int(count)
+            target = self._issued
+            self._condition.notify_all()
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while self._consumed < target and not self._closed:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return self.snapshot(accepted=False, reason="timeout")
+                self._condition.wait(timeout=remaining)
+            completed = self._consumed >= target
+            return self.snapshot(
+                accepted=completed,
+                reason=None if completed else "clock_closed",
+            )
+
+    def snapshot(self, *, accepted: bool = True, reason: str | None = None) -> dict:
+        with self._condition:
+            return {
+                "solver_clock_accepted": bool(accepted),
+                "solver_clock_reason": reason,
+                "solver_clock_id": self._clock_id,
+                "solver_clock_enabled": self._enabled,
+                "solver_clock_closed": self._closed,
+                "solver_steps_issued": self._issued,
+                "solver_steps_consumed": self._consumed,
+                "solver_steps_available": self._available,
+            }
 
 
 def build_rtc_action_mask(
@@ -678,8 +768,9 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
             exponential_shift=exponential_shift,
             exponential_shift_mu=exponential_shift_mu,
             shift_terminal=shift_terminal,
-            )
+        )
         self.rtc_config = rtc_config
+        self.last_step_diagnostics = {}
     @torch.enable_grad()
     def step(self,
              original_denoise_step_partial,
@@ -687,11 +778,25 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
              timestep, 
              sample, 
              to_final=False, 
+             cache_only=False,
              constrained_y : Tensor | None = None,
              weights : Tensor | None = None, 
              device = None, 
              **kwargs
              ):
+        if cache_only:
+            # Lingbot-VA pads one final t=0 transformer call to write its
+            # prediction cache. The upstream implementation deliberately
+            # ignores that call's numerical output.
+            with torch.no_grad():
+                original_denoise_step_partial(x_t.detach())
+            self.last_step_diagnostics = {
+                "cache_only": True,
+                "has_guidance": False,
+                "mask_nonzero": 0,
+            }
+            return sample.detach()
+
         # 原step函数
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
@@ -714,7 +819,9 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
             and bool(torch.any(weights).item())
         )
         if has_guidance:
-            x_t = x_t.clone().detach().requires_grad_(True)
+            # Build a fresh graph for this solver step only. Reusing a sample
+            # with history here chains full transformer graphs across steps.
+            x_t = x_t.detach().clone().requires_grad_(True)
 
             # 疑似没有用 weights 已经自动过了
             # batch_size = x_t.shape[0] # B
@@ -728,21 +835,69 @@ class WrapperedFlowMatchScheduler(FlowMatchScheduler):
                 grad_outputs = err.clone().detach()
                 correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
 
-            max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
-            tau_tensor = torch.as_tensor(tau)
+            # Keep the scalar schedule at least FP32 (BF16 is too coarse near
+            # the endpoints), while preserving higher-precision solver tests.
+            schedule_dtype = torch.promote_types(x_t.dtype, torch.float32)
+            max_guidance_weight = torch.as_tensor(
+                self.rtc_config.max_guidance_weight,
+                device=x_t.device,
+                dtype=schedule_dtype,
+            )
+            tau_tensor = torch.as_tensor(
+                tau,
+                device=x_t.device,
+                dtype=schedule_dtype,
+            )
             squared_one_minus_tau = (1 - tau_tensor) ** 2
             inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
             c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
             guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
             guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
 
-            v_result_t = v_t - guidance_weight * correction
+            v_result_t = (v_t - guidance_weight * correction).detach()
+            self.last_step_diagnostics = {
+                "cache_only": False,
+                "has_guidance": True,
+                "sigma": float(sigma),
+                "tau": float(tau),
+                "mask_nonzero": int(torch.count_nonzero(weights).item()),
+                "error_norm": float(err.detach().float().norm().item()),
+                "correction_norm": float(
+                    correction.detach().float().norm().item()
+                ),
+                "guidance_weight": float(guidance_weight),
+                "base_velocity_norm": float(v_t.detach().float().norm().item()),
+                "guided_velocity_norm": float(
+                    v_result_t.detach().float().norm().item()
+                ),
+            }
 
         else:
-            # First step, no guidance - return v_t
-            v_result_t = original_denoise_step_partial(x_t)
+            # ``step`` is decorated with enable_grad for the guided branch, so
+            # the baseline branch must explicitly restore inference semantics.
+            with torch.no_grad():
+                v_result_t = original_denoise_step_partial(x_t.detach())
+            self.last_step_diagnostics = {
+                "cache_only": False,
+                "has_guidance": False,
+                "sigma": float(sigma),
+                "tau": float(tau),
+                "mask_nonzero": 0,
+                "error_norm": 0.0,
+                "correction_norm": 0.0,
+                "guidance_weight": 0.0,
+                "base_velocity_norm": float(
+                    v_result_t.detach().float().norm().item()
+                ),
+                "guided_velocity_norm": float(
+                    v_result_t.detach().float().norm().item()
+                ),
+            }
 
-        
-        prev_sample = sample + v_result_t * (sigma_ - sigma)
+        # No solver output may retain the denoiser/VJP graph. Besides wasting
+        # memory, carrying it through ``sample`` makes each successive step
+        # slower and can keep a whole chunk alive in asynchronous saves.
+        with torch.no_grad():
+            prev_sample = sample.detach() + v_result_t * (sigma_ - sigma)
 
         return prev_sample

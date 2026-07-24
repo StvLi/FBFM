@@ -21,6 +21,7 @@ from fbfm.policies.fbfm.configuration_rtc import RTCConfig
 from lingbot_va_bridge import FeedbackStateBuffer
 from lingbot_va_bridge import FeedbackSlotTracker
 from lingbot_va_bridge import SlotAlignedStateBuffer
+from lingbot_va_bridge import SolverStepClock
 from lingbot_va_bridge import ChunkConstraintContext
 from lingbot_va_bridge import ConstraintMode
 from lingbot_va_bridge import VA_PrevChunkAdapter
@@ -72,6 +73,301 @@ def test_wrapper_scheduler_matches_base_without_guidance():
         weights=torch.zeros_like(x_t),
     )
     assert torch.equal(wrapped_zero_mask_out, base_out)
+    assert wrapped.last_step_diagnostics["has_guidance"] is False
+    assert wrapped.last_step_diagnostics["mask_nonzero"] == 0
+    assert wrapped.last_step_diagnostics["correction_norm"] == 0.0
+
+
+def test_wrapper_scheduler_matches_lingbot_cache_write_trajectory():
+    wrapped = WrapperedFlowMatchScheduler(
+        num_inference_steps=4,
+        extra_one_step=True,
+        sigma_min=0.0,
+        rtc_config=RTCConfig(),
+    )
+    base = FlowMatchScheduler(
+        num_inference_steps=4,
+        extra_one_step=True,
+        sigma_min=0.0,
+    )
+    wrapped.set_timesteps(4)
+    base.set_timesteps(4)
+    timesteps = torch.nn.functional.pad(wrapped.timesteps, (0, 1), value=0)
+
+    wrapped_calls = []
+    wrapped_sample = torch.tensor([[0.75, -0.25]], dtype=torch.float32)
+    for index, timestep in enumerate(timesteps):
+        cache_only = index == len(timesteps) - 1
+
+        def wrapped_denoise(x, cache_only=cache_only):
+            wrapped_calls.append((cache_only, x.detach().clone()))
+            return 0.25 * x + 1.0
+
+        wrapped_sample = wrapped.step(
+            original_denoise_step_partial=wrapped_denoise,
+            x_t=wrapped_sample,
+            timestep=timestep,
+            sample=wrapped_sample,
+            cache_only=cache_only,
+            constrained_y=torch.full_like(wrapped_sample, 999.0),
+            weights=(
+                torch.ones_like(wrapped_sample)
+                if cache_only else torch.zeros_like(wrapped_sample)
+            ),
+        )
+
+    base_calls = []
+    base_sample = torch.tensor([[0.75, -0.25]], dtype=torch.float32)
+    for index, timestep in enumerate(timesteps):
+        cache_only = index == len(timesteps) - 1
+        base_calls.append((cache_only, base_sample.detach().clone()))
+        model_output = 0.25 * base_sample + 1.0
+        if not cache_only:
+            base_sample = base.step(model_output, timestep, base_sample)
+
+    assert len(wrapped_calls) == len(base_calls) == 5
+    assert [cache_only for cache_only, _ in wrapped_calls] == [
+        cache_only for cache_only, _ in base_calls
+    ]
+    for (_, wrapped_input), (_, base_input) in zip(wrapped_calls, base_calls):
+        assert torch.equal(wrapped_input, base_input)
+    assert torch.equal(wrapped_sample, base_sample)
+    assert not wrapped_sample.requires_grad
+    assert wrapped_sample.grad_fn is None
+
+
+def test_none_infer_matches_upstream_solver_and_cache_sequence(monkeypatch, tmp_path):
+    import wan_va_server as server_module
+
+    class FakeTransformer:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, model_input, update_cache, cache_name, action_mode):
+            del cache_name
+            x_t = model_input["noisy_latents"]
+            self.calls.append((action_mode, update_cache, x_t.detach().clone()))
+            velocity = 0.25 * x_t + 1.0
+            if action_mode:
+                return velocity.squeeze(-1).permute(0, 2, 3, 1).reshape(
+                    velocity.shape[0], -1, velocity.shape[1]
+                )
+            return velocity
+
+    class NoConstraintContext:
+        chunk_id = 0
+
+        def snapshot_state_constraints(self):
+            return (
+                torch.zeros(1, 48, 2, 1, 1),
+                torch.zeros(1, 1, 2, 1, 1),
+                0,
+            )
+
+        def snapshot_action_constraints(self):
+            return (
+                torch.zeros(1, 2, 2, 2, 1),
+                torch.zeros(1, 1, 2, 2, 1),
+                0,
+            )
+
+    server = object.__new__(server_module.VA_Server)
+    server.device = torch.device("cpu")
+    server.dtype = torch.float32
+    server.job_config = SimpleNamespace(
+        frame_chunk_size=2,
+        action_dim=2,
+        num_inference_steps=3,
+        action_num_inference_steps=2,
+        video_exec_step=-1,
+        guidance_scale=1.0,
+        action_guidance_scale=1.0,
+        patch_size=(1, 1, 1),
+        constraint_mode="NONE",
+    )
+    server.latent_height = 1
+    server.latent_width = 1
+    server.action_per_frame = 2
+    server.use_cfg = False
+    server.scheduler = WrapperedFlowMatchScheduler(
+        shift=1.0,
+        sigma_min=0.0,
+        extra_one_step=True,
+        rtc_config=RTCConfig(),
+    )
+    server.action_scheduler = WrapperedFlowMatchScheduler(
+        shift=1.0,
+        sigma_min=0.0,
+        extra_one_step=True,
+        rtc_config=RTCConfig(),
+    )
+    server.transformer = FakeTransformer()
+    server.active_constraint_context = NoConstraintContext()
+    server.action_mask = torch.ones(2, dtype=torch.bool)
+    server.cache_name = "pos"
+    server.exp_save_root = str(tmp_path)
+    server._solver_phase = "video"
+    server._cancel_requested = threading.Event()
+    server._solver_step_clock = SolverStepClock()
+    server._solver_step_clock.start(clock_id=None, enabled=False)
+    init_latent = torch.full((1, 48, 1, 1, 1), 0.125)
+    server._encode_obs = lambda obs: init_latent.clone()
+    server._prime_feedback_stream_initial_obs = lambda obs: (_ for _ in ()).throw(
+        AssertionError("NONE must not initialize the feedback VAE stream")
+    )
+    server._prepare_latent_input = lambda latents=None, actions=None, *args, **kwargs: {
+        "latent_res_lst": {"noisy_latents": latents},
+        "action_res_lst": {"noisy_latents": actions},
+    }
+    server._repeat_input_for_cfg = lambda model_input: model_input
+    server._drain_live_feedback = lambda: (0, False)
+    server._sync_cancel_requested = lambda: False
+    server.postprocess_action = lambda actions: actions
+
+    monkeypatch.setattr(
+        server_module,
+        "data_seq_to_patch",
+        lambda patch_size, output, *args, **kwargs: output,
+    )
+    monkeypatch.setattr(server_module, "save_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server_module, "tqdm", lambda values: values)
+    monkeypatch.setattr(server_module.torch.cuda, "empty_cache", lambda: None)
+
+    torch.manual_seed(1234)
+    initial_latents = torch.randn(1, 48, 2, 1, 1)
+    initial_actions = torch.randn(1, 2, 2, 2, 1)
+
+    reference_video_scheduler = FlowMatchScheduler(
+        shift=1.0, sigma_min=0.0, extra_one_step=True
+    )
+    reference_action_scheduler = FlowMatchScheduler(
+        shift=1.0, sigma_min=0.0, extra_one_step=True
+    )
+    reference_video_scheduler.set_timesteps(3)
+    reference_action_scheduler.set_timesteps(2)
+    reference_latents = initial_latents.clone()
+    for timestep in reference_video_scheduler.timesteps:
+        velocity = 0.25 * reference_latents + 1.0
+        reference_latents = reference_video_scheduler.step(
+            velocity, timestep, reference_latents
+        )
+        reference_latents[:, :, :1] = init_latent
+    reference_actions = initial_actions.clone()
+    for timestep in reference_action_scheduler.timesteps:
+        velocity = 0.25 * reference_actions + 1.0
+        reference_actions = reference_action_scheduler.step(
+            velocity, timestep, reference_actions
+        )
+        reference_actions[:, :, :1] = 0
+
+    torch.manual_seed(1234)
+    actions, latents = server._infer({"obs": []}, frame_st_id=0)
+
+    assert torch.equal(latents, reference_latents)
+    assert torch.equal(actions, reference_actions)
+    video_calls = [call for call in server.transformer.calls if not call[0]]
+    action_calls = [call for call in server.transformer.calls if call[0]]
+    assert [update_cache for _, update_cache, _ in video_calls] == [0, 0, 0, 1]
+    assert [update_cache for _, update_cache, _ in action_calls] == [0, 0, 1]
+    assert torch.equal(video_calls[-1][2], reference_latents)
+    assert torch.equal(action_calls[-1][2], reference_actions)
+
+
+def test_solver_step_clock_waits_for_exact_consumption():
+    clock = SolverStepClock()
+    clock.start(clock_id="chunk-3", enabled=True)
+    result = {}
+
+    def grant():
+        result.update(
+            clock.grant_and_wait(clock_id="chunk-3", count=2, timeout=1.0)
+        )
+
+    worker = threading.Thread(target=grant)
+    worker.start()
+    for _ in range(1000):
+        if clock.snapshot()["solver_steps_issued"] == 2:
+            break
+        threading.Event().wait(0.001)
+    assert clock.snapshot()["solver_steps_issued"] == 2
+    assert worker.is_alive()
+    assert clock.consume()
+    assert worker.is_alive()
+    assert clock.consume()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert result["solver_clock_accepted"]
+    assert result["solver_steps_consumed"] == 2
+    assert result["solver_steps_available"] == 0
+
+
+def test_solver_step_clock_rejects_stale_chunk_grant():
+    clock = SolverStepClock()
+    clock.start(clock_id="current", enabled=True)
+    result = clock.grant_and_wait(clock_id="stale", count=1, timeout=0.01)
+    assert not result["solver_clock_accepted"]
+    assert result["solver_clock_reason"] == "clock_id_mismatch"
+    assert result["solver_steps_issued"] == 0
+
+
+def test_wrapper_scheduler_never_returns_an_autograd_graph():
+    rtc_config = RTCConfig(max_guidance_weight=10.0)
+    wrapped = WrapperedFlowMatchScheduler(
+        num_inference_steps=4,
+        extra_one_step=True,
+        rtc_config=rtc_config,
+    )
+    wrapped.set_timesteps(4)
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+
+    def denoise_fn(x):
+        return parameter * x.square()
+
+    sample = torch.tensor([[0.5, -0.25]], dtype=torch.float32)
+    timestep = wrapped.timesteps[0]
+    cases = (
+        (None, None),
+        (torch.ones_like(sample), torch.zeros_like(sample)),
+        (torch.ones_like(sample), torch.ones_like(sample)),
+    )
+    for constrained_y, weights in cases:
+        output = wrapped.step(
+            original_denoise_step_partial=denoise_fn,
+            x_t=sample,
+            timestep=timestep,
+            sample=sample,
+            constrained_y=constrained_y,
+            weights=weights,
+        )
+        assert not output.requires_grad
+        assert output.grad_fn is None
+        assert parameter.grad is None
+
+
+def test_repeated_guided_steps_do_not_chain_solver_graphs():
+    wrapped = WrapperedFlowMatchScheduler(
+        num_inference_steps=4,
+        extra_one_step=True,
+        rtc_config=RTCConfig(max_guidance_weight=10.0),
+    )
+    wrapped.set_timesteps(4)
+    sample = torch.tensor([[0.5, -0.25]], dtype=torch.float32)
+
+    def denoise_fn(x):
+        return x.square() + 0.5 * x
+
+    for timestep in wrapped.timesteps:
+        sample = wrapped.step(
+            original_denoise_step_partial=denoise_fn,
+            x_t=sample,
+            timestep=timestep,
+            sample=sample,
+            constrained_y=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            weights=torch.ones_like(sample),
+        )
+        assert not sample.requires_grad
+        assert sample.grad_fn is None
 
 
 def test_wrapper_scheduler_guidance_changes_with_target_and_weights():
@@ -116,6 +412,88 @@ def test_wrapper_scheduler_guidance_changes_with_target_and_weights():
 
     assert not torch.allclose(out_a, out_b)
     assert not torch.allclose(out_a, out_c)
+
+
+def test_sigma_parameterized_guidance_moves_sample_toward_target():
+    wrapped = WrapperedFlowMatchScheduler(
+        num_inference_steps=4,
+        rtc_config=RTCConfig(max_guidance_weight=1.0),
+    )
+    wrapped.set_timesteps(4)
+    sample = torch.tensor([[0.0]], dtype=torch.float32)
+    target = torch.tensor([[1.0]], dtype=torch.float32)
+
+    output = wrapped.step(
+        original_denoise_step_partial=torch.zeros_like,
+        x_t=sample,
+        timestep=wrapped.timesteps[0],
+        sample=sample,
+        constrained_y=target,
+        weights=torch.ones_like(sample),
+    )
+
+    assert 0 < output.item() < target.item()
+    diagnostics = wrapped.last_step_diagnostics
+    assert diagnostics["has_guidance"] is True
+    assert diagnostics["mask_nonzero"] == 1
+    assert diagnostics["error_norm"] > 0
+    assert diagnostics["correction_norm"] > 0
+    assert diagnostics["guided_velocity_norm"] > diagnostics["base_velocity_norm"]
+
+
+def test_sigma_parameterized_guidance_matches_paper_vjp_equation():
+    max_weight = 10.0
+    wrapped = WrapperedFlowMatchScheduler(
+        num_inference_steps=4,
+        shift=1.0,
+        sigma_min=0.0,
+        extra_one_step=True,
+        rtc_config=RTCConfig(max_guidance_weight=max_weight),
+    )
+    wrapped.set_timesteps(4)
+
+    sample = torch.tensor([[0.4, -0.2]], dtype=torch.float64)
+    target = torch.tensor([[1.2, 0.3]], dtype=torch.float64)
+    mask = torch.tensor([[1.0, 0.25]], dtype=torch.float64)
+    timestep = wrapped.timesteps[1]
+    sigma = wrapped.sigmas[1].to(dtype=sample.dtype)
+    sigma_next = wrapped.sigmas[2].to(dtype=sample.dtype)
+    tau = 1 - sigma
+
+    def denoise_fn(x):
+        return 0.3 * x + 0.1
+
+    base_velocity = denoise_fn(sample)
+    clean_endpoint = sample - sigma * base_velocity
+    error = mask * (target - clean_endpoint)
+    endpoint_jacobian = 1 - 0.3 * sigma
+    correction = endpoint_jacobian * error
+    r_squared = sigma.square() / (tau.square() + sigma.square())
+    guidance_weight = torch.clamp(
+        sigma / (tau * r_squared), max=max_weight
+    )
+    guided_velocity = base_velocity - guidance_weight * correction
+    expected = sample + (sigma_next - sigma) * guided_velocity
+
+    actual = wrapped.step(
+        original_denoise_step_partial=denoise_fn,
+        x_t=sample,
+        timestep=timestep,
+        sample=sample,
+        constrained_y=target,
+        weights=mask,
+    )
+
+    assert torch.allclose(actual, expected)
+    diagnostics = wrapped.last_step_diagnostics
+    torch.testing.assert_close(
+        torch.tensor(diagnostics["guidance_weight"], dtype=sample.dtype),
+        guidance_weight,
+    )
+    torch.testing.assert_close(
+        torch.tensor(diagnostics["correction_norm"], dtype=sample.dtype),
+        correction.norm(),
+    )
 
 
 def test_feedback_state_buffer_exports_recent_states():
@@ -281,6 +659,35 @@ def test_constraint_modes_only_gate_masks():
     assert torch.equal(none.get_constrained_actions(), rtc.get_constrained_actions())
     assert torch.equal(rtc.get_constrained_actions(), fbfm.get_constrained_actions())
     assert torch.equal(none.get_constrained_states(), fbfm.get_constrained_states())
+
+
+def test_action_constraint_mask_excludes_unused_lingbot_channels():
+    import wan_va_server as server_module
+
+    server = object.__new__(server_module.VA_Server)
+    server.device = torch.device("cpu")
+    server.dtype = torch.float32
+    server.frame_st_id = 4
+    server.feedback_target_frame_st_id = 4
+    server.action_mask = torch.tensor([True, False, True])
+    server.active_constraint_context = None
+    adapter = SimpleNamespace(
+        constraint_mode=ConstraintMode.RTC,
+        _explicit_state_mask=torch.zeros(1),
+        _rtc_action_mask=torch.tensor([1.0, 0.5]),
+        _frame_chunk_size=1,
+        _action_per_frame=2,
+        get_constrained_states=lambda: torch.zeros(1, 1, 1, 1, 1),
+        get_constrained_actions=lambda: torch.zeros(1, 3, 1, 2, 1),
+    )
+
+    context = server._make_constraint_context(adapter)
+    _, mask, _ = context.snapshot_action_constraints()
+
+    assert mask.shape == (1, 3, 1, 2, 1)
+    assert torch.equal(mask[0, 0, 0, :, 0], torch.tensor([1.0, 0.5]))
+    assert torch.count_nonzero(mask[0, 1]) == 0
+    assert torch.equal(mask[0, 2, 0, :, 0], torch.tensor([1.0, 0.5]))
 
 
 def test_rtc_action_mask_matches_core_implementation():
@@ -499,7 +906,11 @@ def _make_fake_feedback_server(latent_frames=1):
     server.frame_st_id = 0
     server.latent_height = 1
     server.latent_width = 1
-    server.job_config = SimpleNamespace(frame_chunk_size=2, feedback_obs_per_state=4)
+    server.job_config = SimpleNamespace(
+        frame_chunk_size=2,
+        feedback_obs_per_state=4,
+        constraint_mode="FBFM",
+    )
     server.transformer = SimpleNamespace(config=SimpleNamespace(in_channels=1))
     server.feedback_streaming_vae = object()
     server.feedback_streaming_vae_half = None
@@ -535,6 +946,19 @@ def _make_fake_feedback_server(latent_frames=1):
 
     server._encode_obs_with_stream_wrappers = fake_encode
     return server, encode_calls
+
+
+def test_none_and_rtc_do_not_queue_or_encode_feedback():
+    for mode in ("NONE", "RTC"):
+        server, encode_calls = _make_fake_feedback_server()
+        server.job_config.constraint_mode = mode
+
+        result = server.enqueue_live_feedback({"feedback": True, "obs": ["frame"]})
+
+        assert not result["feedback_queued"]
+        assert result["feedback_ignored_mode"] == mode
+        assert server._live_feedback_queue.empty()
+        assert encode_calls == []
 
 
 def test_feedback_stream_aligns_four_new_observations_to_one_state_slot():
@@ -720,3 +1144,57 @@ def test_static_ablation_retains_feedback_without_mutating_running_context():
     assert torch.count_nonzero(context_mask) == 0
     assert buffered_count == 1
     assert torch.equal(buffered_mask, torch.tensor([1.0, 0.0]))
+
+
+def test_real_kv_cache_rejects_misaligned_observation_and_action_frames(
+    monkeypatch, tmp_path
+):
+    import wan_va_server as server_module
+
+    class FakeTransformer:
+        def clear_pred_cache(self, cache_name):
+            assert cache_name == "pos"
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("misaligned history must fail before a cache write")
+
+    server = object.__new__(server_module.VA_Server)
+    server.transformer = FakeTransformer()
+    server.cache_name = "pos"
+    server.exp_save_root = str(tmp_path)
+    server.frame_st_id = 1
+    server._encode_obs = lambda obs: torch.zeros(1, 48, 1, 1, 1)
+    server.preprocess_action = lambda action: torch.zeros(1, 30, 2, 16, 1)
+    monkeypatch.setattr(server_module, "save_async", lambda *args, **kwargs: None)
+
+    try:
+        server._compute_kv_cache({"obs": ["frame"], "state": "actions"})
+    except ValueError as exc:
+        assert "time-aligned observation/action frames" in str(exc)
+    else:
+        raise AssertionError("expected a time-alignment error")
+
+
+def test_previous_action_constraint_returns_to_normalized_model_coordinates():
+    import wan_va_server as server_module
+
+    server = object.__new__(server_module.VA_Server)
+    server.job_config = SimpleNamespace(
+        used_action_channel_ids=[0, 2],
+        inverse_used_action_channel_ids=[0, 2, 1],
+    )
+    server.action_norm_method = "quantiles"
+    server.actions_q01 = torch.tensor([-2.0, 0.0, 10.0]).reshape(-1, 1, 1)
+    server.actions_q99 = torch.tensor([2.0, 0.0, 20.0]).reshape(-1, 1, 1)
+    server.action_mask = torch.tensor([True, False, True])
+    normalized = torch.tensor(
+        [-0.5, 0.25, 0.0, 0.0, 0.75, -0.25]
+    ).reshape(1, 3, 2, 1, 1)
+    assert normalized.shape == (1, 3, 2, 1, 1)
+
+    server.last_action = server.postprocess_action(normalized.clone())
+    target = server._preprocess_previous_action_target()
+
+    assert target.shape == (3, 2, 1)
+    assert torch.allclose(target[server.action_mask], normalized[0, server.action_mask, ..., 0])
+    assert torch.count_nonzero(target[~server.action_mask]) == 0
