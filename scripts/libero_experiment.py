@@ -12,16 +12,36 @@ from pathlib import Path
 import numpy as np
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPOSITORY / "src"))
+FBFM_REPOSITORY = REPOSITORY.parents[1]
+sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
 from dreamzero_fbfm.client import FBFMClient
 from dreamzero_fbfm.pseudo_clock import solver_grants
+
+
+DEFAULT_MAX_STEPS = {
+    "libero_spatial": 480,
+    "libero_object": 480,
+    "libero_goal": 480,
+    "libero_10": 480,
+    "libero_90": 480,
+}
 
 
 def append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, allow_nan=False, sort_keys=True) + "\n")
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def main() -> None:
@@ -32,17 +52,34 @@ def main() -> None:
     parser.add_argument("--trial-start", type=int, default=0)
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=220)
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--mode", choices=("NONE", "RTC", "FBFM"), required=True)
+    parser.add_argument(
+        "--solver-release-policy",
+        choices=("uniform", "after_feedback"),
+        default="after_feedback",
+    )
+    parser.add_argument(
+        "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
+    )
+    parser.add_argument("--state-weight", type=float, default=56 / 9600)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.max_steps is None:
+        args.max_steps = DEFAULT_MAX_STEPS[args.suite]
     if args.trials <= 0 or args.max_steps <= 0:
         raise ValueError("trials and max-steps must be positive")
 
-    sys.path.insert(0, str(args.base_workspace.resolve()))
+    workspace = args.base_workspace.resolve()
+    import_paths = [
+        str(REPOSITORY / "src"),
+        str(FBFM_REPOSITORY),
+        str(workspace),
+    ]
+    sys.path[:] = import_paths + [path for path in sys.path if path not in import_paths]
     from fbfm.libero_observation import LIBERO_DUMMY_ACTION, extract_libero_observation
     from libero.libero import benchmark, get_libero_path
     from libero.libero.envs import OffScreenRenderEnv
@@ -53,13 +90,26 @@ def main() -> None:
     if args.trial_start + args.trials > len(initial_states):
         raise ValueError("requested trials exceed available official init states")
     bddl_path = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    grants = solver_grants(simulation_steps=8, solver_steps=16)
+    # DreamZero keeps 16 native UniPC scheduler steps but evaluates the DiT only
+    # eight times according to its released cache mask.
+    grants = solver_grants(
+        simulation_steps=8,
+        solver_steps=8,
+        release_policy=args.solver_release_policy,
+    )
     client = FBFMClient(args.host, args.port)
     episode_path = args.output / "episodes.jsonl"
+    existing_records = load_jsonl(episode_path)
+    existing_trials = {int(record["trial_id"]) for record in existing_records}
+    requested_trials = set(range(args.trial_start, args.trial_start + args.trials))
+    overlap = sorted(existing_trials & requested_trials)
+    if overlap:
+        raise ValueError(f"output already contains requested trial ids: {overlap}")
     records: list[dict] = []
     try:
         for trial_id in range(args.trial_start, args.trial_start + args.trials):
-            client.reset(task.language, args.seed + trial_id)
+            model_seed = args.seed if args.model_seed_rule == "fixed" else args.seed + trial_id
+            client.reset(task.language, model_seed)
             env = OffScreenRenderEnv(
                 bddl_file_name=str(bddl_path), camera_heights=256, camera_widths=256
             )
@@ -103,7 +153,8 @@ def main() -> None:
                             feedback["wrist_image"],
                             feedback["state"],
                         )
-                        client.grant(grant_count)
+                        if grant_count:
+                            client.grant(grant_count)
                         success = bool(done or reward > 0)
                         if success or len(executed) >= args.max_steps:
                             client.cancel()
@@ -125,7 +176,7 @@ def main() -> None:
                 "task_id": args.task_id,
                 "trial_id": trial_id,
                 "environment_seed": args.seed,
-                "model_seed": args.seed + trial_id,
+                "model_seed": model_seed,
                 "task_description": task.language,
                 "success": success,
                 "executed_steps": len(executed),
@@ -133,7 +184,18 @@ def main() -> None:
                 "elapsed_seconds": time.perf_counter() - started,
                 "inference_wave_seconds": inference_seconds,
                 "actions_finite": bool(np.isfinite(np.asarray(executed)).all()),
-                "protocol": {"H": 16, "d": 8, "s": 8, "solver_grants": list(grants)},
+                "protocol": {
+                    "H": 16,
+                    "d": 8,
+                    "s": 8,
+                    "scheduler_steps": 16,
+                    "dit_evaluations": 8,
+                    "state_weight": args.state_weight,
+                    "solver_grants": list(grants),
+                    "solver_release_policy": args.solver_release_policy,
+                    "model_seed_rule": args.model_seed_rule,
+                    "max_steps": args.max_steps,
+                },
             }
             trajectory_path = args.output / "trajectories" / f"trial_{trial_id:03d}.npz"
             trajectory_path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,14 +215,15 @@ def main() -> None:
     finally:
         client.close()
 
-    successes = sum(int(record["success"]) for record in records)
+    all_records = load_jsonl(episode_path)
+    successes = sum(int(record["success"]) for record in all_records)
     summary = {
         "mode": args.mode,
         "suite": args.suite,
         "task_id": args.task_id,
-        "trials": len(records),
+        "trials": len(all_records),
         "successes": successes,
-        "success_rate": successes / len(records),
+        "success_rate": successes / len(all_records),
         "episodes": str(episode_path.resolve()),
     }
     (args.output / "summary.json").write_text(

@@ -38,6 +38,7 @@ class ModelServer:
         port: int,
         audit_path: Path,
         beta: float = 10.0,
+        state_weight: float = 56 / 9600,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("model server must bind to 127.0.0.1")
@@ -51,6 +52,7 @@ class ModelServer:
             normalizer,
             mode=mode,
             beta=beta,
+            state_weight=state_weight,
             audit_path=str(audit_path),
         )
         self.task_description: str | None = None
@@ -112,29 +114,42 @@ class ModelServer:
         server.bind((self.host, self.port))
         server.listen(1)
         self.audit.write("server_ready", host=self.host, port=self.port)
-        connection, peer = server.accept()
-        if peer[0] != "127.0.0.1":
-            raise ConnectionError(f"rejected non-local client {peer}")
         try:
-            with connection:
-                connection.settimeout(360)
-                while True:
-                    request = receive_message(connection)
-                    if request is None:
-                        break
-                    request_type = request.get("type")
-                    try:
-                        response = self._handle(request_type, request)
-                    except BaseException as error:
-                        response = {
-                            "status": "error",
-                            "type": request_type,
-                            "error": f"{type(error).__name__}: {error}",
-                        }
-                        self.audit.write("server_error", request_type=request_type, error=response["error"])
-                    send_message(connection, response)
-                    if request_type == "close":
-                        break
+            while True:
+                connection, peer = server.accept()
+                if peer[0] != "127.0.0.1":
+                    connection.close()
+                    self.audit.write("client_rejected", peer=str(peer))
+                    continue
+                self.audit.write("client_connected", peer=str(peer))
+                try:
+                    with connection:
+                        connection.settimeout(360)
+                        while True:
+                            request = receive_message(connection)
+                            if request is None:
+                                break
+                            request_type = request.get("type")
+                            try:
+                                response = self._handle(request_type, request)
+                            except BaseException as error:
+                                response = {
+                                    "status": "error",
+                                    "type": request_type,
+                                    "error": f"{type(error).__name__}: {error}",
+                                }
+                                self.audit.write(
+                                    "server_error",
+                                    request_type=request_type,
+                                    error=response["error"],
+                                )
+                            send_message(connection, response)
+                            if request_type == "close":
+                                break
+                finally:
+                    self.runtime.cancel()
+                    self.job = None
+                    self.audit.write("client_disconnected", peer=str(peer))
         finally:
             self.runtime.cancel()
             server.close()
@@ -159,7 +174,17 @@ class ModelServer:
         if request_type == "predict_start":
             observation = self._decode_observation(request)
             committed = decode_array(request.get("committed_actions"), dtype="float32")
-            self.runtime.begin_chunk(committed, pseudo_async=True)
+            self.runtime.begin_chunk(
+                committed,
+                pseudo_async=True,
+                anchor_feedback=FeedbackObservation(
+                    action_offset=0,
+                    main_image=observation["main_images"][0],
+                    wrist_image=observation["wrist_images"][0],
+                    state=observation["states"][0],
+                    task_description=self.task_description or "",
+                ),
+            )
             self._start_job(observation)
             return {"status": "ok", "type": request_type}
         if request_type == "feedback":

@@ -7,6 +7,9 @@ from dreamzero_fbfm.pseudo_clock import SolverClock, solver_grants
 def test_integer_grants_are_deterministic_and_complete():
     assert solver_grants(8, 16) == (2, 2, 2, 2, 2, 2, 2, 2)
     assert solver_grants(3, 8) == (2, 3, 3)
+    assert solver_grants(8, 8, release_policy="after_feedback") == (
+        0, 0, 0, 0, 0, 0, 0, 8
+    )
 
 
 def test_grant_waits_for_solver_completion():

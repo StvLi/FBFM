@@ -24,9 +24,11 @@ and apply the joint endpoint VJP. Equal guided conditional/unconditional video
 outputs make the upstream CFG expression an identity without changing its code.
 The conditional action output remains DreamZero's native action flow.
 
-All modes force all 16 `dit_step_mask` entries on. Cached velocity reuse cannot
-represent a newly arrived constraint or its current endpoint Jacobian, so it is not
-used in the matched method comparison.
+All modes preserve the checkpoint's native 16-step UniPC schedule and 8-evaluation
+`dit_step_mask`. A newly arrived constraint is consumed at the next native DiT
+evaluation; skipped scheduler steps reuse the most recent (possibly guided) velocity
+exactly as in upstream DreamZero. This is required for `NONE` to preserve the
+released policy's numerical trajectory.
 
 ## Temporal alignment
 
@@ -37,12 +39,19 @@ coordinates; only the first 8x7 coordinates are masked. The generated prefix is
 therefore aligned to actions executed during the virtual delay, and slots 8:16 are
 the next executable suffix.
 
-Two solver evaluations are completed after each simulated action. Feedback is
-sampled after action offsets 2, 4, 6 and 8. The four transformed multi-view frames
-are encoded together by the checkpoint's frozen WAN VAE and assigned once to the
+One native DiT evaluation is completed after each simulated action. Feedback is
+sampled after action offsets 2, 4, 6 and 8. The chunk-start anchor and four
+transformed feedback frames are encoded together by the checkpoint's frozen causal
+WAN VAE; the anchor latent is discarded and the final latent is assigned to the
 first of the two predicted latent slots. The second slot remains governed by the
 pretrained prior. A state target never enters solver-start history in that same
 generation.
+
+The active action overlap contains `8x7=56` physical coordinates, whereas one
+state latent contains `48x10x20=9600` coordinates. The fixed state block weight is
+therefore `56/9600`; this gives the two active modality blocks equal aggregate
+coordinate weight before the joint VJP. The unweighted/binary state-mask choice is
+retained as a documented ablation, not used as the default matched run.
 
 ## Preserved contracts
 

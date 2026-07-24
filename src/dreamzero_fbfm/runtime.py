@@ -30,12 +30,6 @@ class FeedbackObservation:
     task_description: str
 
 
-def flow_sigmas(num_steps: int, shift: float, sigma_max: float = 0.999) -> tuple[float, ...]:
-    base = np.linspace(sigma_max, 0.0, num_steps + 1, dtype=np.float64)[:-1]
-    shifted = shift * base / (1 + (shift - 1) * base)
-    return tuple(float(value) for value in shifted)
-
-
 class DreamZeroFeedbackEncoder:
     """Encode four aligned LIBERO observations into one native DreamZero latent."""
 
@@ -50,10 +44,31 @@ class DreamZeroFeedbackEncoder:
 
     def reset(self) -> None:
         self._frames: list[Tensor] = []
+        self._anchor: Tensor | None = None
+
+    def set_anchor(self, feedback: FeedbackObservation) -> None:
+        """Set the causal keyframe preceding the first feedback VAE block."""
+        if feedback.action_offset != 0:
+            raise ValueError("feedback anchor must have action_offset=0")
+        self._anchor = self._transform_frame(feedback)
 
     def add(self, feedback: FeedbackObservation) -> list[Tensor]:
         if feedback.action_offset <= 0 or feedback.action_offset % self.stride:
             return []
+        if self._anchor is None:
+            raise RuntimeError("feedback encoder anchor was not initialized")
+        self._frames.append(self._transform_frame(feedback))
+        encoded: list[Tensor] = []
+        while len(self._frames) >= self.observations_per_latent:
+            group = self._frames[: self.observations_per_latent]
+            del self._frames[: self.observations_per_latent]
+            # Wan's first causal latent is a keyframe. Prefix the observation
+            # available at launch so the final latent represents this block.
+            encoded.append(self._encode(torch.cat([self._anchor, *group], dim=1)))
+            self._anchor = group[-1]
+        return encoded
+
+    def _transform_frame(self, feedback: FeedbackObservation) -> Tensor:
         env_obs = {
             "main_images": np.asarray(feedback.main_image, dtype=np.uint8)[None],
             "wrist_images": np.asarray(feedback.wrist_image, dtype=np.uint8)[None],
@@ -67,13 +82,7 @@ class DreamZeroFeedbackEncoder:
         frame = normalized["images"]
         if tuple(frame.shape[:2]) != (1, 1):
             raise ValueError(f"Unexpected transformed feedback shape {tuple(frame.shape)}")
-        self._frames.append(frame.detach().cpu())
-        encoded: list[Tensor] = []
-        while len(self._frames) >= self.observations_per_latent:
-            group = self._frames[: self.observations_per_latent]
-            del self._frames[: self.observations_per_latent]
-            encoded.append(self._encode(torch.cat(group, dim=1)))
-        return encoded
+        return frame.detach().cpu()
 
     def _encode(self, images: Tensor) -> Tensor:
         device = next(self.head.parameters()).device
@@ -100,6 +109,11 @@ class DreamZeroFeedbackEncoder:
             ).detach()
         if latent.ndim != 5 or latent.shape[2] < 1:
             raise ValueError(f"Unexpected feedback latent shape {tuple(latent.shape)}")
+        if images.shape[1] == self.observations_per_latent + 1 and latent.shape[2] < 2:
+            raise ValueError(
+                "Causal feedback window did not produce an anchor and a future latent: "
+                f"images={tuple(images.shape)} latent={tuple(latent.shape)}"
+            )
         return latent[:, :, -1]
 
 
@@ -114,8 +128,8 @@ class DreamZeroFBFMRuntime:
         mode: ConstraintMode | str,
         delay: int = 8,
         execution_horizon: int = 8,
-        solver_steps: int = 16,
-        sigma_shift: float = 5.0,
+        solver_evaluations: int | None = None,
+        state_weight: float = 56 / 9600,
         beta: float = 10.0,
         audit_path: str | None = None,
     ) -> None:
@@ -129,9 +143,26 @@ class DreamZeroFBFMRuntime:
         self.mode = ConstraintMode.parse(mode)
         self.delay = delay
         self.execution_horizon = execution_horizon
-        self.solver_steps = solver_steps
+        native_mask = tuple(bool(value) for value in self.head.dit_step_mask)
+        scheduler_steps = int(self.head.num_inference_steps)
+        if len(native_mask) != scheduler_steps:
+            raise ValueError(
+                "DreamZero DiT mask must align with the native scheduler: "
+                f"mask={len(native_mask)} scheduler={scheduler_steps}"
+            )
+        native_evaluations = sum(native_mask)
+        if solver_evaluations is not None and solver_evaluations != native_evaluations:
+            raise ValueError(
+                "configured solver evaluations do not match DreamZero's native cache "
+                f"schedule: configured={solver_evaluations} native={native_evaluations}"
+            )
+        self.scheduler_steps = scheduler_steps
+        self.solver_evaluations = native_evaluations
+        self.native_dit_mask = native_mask
+        if not 0.0 < state_weight <= 1.0:
+            raise ValueError("state_weight must be in (0, 1]")
+        self.state_weight = float(state_weight)
         self.beta = beta
-        self.sigmas = flow_sigmas(solver_steps, sigma_shift)
         self.audit = JsonlAudit(audit_path)
         self.clock = SolverClock()
         self.feedback_encoder = DreamZeroFeedbackEncoder(policy)
@@ -143,11 +174,28 @@ class DreamZeroFBFMRuntime:
         self._next_state_slot = 0
         self._lock = threading.RLock()
         self._install_hook()
-        # FBFM requires an endpoint graph at each solver evaluation. Keep this
-        # identical for NONE/RTC/FBFM within the matched protocol.
-        self.head.dit_step_mask = [True] * self.solver_steps
 
-    def begin_chunk(self, committed_actions: np.ndarray | None, *, pseudo_async: bool) -> None:
+    def _solver_sigma(self, kwargs: dict[str, Any]) -> float:
+        """Read the action sigma used by the active native scheduler step."""
+        timestep = kwargs.get("timestep_action")
+        if not isinstance(timestep, Tensor) or timestep.numel() == 0:
+            raise ValueError("DreamZero solver call is missing timestep_action")
+        flat = timestep.detach().float().reshape(-1)
+        if not torch.all(flat == flat[0]):
+            raise ValueError("FBFM currently requires one shared action timestep per batch")
+        train_steps = float(self.head.scheduler.num_train_timesteps)
+        sigma = float(flat[0].item() / train_steps)
+        if not 0.0 <= sigma <= 1.0:
+            raise ValueError(f"invalid DreamZero action sigma {sigma}")
+        return sigma
+
+    def begin_chunk(
+        self,
+        committed_actions: np.ndarray | None,
+        *,
+        pseudo_async: bool,
+        anchor_feedback: FeedbackObservation | None = None,
+    ) -> None:
         with self._lock:
             self.cancel()
             first_parameter = next(self.head.parameters(), None) if hasattr(self.head, "parameters") else None
@@ -157,6 +205,10 @@ class DreamZeroFBFMRuntime:
             self._next_state_slot = 0
             self._constraints = None
             self.feedback_encoder.reset()
+            if pseudo_async:
+                if anchor_feedback is None:
+                    raise ValueError("pseudo-asynchronous inference requires an anchor observation")
+                self.feedback_encoder.set_anchor(anchor_feedback)
             self._feedback = queue.Queue()
             horizon = int(self.head.action_horizon)
             model_dim = int(self.head.model.action_dim)
@@ -179,6 +231,7 @@ class DreamZeroFBFMRuntime:
                 "chunk_begin",
                 mode=self.mode.value,
                 pseudo_async=pseudo_async,
+                state_weight=self.state_weight,
                 action_mask_nonzero=int(torch.count_nonzero(mask).item()),
             )
 
@@ -231,7 +284,7 @@ class DreamZeroFBFMRuntime:
             if not is_solver:
                 with torch.no_grad():
                     return original(**kwargs)
-            if self._step >= self.solver_steps:
+            if self._step >= self.solver_evaluations:
                 raise RuntimeError("DreamZero issued more solver evaluations than configured")
             if not self.clock.consume():
                 raise InferenceCancelled("pseudo-asynchronous chunk cancelled")
@@ -241,8 +294,10 @@ class DreamZeroFBFMRuntime:
             constraints = self._ensure_constraints(video, action)
             drained = self._drain_feedback(constraints)
             state_target, state_mask, action_target, action_mask, version = constraints.snapshot()
+            state_mask.mul_(self.state_weight)
             has_guidance = bool(torch.any(state_mask).item() or torch.any(action_mask).item())
             call_kwargs = dict(kwargs, noisy_input=video, action=action)
+            sigma = self._solver_sigma(kwargs) if has_guidance else None
 
             if has_guidance:
                 with torch.enable_grad():
@@ -261,7 +316,7 @@ class DreamZeroFBFMRuntime:
                         video_mask=state_mask,
                         action_target=action_target,
                         action_mask=action_mask,
-                        sigma=self.sigmas[self._step],
+                        sigma=sigma,
                         beta=self.beta,
                     )
                 # The upstream caller applies CFG after this hook. Equal video
@@ -289,7 +344,7 @@ class DreamZeroFBFMRuntime:
                 "solver_step",
                 mode=self.mode.value,
                 step=self._step,
-                sigma=self.sigmas[self._step],
+                sigma=sigma,
                 context_version=version,
                 feedback_drained=drained,
                 gpu_allocated_bytes=(

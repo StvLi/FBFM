@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPOSITORY / "src"))
+FBFM_REPOSITORY = REPOSITORY.parents[1]
+sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
 
 def main() -> None:
@@ -23,13 +24,24 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--beta", type=float, default=10.0)
+    parser.add_argument("--state-weight", type=float, default=56 / 9600)
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)
     args = parser.parse_args()
 
     workspace = args.base_workspace.resolve()
-    sys.path[:0] = [str(workspace), str(workspace / "RLinf"), str(workspace / "dreamzero")]
-    os.environ["NUM_DIT_STEPS"] = "16"
+    import_paths = [
+        str(REPOSITORY / "src"),
+        str(FBFM_REPOSITORY),
+        str(workspace),
+        str(workspace / "RLinf"),
+        str(workspace / "dreamzero"),
+    ]
+    sys.path[:] = import_paths + [path for path in sys.path if path not in import_paths]
+    # The released LIBERO checkpoint was evaluated with DreamZero's native
+    # 8-evaluation cache schedule over 16 UniPC steps. FBFM hooks those native
+    # evaluations; changing this to 16 changes the zero-guidance policy itself.
+    os.environ["NUM_DIT_STEPS"] = "8"
     os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
     from fbfm.model_runtime import load_policy, reset_policy_state
@@ -49,6 +61,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         beta=args.beta,
+        state_weight=args.state_weight,
         audit_path=args.audit,
     )
     ready = {
@@ -56,6 +69,7 @@ def main() -> None:
         "mode": args.mode,
         "host": args.host,
         "port": args.port,
+        "state_weight": args.state_weight,
         "load": load_report,
     }
     if args.ready_file is not None:

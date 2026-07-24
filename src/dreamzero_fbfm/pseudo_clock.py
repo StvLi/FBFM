@@ -6,10 +6,19 @@ import threading
 import time
 
 
-def solver_grants(simulation_steps: int, solver_steps: int) -> tuple[int, ...]:
-    """Distribute solver evaluations over simulation steps with integer arithmetic."""
+def solver_grants(
+    simulation_steps: int,
+    solver_steps: int,
+    *,
+    release_policy: str = "uniform",
+) -> tuple[int, ...]:
+    """Map simulation steps to solver grants under a deterministic policy."""
     if simulation_steps <= 0 or solver_steps <= 0:
         raise ValueError("step counts must be positive")
+    if release_policy == "after_feedback":
+        return (0,) * (simulation_steps - 1) + (solver_steps,)
+    if release_policy != "uniform":
+        raise ValueError(f"unknown solver release policy {release_policy!r}")
     return tuple(
         ((index + 1) * solver_steps) // simulation_steps
         - (index * solver_steps) // simulation_steps
