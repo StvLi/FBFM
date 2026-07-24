@@ -1,24 +1,24 @@
 # DreamZero x FBFM x LIBERO handover
 
-Updated: 2026-07-24
+Updated: 2026-07-25
 
 ## Repositories and revisions
 
 | Item | Location / revision |
 | --- | --- |
 | Canonical monorepo route | `/home/oem/tmp_ws/FBFM/wam/dreamzero-libero` |
-| Monorepo branch | `runnable-fbfm-lingbotva-dreamzero` |
+| Monorepo branch | `fix/dreamzero-rolling-feedback` |
 | Imported standalone repository | `/home/oem/tmp_ws/DreamZero-FBFM-LIBERO` |
 | A6000 integration repository | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO` |
 | Imported standalone branch | `runnable-dreamzero-fbfm-libero` |
-| Numerical method revision | `605f76d` |
-| Full-benchmark ledger revision | `67c7e80` |
-| Ledger synchronization revision | `118c89d` |
+| Rolling method revision | `118211b` |
+| Canonical audit/metadata revision | `1ee00fa` |
+| A6000 rolling method revision | `0d258e4` |
+| A6000 audit/metadata revision | `0f04fd3` |
 | Paper experiment branch | `/home/oem/tmp_ws/aaai_paper`, branch `experiment` |
 
-The ledger and synchronization revisions add sequential-client lifecycle,
-resume validation, and result tables. They do not alter the numerical method in
-`605f76d`.
+The second revision in each repository fixes experiment metadata and audit
+grouping; it does not alter the numerical method in `118211b`/`0d258e4`.
 
 ## A6000 deployment
 
@@ -33,8 +33,8 @@ resume validation, and result tables. They do not alter the numerical method in
 | Tokenizer | `assets/tokenizers/umt5-xxl` |
 
 The checkpoint loads all 1,828 tensors. Model residency is approximately 25.27
-GB allocated, and an FBFM episode peaks at approximately 27.89 GB on the RTX
-A6000. The first model load takes about 2.5 minutes because the six checkpoint
+GB allocated, and the rolling task-0 pilot peaked at 26.78 GiB allocated on the
+RTX A6000. The first model load takes about 2.5 minutes because the six checkpoint
 shards are read through host memory before the GPU transfer.
 
 ## Method mapping
@@ -50,14 +50,17 @@ are therefore retained. The integration preserves these upstream contracts:
 - zero masks and the original numerical path in `NONE` mode.
 
 The action block constrains the committed `8 x 7 = 56` physical coordinates.
-The visual block uses the current-wave anchor plus observations at offsets
-2/4/6/8 in the frozen causal VAE and constrains one `48 x 10 x 20 = 9600`
-latent slot. Its fixed default weight is `56/9600`. See
-`docs/IMPLEMENTATION.md` for the solver equations and hook boundary.
+The visual block constrains one `48 x 10 x 20 = 9600` latent slot. After every
+action, the current-wave anchor and the causal observations available so far are
+completed to a five-frame VAE window by holding the latest observation forward.
+The source window progresses from `[0,1,1,1,1]` to `[0,2,4,6,8]`; the latter is
+exactly the native complete block. The slot is re-encoded, refreshed and
+versioned before each of the eight DiT evaluations. Its fixed default weight is
+`56/9600`. See `docs/IMPLEMENTATION.md` for the solver equations and hook boundary.
 
-## Full experiment protocol
+## Experiment state
 
-The active experiment covers all standard LIBERO suites in this order:
+The intended full experiment covers all standard LIBERO suites in this order:
 
 1. `libero_spatial` (10 tasks)
 2. `libero_object` (10 tasks)
@@ -65,49 +68,54 @@ The active experiment covers all standard LIBERO suites in this order:
 4. `libero_10` (10 tasks)
 5. `libero_90` (90 tasks)
 
-Each task uses official trial IDs 0-19, for 130 tasks and 2,600 episodes. One
-model server remains resident while task clients run sequentially. The runner
-accepts only a contiguous completed-trial prefix and rejects duplicates before
-resuming.
+Each task uses official trial IDs 0-19, for 130 tasks and 2,600 episodes. The
+full rolling run has not been started. The previous `after_feedback` run was
+stopped after 73 episodes because all eight DiT evaluations were delayed until
+after action 8; its data are diagnostic only.
 
 | Runtime artifact | Location |
 | --- | --- |
-| Experiment root | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO/results/libero_all_fbfm_20_67c7e80` |
-| Server PID | `<experiment root>/server.pid` |
-| Runner PID | `<experiment root>/runner.pid` |
-| Episode outputs | `<experiment root>/tasks/<suite>/task_NNN` |
-| Joint solver audit | `<experiment root>/solver.jsonl` |
-| Live task table | `<experiment root>/task_summary.csv` |
-| Live trial table | `<experiment root>/trials.csv` |
-| Human-readable status | `<experiment root>/live_status.md` |
+| Rolling pilot root | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO/results/rolling_v1_task0_20_0d258e4` |
+| Episode outputs | `<pilot root>/tasks/libero_spatial/task_000` |
+| Joint solver audit | `<pilot root>/solver.jsonl` |
+| Task table | `<pilot root>/task_summary.csv` |
+| Trial table | `<pilot root>/trials.csv` |
+| Human-readable status | `<pilot root>/live_status.md` |
 
-At handover, `libero_spatial/task0` is complete at 14/20 successes. It was run
-with method revision `605f76d` and adopted into the `67c7e80` ledger. The
-remaining queue starts at `libero_spatial/task1`.
+The rolling pilot is complete at 9/20 successes (45.0%, 95% Wilson interval
+25.8%-65.8%). The matched delayed-feedback diagnostic achieved 8/20, while the
+historical base task-0 run achieved 19/20. Rolling feedback is implemented and
+working, but does not by itself explain or recover the performance gap.
 
 ## Table management
 
-The remote runner atomically refreshes its CSV and Markdown tables after every
-task. A local detached monitor synchronizes them into the paper repository every
-900 seconds:
+The rolling pilot tables are stored in the paper repository as:
 
-- `experiments/dreamzero_fbfm_trials.csv`
-- `experiments/dreamzero_fbfm_task_summary.csv`
-- `experiments/dreamzero_fbfm_live_status.md`
-- `experiments/dreamzero_fbfm_manifest.json`
+- `experiments/dreamzero_fbfm_rolling_v1_trials.csv`
+- `experiments/dreamzero_fbfm_rolling_v1_task_summary.csv`
+- `experiments/dreamzero_fbfm_rolling_v1_live_status.md`
+- `experiments/dreamzero_fbfm_rolling_v1_manifest.json`
+- `experiments/dreamzero_fbfm_rolling_v1.md`
 
-The local monitor command is `scripts/sync_libero_ledger.py`; its deployment log
-is `results/monitor/ledger_sync.log`. Only task rows marked `complete` are final
-20-trial estimates. Partial rows are operational progress only.
+The old monitor is stopped. Start a new monitor only when a full rolling run is
+launched, and use a new result root and filename prefix.
 
 ## Validation and caveats
 
-- CPU regression suite: 14 tests passed on the A6000 deployment.
-- The first weighted FBFM smoke completed all 220 steps without OOM, NaN, or memory growth.
-- The first complete task produced 14/20 successes, confirming nonzero closed-loop performance.
+- Canonical CPU regression suite: 23 tests passed.
+- A6000 standalone route suite: 17 applicable tests passed. Two monorepo-path
+  tests are intentionally inapplicable to the standalone deployment layout.
+- The smoke succeeded in 168/480 steps; the formal pilot completed all 20 trials.
+- The solver audit contains 6,969 finite evaluations, 0 server errors, context
+  versions 1-8 per complete wave, and one slot-0 target refresh per evaluation.
+- Mean allocated memory over the first/last 200 solver evaluations was
+  24.065/23.970 GiB, so the rolling VAE path does not retain graphs or grow memory.
 - The paused base run used eight parallel environments on the RTX PRO 6000; the
   A6000 FBFM run is sequential. Both use official initial states, but batching
   can change floating-point trajectories, so this deployment difference must be
   retained in comparisons.
 - Measured wall-clock time is a resource metric only. It does not define the
   pseudo-asynchronous method schedule.
+- Before a full benchmark, run matched 20-trial `NONE` and `RTC` pilots on the
+  same A6000 path. This separates overlap/action-guidance degradation from the
+  effect of rolling state feedback.
