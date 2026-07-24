@@ -20,7 +20,9 @@ processes.
 
 ```text
 FBFM/
-  fbfm/                         # method-level and earlier policy components
+  fbfm/                         # shared method and deployment adapters
+    model_runtime.py            # single-GPU RLinf/DreamZero model loader
+    libero_observation.py       # LIBERO observation and state contract
   toymodel/                     # small mathematical experiments
   wam/
     README.md                   # route index and ownership boundaries
@@ -30,6 +32,11 @@ FBFM/
 
 Generated trajectories, videos, checkpoints, third-party repositories, and
 Conda environments are intentionally external to Git.
+
+The root `fbfm` package is tracked source, not deployment state. In particular,
+the DreamZero launchers import `fbfm.model_runtime` and
+`fbfm.libero_observation` from this checkout. Do not satisfy those imports with
+untracked copies in a machine workspace.
 
 ## LingBot-VA x RoboTwin
 
@@ -66,7 +73,7 @@ environment from the LIBERO Python 3.8 simulator environment.
 
 ```bash
 cd wam/dreamzero-libero
-PYTHONPATH=src python -m pytest
+PYTHONPATH=src:../.. python -m pytest
 ```
 
 Deployment, single-task smoke, full 130-task evaluation, resume behavior, and

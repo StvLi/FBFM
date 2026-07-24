@@ -55,6 +55,21 @@ or checkpoints. A deployment base workspace must provide:
 
 The model and simulator environments are intentionally separate.
 
+## Source ownership
+
+The complete route spans two deliberate source locations in this monorepo:
+
+| Source | Responsibility | Import environment |
+| --- | --- | --- |
+| `fbfm/model_runtime.py` | RLinf config construction, strict single-GPU policy loading, episode cache reset | DreamZero Python 3.11 |
+| `fbfm/libero_observation.py` | LIBERO images, quaternion conversion, 8D state and dummy action | LIBERO simulator |
+| `wam/dreamzero-libero/src/dreamzero_fbfm/` | FBFM constraints, joint solver hook, pseudo-clock and transport | route-specific |
+
+Both launchers bootstrap the monorepo root and load the checked-in `fbfm`
+modules before any same-named directory under the deployment workspace. A
+machine-local `$DREAMZERO_BASE_WORKSPACE/fbfm` copy is not required and must not
+be treated as source of record.
+
 ## A6000 commands
 
 The prepared base workspace is `/home/deepcybo-lite/fbfm_ws`. Start the model
@@ -89,7 +104,7 @@ PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 Run CPU regressions with:
 
 ```bash
-PYTHONPATH=src python -m pytest
+PYTHONPATH=src:../.. python -m pytest
 ```
 
 Primary generated files are ignored under `results/`: `episodes.jsonl`,

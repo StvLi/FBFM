@@ -12,7 +12,8 @@ from pathlib import Path
 import numpy as np
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPOSITORY / "src"))
+FBFM_REPOSITORY = REPOSITORY.parents[1]
+sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
 from dreamzero_fbfm.client import FBFMClient
 from dreamzero_fbfm.pseudo_clock import solver_grants
@@ -53,7 +54,13 @@ def main() -> None:
     if args.trials <= 0 or args.max_steps <= 0:
         raise ValueError("trials and max-steps must be positive")
 
-    sys.path.insert(0, str(args.base_workspace.resolve()))
+    workspace = args.base_workspace.resolve()
+    import_paths = [
+        str(REPOSITORY / "src"),
+        str(FBFM_REPOSITORY),
+        str(workspace),
+    ]
+    sys.path[:] = import_paths + [path for path in sys.path if path not in import_paths]
     from fbfm.libero_observation import LIBERO_DUMMY_ACTION, extract_libero_observation
     from libero.libero import benchmark, get_libero_path
     from libero.libero.envs import OffScreenRenderEnv

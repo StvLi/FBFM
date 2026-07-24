@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPOSITORY / "src"))
+FBFM_REPOSITORY = REPOSITORY.parents[1]
+sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
 
 def main() -> None:
@@ -29,7 +30,14 @@ def main() -> None:
     args = parser.parse_args()
 
     workspace = args.base_workspace.resolve()
-    sys.path[:0] = [str(workspace), str(workspace / "RLinf"), str(workspace / "dreamzero")]
+    import_paths = [
+        str(REPOSITORY / "src"),
+        str(FBFM_REPOSITORY),
+        str(workspace),
+        str(workspace / "RLinf"),
+        str(workspace / "dreamzero"),
+    ]
+    sys.path[:] = import_paths + [path for path in sys.path if path not in import_paths]
     # The released LIBERO checkpoint was evaluated with DreamZero's native
     # 8-evaluation cache schedule over 16 UniPC steps. FBFM hooks those native
     # evaluations; changing this to 16 changes the zero-guidance policy itself.
