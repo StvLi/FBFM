@@ -124,7 +124,8 @@ def main() -> None:
                 "suite": args.suite,
                 "task_id": args.task_id,
                 "trial_id": trial_id,
-                "seed": args.seed,
+                "environment_seed": args.seed,
+                "model_seed": args.seed + trial_id,
                 "task_description": task.language,
                 "success": success,
                 "executed_steps": len(executed),
@@ -134,6 +135,18 @@ def main() -> None:
                 "actions_finite": bool(np.isfinite(np.asarray(executed)).all()),
                 "protocol": {"H": 16, "d": 8, "s": 8, "solver_grants": list(grants)},
             }
+            trajectory_path = args.output / "trajectories" / f"trial_{trial_id:03d}.npz"
+            trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                trajectory_path,
+                actions=np.asarray(executed, dtype=np.float32).reshape(-1, 7),
+                success=np.asarray(success),
+                trial_id=np.asarray(trial_id),
+                environment_seed=np.asarray(args.seed),
+                model_seed=np.asarray(args.seed + trial_id),
+                task_description=np.asarray(task.language),
+            )
+            record["trajectory"] = str(trajectory_path.resolve())
             append_jsonl(episode_path, record)
             records.append(record)
             print(json.dumps(record, sort_keys=True), flush=True)

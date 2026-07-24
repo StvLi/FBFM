@@ -150,6 +150,9 @@ class DreamZeroFBFMRuntime:
     def begin_chunk(self, committed_actions: np.ndarray | None, *, pseudo_async: bool) -> None:
         with self._lock:
             self.cancel()
+            first_parameter = next(self.head.parameters(), None) if hasattr(self.head, "parameters") else None
+            if first_parameter is not None and first_parameter.is_cuda:
+                torch.cuda.reset_peak_memory_stats(first_parameter.device)
             self._step = 0
             self._next_state_slot = 0
             self._constraints = None
@@ -291,6 +294,9 @@ class DreamZeroFBFMRuntime:
                 feedback_drained=drained,
                 gpu_allocated_bytes=(
                     torch.cuda.memory_allocated(video.device) if video.is_cuda else 0
+                ),
+                gpu_peak_allocated_bytes=(
+                    torch.cuda.max_memory_allocated(video.device) if video.is_cuda else 0
                 ),
                 **diagnostics,
             )
