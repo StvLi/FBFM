@@ -149,6 +149,18 @@ bash script/run_robotwin_rtc.sh 1
 bash script/run_robotwin_fbfm.sh 1
 ```
 
+On the 97,887 MiB RTX PRO 6000, the validated 20-trial FBFM run can be split
+across three isolated servers/simulators with:
+
+```bash
+bash script/run_robotwin_fbfm_20_parallel.sh
+```
+
+This launcher uses approximately 83 GiB at peak and is not suitable for a
+smaller GPU without reducing the number of concurrent shards. It requires all
+20 episode videos and the three `res.json` totals before writing
+`aggregate.json`.
+
 The launchers run the policy server and RoboTwin client together, validate that
 `res.json` was produced, and always stop their own server on exit. Defaults are
 the single GPU 0 for both policy and RoboTwin/CuRobo, WebSocket port 29156, and

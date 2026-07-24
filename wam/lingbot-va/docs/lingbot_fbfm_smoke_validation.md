@@ -70,3 +70,22 @@ GPU smoke 前暂停可恢复的 DreamZero x LIBERO benchmark；三组结束后�
 生成协议。
 
 服务端日志中的关键审计行以 `FBFM solver diagnostics` 和 `FBFM GPU memory` 开头。
+
+## FBFM 20-trial 结果
+
+在三条完全隔离的 server/simulator 分片上完成 `7+7+6` 个 episode：
+
+| 指标 | 结果 |
+|---|---:|
+| success | 20/20 |
+| success rate | 100.0% |
+| 95% Wilson CI | 83.89%-100.0% |
+| state-guided audit records | 159 |
+| action-guided audit records | 318 |
+| numerical failure records | 0 |
+| post-chunk allocated range | 16,611.6-16,630.3 MiB |
+| maximum per-chunk peak allocated | 21,342.1 MiB |
+
+结果目录：`robotwin_outputs/fbfm_20_20260724_102818/`；结构化聚合为
+`aggregate.json`。seed blocks 是 10000-10006、20000-20006 和 30000-30005。三个分片不共享
+KV cache、feedback state 或随机数生成器，因此只把独立 episode 并行化，没有改变固定伪时钟。

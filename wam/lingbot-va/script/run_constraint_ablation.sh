@@ -97,7 +97,8 @@ env "${common_env[@]}" CUDA_VISIBLE_DEVICES="$client_gpu" \
   --action_guidance_scale 1 --test_num "$test_num" --port "$port" \
   >"$output/logs/client.log" 2>&1
 
-result="$output/client/stseed-10000/metrics/adjust_bottle/res.json"
+st_seed=$((10000 * (1 + eval_seed)))
+result="$output/client/stseed-${st_seed}/metrics/adjust_bottle/res.json"
 [[ -s "$result" ]] || {
   echo "RoboTwin did not produce $result" >&2
   exit 4

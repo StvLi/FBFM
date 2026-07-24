@@ -50,6 +50,8 @@ trap - INT TERM
 
 /home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python - "$run_root" <<'PY'
 import json
+import math
+import re
 import sys
 from pathlib import Path
 
@@ -62,6 +64,9 @@ aggregate = {
     "episodes": [],
     "succ_num": 0,
     "total_num": 0,
+    "state_guided_records": 0,
+    "action_guided_records": 0,
+    "numerical_failure_records": 0,
 }
 
 for shard in sorted(root.glob("shard*")):
@@ -70,18 +75,51 @@ for shard in sorted(root.glob("shard*")):
         raise RuntimeError(f"expected one res.json in {shard}, got {result_paths}")
     result_path = result_paths[0]
     result = json.loads(result_path.read_text())
-    videos = sorted(result_path.parents[2].rglob("*.mp4"))
+    videos = sorted(
+        result_path.parents[2].rglob("*.mp4"),
+        key=lambda path: int(path.name.split("_", 1)[0]),
+    )
+    server_logs = list(shard.rglob("logs/server.log"))
+    if len(server_logs) != 1:
+        raise RuntimeError(f"expected one server.log in {shard}, got {server_logs}")
+    server_text = server_logs[0].read_text(errors="replace")
+    state_guided = len(
+        re.findall(r"phase=video[^\n]*guided=True[^\n]*mask_nonzero=[1-9]", server_text)
+    )
+    action_guided = len(
+        re.findall(r"phase=action[^\n]*guided=True[^\n]*mask_nonzero=[1-9]", server_text)
+    )
+    numerical_failures = len(
+        re.findall(r"non-finite|CUDA out of memory|Fatal Python error", server_text)
+    )
+    memory = [
+        tuple(map(float, match))
+        for match in re.findall(
+            r"allocated_mib=([0-9.]+).*peak_allocated_mib=([0-9.]+)",
+            server_text,
+        )
+    ]
     seed_start = seed_blocks[shard.name]
     shard_record = {
         "name": shard.name,
         "seed_start": seed_start,
         "result": str(result_path),
+        "state_guided_records": state_guided,
+        "action_guided_records": action_guided,
+        "numerical_failure_records": numerical_failures,
+        "post_chunk_allocated_mib_min": min(value[0] for value in memory),
+        "post_chunk_allocated_mib_max": max(value[0] for value in memory),
+        "peak_allocated_mib_max": max(value[1] for value in memory),
         **result,
     }
     aggregate["shards"].append(shard_record)
     aggregate["succ_num"] += int(result["succ_num"])
     aggregate["total_num"] += int(result["total_num"])
-    for index, video in enumerate(videos):
+    aggregate["state_guided_records"] += state_guided
+    aggregate["action_guided_records"] += action_guided
+    aggregate["numerical_failure_records"] += numerical_failures
+    for video in videos:
+        index = int(video.name.split("_", 1)[0])
         aggregate["episodes"].append(
             {
                 "seed": seed_start + index,
@@ -93,6 +131,24 @@ for shard in sorted(root.glob("shard*")):
 if aggregate["total_num"] != 20 or len(aggregate["episodes"]) != 20:
     raise RuntimeError(f"incomplete FBFM-20 result: {aggregate}")
 aggregate["succ_rate"] = aggregate["succ_num"] / aggregate["total_num"]
+if sum(item["success"] for item in aggregate["episodes"]) != aggregate["succ_num"]:
+    raise RuntimeError("video outcomes disagree with res.json success counts")
+z = 1.959963984540054
+n = aggregate["total_num"]
+p = aggregate["succ_rate"]
+denominator = 1 + z * z / n
+center = (p + z * z / (2 * n)) / denominator
+half_width = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denominator
+aggregate["wilson_95"] = [center - half_width, center + half_width]
+aggregate["post_chunk_allocated_mib_min"] = min(
+    item["post_chunk_allocated_mib_min"] for item in aggregate["shards"]
+)
+aggregate["post_chunk_allocated_mib_max"] = max(
+    item["post_chunk_allocated_mib_max"] for item in aggregate["shards"]
+)
+aggregate["peak_allocated_mib_max"] = max(
+    item["peak_allocated_mib_max"] for item in aggregate["shards"]
+)
 (root / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
 print(root)
 PY
