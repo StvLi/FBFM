@@ -19,6 +19,8 @@ SNAPSHOT_ATTEMPTS = 5
 LIVE_TOTALS_PATTERN = re.compile(
     r"\|\s*(\d+)/(\d+)\s*\|\s*(\d+)/(\d+)\s*\|\s*(\d+)\s*\|"
 )
+INDEX_START = "<!-- dreamzero-fbfm-causal-full-live:start -->"
+INDEX_END = "<!-- dreamzero-fbfm-causal-full-live:end -->"
 
 
 def _parse_success(value: str) -> bool:
@@ -64,6 +66,80 @@ def _install_snapshot(staging: Path, local_experiments: Path, local_prefix: str)
         temporary.replace(destination)
 
 
+def _update_experiment_index(
+    staging: Path,
+    local_experiments: Path,
+    local_prefix: str,
+    complete: int,
+    total: int,
+    episodes: int,
+    successes: int,
+) -> None:
+    index = local_experiments / "README.md"
+    if not index.is_file():
+        return
+    with (staging / "task_summary.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    target_episodes = sum(int(row["target_trials"]) for row in rows)
+    active = next((row for row in rows if row["status"] == "running"), None)
+    if active is None:
+        active = next((row for row in rows if row["status"] == "pending"), None)
+    if active is None:
+        current = "complete"
+    else:
+        suite = active["suite"]
+        task_id = int(active["task_id"])
+        current = (
+            f"`{suite}/task_{task_id:03d}`: "
+            f"{active['successes']}/{active['trials']} successful episodes"
+        )
+    rate = successes / episodes if episodes else 0.0
+    updated_match = re.search(
+        r"Updated:\s*`([^`]+)`",
+        (staging / "live_status.md").read_text(encoding="utf-8"),
+    )
+    updated = updated_match.group(1) if updated_match else "unknown"
+    live_name = f"{local_prefix}_live_status.md"
+    task_name = f"{local_prefix}_task_summary.csv"
+    trials_name = f"{local_prefix}_trials.csv"
+    block = "\n".join(
+        (
+            INDEX_START,
+            "## Active DreamZero causal-FBFM run",
+            "",
+            "| Item | Live value |",
+            "| --- | --- |",
+            "| Scope | `libero_spatial` + `libero_object`; "
+            f"{total} tasks x 20 trials = {target_episodes} episodes |",
+            f"| Snapshot | `{updated}` |",
+            f"| Progress | {complete}/{total} complete tasks; "
+            f"{episodes}/{target_episodes} episodes |",
+            f"| Success | {successes}/{episodes}; **{rate:.1%} Micro (partial)** |",
+            f"| Current task | {current} |",
+            "| Protocol | causal rolling `FBFM`; pseudo-async overlap; "
+            "uniform 480-step horizon |",
+            f"| Records | [`live`]({live_name}), [`tasks`]({task_name}), "
+            f"[`trials`]({trials_name}) |",
+            "| Interpretation | Running rows are progress indicators; only "
+            "20-trial task rows are final |",
+            INDEX_END,
+        )
+    )
+    content = index.read_text(encoding="utf-8")
+    if INDEX_START in content and INDEX_END in content:
+        before, remainder = content.split(INDEX_START, 1)
+        _, after = remainder.split(INDEX_END, 1)
+        updated_content = before + block + after
+    else:
+        anchor = "## Main experiment matrix"
+        if anchor not in content:
+            raise ValueError("experiment README is missing the main matrix anchor")
+        updated_content = content.replace(anchor, f"{block}\n\n{anchor}", 1)
+    temporary = index.with_name(f".{index.name}.dreamzero.tmp")
+    temporary.write_text(updated_content, encoding="utf-8")
+    temporary.replace(index)
+
+
 def synchronize(
     host: str,
     remote_output: Path,
@@ -94,6 +170,15 @@ def synchronize(
                     raise
                 time.sleep(1)
         _install_snapshot(staging, local_experiments, local_prefix)
+        _update_experiment_index(
+            staging,
+            local_experiments,
+            local_prefix,
+            complete,
+            total,
+            episodes,
+            successes,
+        )
 
     history = local_experiments / f"{local_prefix}_poll_history.csv"
     write_header = not history.exists()
