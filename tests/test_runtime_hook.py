@@ -58,7 +58,7 @@ def _feedback(offset: int) -> FeedbackObservation:
     )
 
 
-def test_feedback_encoder_prepends_causal_anchor():
+def test_feedback_encoder_uses_only_causal_rolling_history():
     encoder = object.__new__(DreamZeroFeedbackEncoder)
     encoder.observations_per_latent = 4
     encoder.actions_per_latent = 8
@@ -82,13 +82,13 @@ def test_feedback_encoder_prepends_causal_anchor():
     assert [output.slot for output in outputs] == [0] * 8
     assert [output.complete for output in outputs] == [False] * 7 + [True]
     expected_windows = [
-        [0, 1, 1, 1, 1],
-        [0, 2, 2, 2, 2],
-        [0, 2, 3, 3, 3],
-        [0, 2, 4, 4, 4],
-        [0, 2, 4, 5, 5],
-        [0, 2, 4, 6, 6],
-        [0, 2, 4, 6, 7],
+        [0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 2],
+        [0, 0, 0, 1, 3],
+        [0, 0, 0, 2, 4],
+        [0, 0, 1, 3, 5],
+        [0, 0, 2, 4, 6],
+        [0, 1, 3, 5, 7],
         [0, 2, 4, 6, 8],
     ]
     assert [window.reshape(-1).tolist() for window in windows] == expected_windows
@@ -111,7 +111,7 @@ def test_feedback_encoder_refreshes_second_latent_slot():
         outputs.extend(encoder.add(_feedback(offset)))
 
     assert [output.slot for output in outputs] == [0] * 8 + [1] * 8
-    assert outputs[8].source_offsets == (8, 9, 9, 9, 9)
+    assert outputs[8].source_offsets == (8, 8, 8, 8, 9)
     assert outputs[-1].source_offsets == (8, 10, 12, 14, 16)
 
 

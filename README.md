@@ -31,7 +31,8 @@ time using measured latency. It adds:
 | native DiT evaluations | 8 |
 | causal model input | 1-frame warm-up, then latest 4 inference anchors |
 | grants per simulator step | 1 |
-| feedback sample stride | 2 observations |
+| feedback cadence | every executed action |
+| rolling VAE sample interval | 2 action steps |
 | observations per latent | 4 |
 | active state slots per wave | first of 2 predicted latent slots |
 | state modality weight | `1.0` (binary observed-slot mask) |
@@ -153,10 +154,12 @@ suite. This intentionally caps LIBERO-10 below RLinf's 520-step reference so
 all suites share one limit; the manifest records this choice. The default
 `uniform` pseudo-clock executes one committed overlap action, refreshes the
 aligned latent target from the newest causal observation window, and then
-releases one native DreamZero DiT evaluation. Incomplete four-frame VAE blocks
-are completed by holding the latest real observation forward; the target is
-re-encoded and versioned after every action, and equals the native complete
-block encoding at the final sample. This protocol is for deterministic
+releases one native DreamZero DiT evaluation. The rolling VAE window ends at
+the newest real observation and uses older real observations at two-action
+intervals; only missing history at a slot boundary is left-padded with its
+measured anchor. The target is re-encoded and versioned after every action and
+equals the complete anchor-plus-four-observation encoding at the final sample.
+This protocol is for deterministic
 pseudo-asynchronous method evaluation, not wall-clock latency.
 
 The four-frame model-input history is separate from rolling feedback. Only

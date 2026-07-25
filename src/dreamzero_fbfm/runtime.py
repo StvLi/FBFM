@@ -45,10 +45,10 @@ class DreamZeroFeedbackEncoder:
     """Refresh native DreamZero latents after every executed action.
 
     DreamZero's causal VAE emits one future latent for four input video frames.
-    During an incomplete four-frame block, the latest real observation is held
-    forward into the not-yet-observed sample positions. This gives a causal
-    provisional target after every action and becomes exactly the native
-    anchor-plus-four-frame encoding when the block is complete.
+    A partially observed block is encoded from a rolling window ending at the
+    newest real observation. Missing history at the left boundary is filled by
+    the real launch anchor. This keeps every hard target causal: no unobserved
+    future coordinate is synthesized and marked as measured.
     """
 
     def __init__(self, policy: Any, *, observations_per_latent: int = 4) -> None:
@@ -71,8 +71,7 @@ class DreamZeroFeedbackEncoder:
     def reset(self) -> None:
         self._slot_anchor: Tensor | None = None
         self._slot_anchor_offset = 0
-        self._sampled_frames: list[Tensor] = []
-        self._sampled_offsets: list[int] = []
+        self._slot_frames: dict[int, Tensor] = {}
         self._last_frame: Tensor | None = None
         self._last_offset = 0
         self._active_slot = 0
@@ -83,6 +82,7 @@ class DreamZeroFeedbackEncoder:
             raise ValueError("feedback anchor must have action_offset=0")
         self._slot_anchor = self._transform_frame(feedback)
         self._last_frame = self._slot_anchor
+        self._slot_frames = {0: self._slot_anchor}
 
     def add(self, feedback: FeedbackObservation) -> list[EncodedFeedback]:
         if self._slot_anchor is None:
@@ -102,29 +102,28 @@ class DreamZeroFeedbackEncoder:
             self._active_slot = slot
             self._slot_anchor = self._last_frame
             self._slot_anchor_offset = self._last_offset
-            self._sampled_frames = []
-            self._sampled_offsets = []
+            self._slot_frames = {self._slot_anchor_offset: self._slot_anchor}
 
         frame = self._transform_frame(feedback)
         self._last_frame = frame
         self._last_offset = feedback.action_offset
+        self._slot_frames[feedback.action_offset] = frame
         position = (feedback.action_offset - 1) % self.actions_per_latent + 1
-        if position % self.observation_interval == 0:
-            self._sampled_frames.append(frame)
-            self._sampled_offsets.append(feedback.action_offset)
-
-        missing = self.observations_per_latent - len(self._sampled_frames)
-        if missing < 0:
-            raise RuntimeError("feedback encoder collected too many samples for one latent")
-        future_frames = [*self._sampled_frames, *([frame] * missing)]
-        future_offsets = [*self._sampled_offsets, *([feedback.action_offset] * missing)]
-        images = torch.cat([self._slot_anchor, *future_frames], dim=1)
+        source_offsets = tuple(
+            max(
+                self._slot_anchor_offset,
+                feedback.action_offset - lag * self.observation_interval,
+            )
+            for lag in range(self.observations_per_latent, -1, -1)
+        )
+        source_frames = [self._slot_frames[offset] for offset in source_offsets]
+        images = torch.cat(source_frames, dim=1)
         return [
             EncodedFeedback(
                 slot=slot,
                 latent=self._encode(images),
                 action_offset=feedback.action_offset,
-                source_offsets=(self._slot_anchor_offset, *future_offsets),
+                source_offsets=source_offsets,
                 complete=position == self.actions_per_latent,
             )
         ]

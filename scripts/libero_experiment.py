@@ -228,7 +228,7 @@ def main() -> None:
                         1 if args.rollout_protocol == "pseudo_async_overlap" else None
                     ),
                     "feedback_encoding": (
-                        "causal_rolling_hold"
+                        "causal_rolling_past"
                         if args.rollout_protocol == "pseudo_async_overlap"
                         else None
                     ),

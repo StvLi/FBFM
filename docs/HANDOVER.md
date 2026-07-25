@@ -51,10 +51,10 @@ are therefore retained. The integration preserves these upstream contracts:
 
 The action block constrains the committed `8 x 7 = 56` physical coordinates.
 The visual block constrains one `48 x 10 x 20 = 9600` latent slot. After every
-action, the current-wave anchor and the causal observations available so far are
-completed to a five-frame VAE window by holding the latest observation forward.
-The source window progresses from `[0,1,1,1,1]` to `[0,2,4,6,8]`; the latter is
-exactly the native complete block. The slot is re-encoded, refreshed and
+action, the newest real observation closes a five-frame causal rolling VAE window.
+Missing history is left-padded with the measured current-wave anchor; no
+unobserved future frame is copied into a hard target. The source window progresses
+from `[0,0,0,0,1]` to `[0,2,4,6,8]`; the latter is the complete block. The slot is re-encoded, refreshed and
 versioned before each of the eight DiT evaluations. Its default mask weight is
 now binary (`1.0`), matching the paper and LingBot-VA. Fractional weights are
 explicit ablations. See `docs/IMPLEMENTATION.md` for the solver equations and

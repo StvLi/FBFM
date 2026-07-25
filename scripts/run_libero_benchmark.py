@@ -94,7 +94,7 @@ def main() -> None:
         "model_seed_rule": args.model_seed_rule,
         "solver_release_policy": args.solver_release_policy,
         "feedback_observation_stride": 1,
-        "feedback_encoding": "causal_rolling_hold",
+        "feedback_encoding": "causal_rolling_past",
         "state_weight": args.state_weight,
         "code_commit": args.code_commit,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),

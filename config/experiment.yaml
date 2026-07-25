@@ -22,6 +22,6 @@ protocol:
   model_seed_rule: fixed
   feedback_observation_stride: 1
   feedback_observations_per_latent: 4
-  feedback_encoding: causal_rolling_hold
+  feedback_encoding: causal_rolling_past
   state_weight: 1.0
   max_guidance_weight: 10.0
