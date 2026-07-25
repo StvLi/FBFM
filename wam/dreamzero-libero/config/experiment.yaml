@@ -23,5 +23,5 @@ protocol:
   feedback_observation_stride: 1
   feedback_observations_per_latent: 4
   feedback_encoding: causal_rolling_hold
-  state_weight: 0.005833333333333334
+  state_weight: 1.0
   max_guidance_weight: 10.0

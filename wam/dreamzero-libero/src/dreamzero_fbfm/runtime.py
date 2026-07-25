@@ -190,7 +190,7 @@ class DreamZeroFBFMRuntime:
         delay: int = 8,
         execution_horizon: int = 8,
         solver_evaluations: int | None = None,
-        state_weight: float = 56 / 9600,
+        state_weight: float = 1.0,
         beta: float = 10.0,
         audit_path: str | None = None,
     ) -> None:

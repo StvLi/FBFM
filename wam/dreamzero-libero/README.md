@@ -34,13 +34,16 @@ time using measured latency. It adds:
 | feedback sample stride | 2 observations |
 | observations per latent | 4 |
 | active state slots per wave | first of 2 predicted latent slots |
-| state modality weight | `56/9600` (active action/state coordinate balance) |
+| state modality weight | `1.0` (binary observed-slot mask) |
 | guidance clip `beta` | 10 |
 
 `NONE`, `RTC`, and `FBFM` use the same model, native 8-DiT cache schedule, rollout,
 noise seeds and pseudo-clock. Only masks differ: `NONE` uses zero masks, `RTC`
 uses the normalized 7-channel action prefix, and `FBFM` adds observed latent
-state slots.
+state slots. The default state mask is binary, matching the paper and the
+LingBot-VA implementation. `--state-weight` remains available for explicitly
+labelled confidence-weight ablations; values below `1.0` are not the default
+FBFM protocol.
 
 ## External dependencies
 
@@ -86,7 +89,7 @@ $BASE/envs/miniconda3/envs/dreamzero/bin/python $REPO/scripts/model_server.py \
   --base-workspace $BASE \
   --checkpoint $BASE/checkpoints/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000 \
   --tokenizer $BASE/assets/tokenizers/umt5-xxl \
-  --mode FBFM --port 18766 \
+  --mode FBFM --state-weight 1.0 --port 18766 \
   --audit $REPO/results/smoke_fbfm/solver.jsonl \
   --ready-file $REPO/results/smoke_fbfm/ready.json
 ```
@@ -99,7 +102,8 @@ REPO=$FBFM_ROOT/wam/dreamzero-libero
 BASE=${DREAMZERO_BASE_WORKSPACE:-/home/deepcybo-lite/fbfm_ws}
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/libero_experiment.py \
-  --base-workspace $BASE --mode FBFM --suite libero_spatial --task-id 0 \
+  --base-workspace $BASE --mode FBFM --state-weight 1.0 \
+  --suite libero_spatial --task-id 0 \
   --trial-start 0 --trials 1 --max-steps 480 --port 18766 \
   --model-seed-rule fixed --solver-release-policy uniform \
   --output $REPO/results/smoke_fbfm
@@ -131,7 +135,8 @@ server reports ready:
 CODE_COMMIT=$(git -C "$FBFM_ROOT" rev-parse --short HEAD)
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/run_libero_benchmark.py \
-  --base-workspace $BASE --mode FBFM --trials 20 --max-steps 480 \
+  --base-workspace $BASE --mode FBFM --state-weight 1.0 \
+  --trials 20 --max-steps 480 \
   --model-seed-rule fixed --solver-release-policy uniform \
   --code-commit "$CODE_COMMIT" --port 18766 \
   --output $REPO/results/libero_all_fbfm_20_$CODE_COMMIT

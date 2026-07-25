@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--beta", type=float, default=10.0)
-    parser.add_argument("--state-weight", type=float, default=56 / 9600)
+    parser.add_argument("--state-weight", type=float, default=1.0)
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)
     args = parser.parse_args()

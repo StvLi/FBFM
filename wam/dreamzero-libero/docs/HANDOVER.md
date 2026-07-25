@@ -1,13 +1,13 @@
 # DreamZero x FBFM x LIBERO handover
 
-Updated: 2026-07-25
+Updated: 2026-07-26
 
 ## Repositories and revisions
 
 | Item | Location / revision |
 | --- | --- |
 | Canonical monorepo route | `/home/oem/tmp_ws/FBFM/wam/dreamzero-libero` |
-| Monorepo branch | `fix/dreamzero-rolling-feedback` |
+| Monorepo branch | `fix/dreamzero-binary-state-mask` |
 | Imported standalone repository | `/home/oem/tmp_ws/DreamZero-FBFM-LIBERO` |
 | A6000 integration repository | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO` |
 | Imported standalone branch | `runnable-dreamzero-fbfm-libero` |
@@ -55,8 +55,10 @@ action, the current-wave anchor and the causal observations available so far are
 completed to a five-frame VAE window by holding the latest observation forward.
 The source window progresses from `[0,1,1,1,1]` to `[0,2,4,6,8]`; the latter is
 exactly the native complete block. The slot is re-encoded, refreshed and
-versioned before each of the eight DiT evaluations. Its fixed default weight is
-`56/9600`. See `docs/IMPLEMENTATION.md` for the solver equations and hook boundary.
+versioned before each of the eight DiT evaluations. Its default mask weight is
+now binary (`1.0`), matching the paper and LingBot-VA. Fractional weights are
+explicit ablations. See `docs/IMPLEMENTATION.md` for the solver equations and
+hook boundary.
 
 ## Experiment state
 
@@ -85,7 +87,9 @@ after action 8; its data are diagnostic only.
 The rolling pilot is complete at 9/20 successes (45.0%, 95% Wilson interval
 25.8%-65.8%). The matched delayed-feedback diagnostic achieved 8/20, while the
 historical base task-0 run achieved 19/20. Rolling feedback is implemented and
-working, but does not by itself explain or recover the performance gap.
+working, but does not by itself explain or recover the performance gap. These
+historical runs used the legacy `56/9600` state weight and must not be combined
+with binary-mask results under one protocol label.
 
 ## Table management
 
