@@ -9,10 +9,21 @@ from torch import Tensor
 
 
 @dataclass(frozen=True)
+class EndpointLinearization:
+    """Autograd graph for one DiT clean-endpoint Jacobian."""
+
+    video_sample: Tensor
+    action_sample: Tensor
+    video_endpoint: Tensor
+    action_endpoint: Tensor
+
+
+@dataclass(frozen=True)
 class GuidanceResult:
     video_velocity: Tensor
     action_velocity: Tensor
     diagnostics: dict[str, float | int | bool]
+    linearization: EndpointLinearization | None = None
 
 
 def guidance_weight(sigma: Tensor | float, beta: float) -> Tensor:
@@ -37,8 +48,15 @@ def joint_fbfm_guidance(
     sigma: Tensor | float,
     beta: float = 10.0,
     decompose_vjp: bool = False,
+    linearization: EndpointLinearization | None = None,
+    cache_linearization: bool = False,
 ) -> GuidanceResult:
-    """Apply one joint state-action endpoint VJP and detach the solver output."""
+    """Apply guidance with a fresh or cached clean-endpoint Jacobian.
+
+    When ``linearization`` is supplied, the residual is recomputed from the
+    current sample, velocity, sigma, target, and mask. Only the VJP Jacobian is
+    reused from the earlier DiT evaluation.
+    """
     if beta <= 0:
         raise ValueError("beta must be positive")
     if video_sample.shape != video_velocity.shape or action_sample.shape != action_velocity.shape:
@@ -64,26 +82,49 @@ def joint_fbfm_guidance(
             },
         )
 
-    sigma_value = torch.as_tensor(sigma, device=video_sample.device, dtype=video_sample.dtype)
+    sigma_value = torch.as_tensor(
+        sigma, device=video_sample.device, dtype=video_sample.dtype
+    )
     video_endpoint = video_sample - sigma_value * video_velocity
     action_endpoint = action_sample - sigma_value * action_velocity
     state_error = (video_target - video_endpoint) * video_mask
     action_error = (action_target - action_endpoint) * action_mask
+    if linearization is None:
+        active_linearization = EndpointLinearization(
+            video_sample=video_sample,
+            action_sample=action_sample,
+            video_endpoint=video_endpoint,
+            action_endpoint=action_endpoint,
+        )
+    else:
+        if (
+            linearization.video_sample.shape != video_sample.shape
+            or linearization.action_sample.shape != action_sample.shape
+        ):
+            raise ValueError("cached endpoint linearization shape mismatch")
+        active_linearization = linearization
+    keep_graph = cache_linearization or linearization is not None
     component_diagnostics: dict[str, float] = {}
     if decompose_vjp:
         state_corrections = torch.autograd.grad(
-            outputs=video_endpoint,
-            inputs=(video_sample, action_sample),
+            outputs=active_linearization.video_endpoint,
+            inputs=(
+                active_linearization.video_sample,
+                active_linearization.action_sample,
+            ),
             grad_outputs=state_error.detach(),
             retain_graph=True,
             create_graph=False,
             allow_unused=True,
         )
         action_corrections = torch.autograd.grad(
-            outputs=action_endpoint,
-            inputs=(video_sample, action_sample),
+            outputs=active_linearization.action_endpoint,
+            inputs=(
+                active_linearization.video_sample,
+                active_linearization.action_sample,
+            ),
             grad_outputs=action_error.detach(),
-            retain_graph=False,
+            retain_graph=keep_graph,
             create_graph=False,
             allow_unused=True,
         )
@@ -125,10 +166,16 @@ def joint_fbfm_guidance(
         }
     else:
         video_correction, action_correction = torch.autograd.grad(
-            outputs=(video_endpoint, action_endpoint),
-            inputs=(video_sample, action_sample),
+            outputs=(
+                active_linearization.video_endpoint,
+                active_linearization.action_endpoint,
+            ),
+            inputs=(
+                active_linearization.video_sample,
+                active_linearization.action_sample,
+            ),
             grad_outputs=(state_error.detach(), action_error.detach()),
-            retain_graph=False,
+            retain_graph=keep_graph,
             create_graph=False,
             allow_unused=False,
         )
@@ -166,6 +213,8 @@ def joint_fbfm_guidance(
             "action_correction_norm": float(action_correction.detach().float().norm().item()),
             "guidance_weight": float(weight.item()),
             "vjp_decomposed": decompose_vjp,
+            "jacobian_reused": linearization is not None,
             **component_diagnostics,
         },
+        active_linearization if keep_graph else None,
     )

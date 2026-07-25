@@ -1,0 +1,57 @@
+diff --git a/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py b/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+--- a/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
++++ b/groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py
+@@ -205,6 +205,9 @@ class WANPolicyHead(ActionHead):
+         
+         self._device = "cuda"
+         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
++        # Optional inference adapters may guide individual scheduler updates
++        # without replacing the native velocities stored in prev_predictions.
++        self.supports_external_step_guidance = True
+ 
+ 
+         num_dit_steps = 8
+@@ -1284,11 +1287,25 @@ class WANPolicyHead(ActionHead):
+                 assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
+                 _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
+ 
++            step_flow_pred = flow_pred
++            step_flow_pred_action = flow_pred_cond_action
++            external_step_guidance = getattr(self, "external_step_guidance", None)
++            if external_step_guidance is not None:
++                step_flow_pred, step_flow_pred_action = external_step_guidance(
++                    scheduler_index=index,
++                    model_evaluated=should_run_model,
++                    video_sample=noisy_input.transpose(1, 2),
++                    action_sample=noisy_input_action,
++                    video_velocity=flow_pred,
++                    action_velocity=flow_pred_cond_action,
++                    timestep_action=timestep_action,
++                )
++
+             end_diffusion_events[index].record()
+ 
+             # Video: denoising step (uses rescaled schedule if decoupled)
+             noisy_input = sample_scheduler.step(
+-                model_output=flow_pred.transpose(1, 2),
++                model_output=step_flow_pred.transpose(1, 2),
+                 timestep=video_timestep,
+                 sample=noisy_input,
+                 step_index=index,
+@@ -1297,12 +1314,15 @@ class WANPolicyHead(ActionHead):
+             
+             # Action: always fully denoises with standard schedule (1000->0)
+             noisy_input_action = sample_scheduler_action.step(
+-                model_output=flow_pred_cond_action,
++                model_output=step_flow_pred_action,
+                 timestep=action_timestep,
+                 sample=noisy_input_action,
+                 step_index=index,
+                 return_dict=False,
+             )[0]
++            external_step_complete = getattr(self, "external_step_complete", None)
++            if external_step_complete is not None:
++                external_step_complete(scheduler_index=index)
+ 
+         latents = noisy_input
+         latents_action = noisy_input_action

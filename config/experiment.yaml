@@ -21,6 +21,7 @@ protocol:
   solver_grants_per_environment_step: [1, 1, 1, 1, 1, 1, 1, 1]
   model_seed_rule: fixed
   feedback_observation_stride: 1
+  feedback_vae_sample_interval: 3
   feedback_observations_per_latent: 4
   feedback_encoding: causal_rolling_past
   state_weight: 1.0

@@ -3,32 +3,34 @@
 ## Mathematical mapping
 
 DreamZero transports predicted video latents `Z` and a 16x32 padded action tensor
-`A` in one DiT call. At solver evaluation `k`, the runtime reconstructs
+`A` in one DiT call. Let native DiT evaluation `k` produce base velocity `v_k`
+and endpoint Jacobian `J_k`. At each UniPC scheduler index `j` served by that
+cached DiT result, the runtime reconstructs
 
-`Z1 = Z_sigma - sigma * v_Z` and `A1 = A_sigma - sigma * v_A`.
+`Xhat_j = X_j - sigma_j * v_k` and `e_j = W * (Y_j - Xhat_j)`.
 
-It builds the masked discrepancy from native-latent visual targets and normalized
-action targets, then evaluates one joint VJP with respect to both noisy inputs.
-The returned gradients retain the cross-modal Jacobian blocks. Since DreamZero's
-solver runs from decreasing `sigma` rather than increasing paper time `tau`, the
-guided model outputs are `v - lambda * g`. The unmodified UniPC schedulers consume
-those outputs. Every returned tensor is detached before the next step.
+It then evaluates `g_j = J_k^T e_j`. The DiT velocity and Jacobian are refreshed
+only at the next native evaluation, but `Xhat_j`, `e_j`, the guidance schedule,
+and guided velocity `v_k - lambda(sigma_j) * g_j` are recomputed at every UniPC
+index. The joint VJP retains the state-to-action and action-to-state Jacobian
+blocks. Since DreamZero runs from decreasing `sigma` rather than increasing
+paper time `tau`, the correction has the minus sign shown above.
 
 ## DreamZero hook boundary
 
 The runtime wraps one loaded `WANPolicyHead` instance at
 `_run_diffusion_steps`. Cache-writing calls pass through under `no_grad`. Joint
 denoising calls wait for a pseudo-clock grant, encode newly queued feedback, take a
-versioned constraint snapshot, run the original conditional/unconditional DiT,
-and apply the joint endpoint VJP. Equal guided conditional/unconditional video
-outputs make the upstream CFG expression an identity without changing its code.
-The conditional action output remains DreamZero's native action flow.
+versioned constraint snapshot, and run the original conditional/unconditional
+DiT. A small callback at the scheduler boundary applies guidance only to the
+current update. `prev_predictions` therefore stores the detached native DiT
+velocity rather than a guided velocity.
 
 All modes preserve the checkpoint's native 16-step UniPC schedule and 8-evaluation
-`dit_step_mask`. A newly arrived constraint is consumed at the next native DiT
-evaluation; skipped scheduler steps reuse the most recent (possibly guided) velocity
-exactly as in upstream DreamZero. This is required for `NONE` to preserve the
-released policy's numerical trajectory.
+`dit_step_mask`. A newly arrived constraint is consumed at the next scheduler
+update. At skipped DiT indices, only the last endpoint Jacobian and native
+velocity are reused; the residual is always current. `NONE` returns the native
+velocity unchanged and preserves the released policy's numerical trajectory.
 
 ## Temporal alignment
 
@@ -39,15 +41,14 @@ coordinates; only the first 8x7 coordinates are masked. The generated prefix is
 therefore aligned to actions executed during the virtual delay, and slots 8:16 are
 the next executable suffix.
 
-One native DiT evaluation is completed after each simulated action. Every action
+One native DiT cache block is completed after each simulated action. Every action
 produces a feedback observation. DreamZero's frozen causal WAN VAE maps an anchor
-plus four sampled frames to one future latent, while one predicted latent spans
-eight actions. At intermediate actions, the latest real observation is held into
-the not-yet-observed sample positions and the five-frame causal window is
-re-encoded. The first predicted latent slot is therefore refreshed eight times;
-at offsets 2, 4, 6 and 8 another real sample replaces the held value, and the
-offset-8 target exactly equals the complete anchor-plus-four-frame encoding. The
-second slot remains governed by the pretrained prior. A state target never enters
+plus four training-stride frames to one future latent; LIBERO SFT sampled those
+frames three environment steps apart. The encoder keeps all observations in
+causal order but refreshes its hard target only at offsets 3, 6, 9, and 12. Its
+windows progress as `[0,0,0,0,3]`, `[0,0,0,3,6]`,
+`[0,0,3,6,9]`, and `[0,3,6,9,12]`. With the eight-action overlap used here, the
+first two refreshes can occur in one generation wave. A state target never enters
 solver-start history in that same generation.
 
 The active action overlap contains `8x7=56` physical coordinates, whereas one
@@ -69,8 +70,9 @@ to the action block and is not the default joint-VJP protocol. Fractional
 
 ## Audit contract
 
-Each numerical solver record contains mode, solver index, sigma, feedback count,
-constraint version, state/action mask populations, endpoint-error norms, both VJP
-correction norms, guidance weight and allocated CUDA bytes. Exceptions are written
-as server error records. Episode records include task/init/seed, success, executed
-steps, wave count, timing and the full deterministic grant schedule.
+Each native `solver_step` record contains mode, DiT index, sigma, feedback count,
+constraint version, mask populations, endpoint errors, VJP norms, guidance weight,
+and allocated CUDA bytes. Each `scheduler_guidance_step` additionally records its
+UniPC index and whether the Jacobian was refreshed or reused. Exceptions are
+written as server error records. Episode records include task/init/seed, success,
+executed steps, wave count, timing and the deterministic grant schedule.

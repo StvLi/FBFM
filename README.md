@@ -10,8 +10,9 @@ This repository is an integration layer. It does not fork or retrain DreamZero,
 change its checkpoint, replace UniPC, alter LIBERO actions, or redefine model
 time using measured latency. It adds:
 
-- one block-diagonal state/action constraint at each joint solver evaluation;
-- endpoint VJP guidance with the paper's clipped few-step schedule;
+- one block-diagonal state/action constraint at each UniPC scheduler update;
+- endpoint VJP guidance with the paper's clipped few-step schedule, refreshing
+  the Jacobian only when DreamZero evaluates its DiT;
 - native DreamZero VAE encoding for per-action rolling visual feedback;
 - native DreamZero causal inference history: one-frame warm-up followed by
   four-frame inference-anchor requests with continuous KV-cache positions;
@@ -32,7 +33,7 @@ time using measured latency. It adds:
 | causal model input | 1-frame warm-up, then latest 4 inference anchors |
 | grants per simulator step | 1 |
 | feedback cadence | every executed action |
-| rolling VAE sample interval | 2 action steps |
+| rolling VAE sample interval | 3 action steps (checkpoint training stride) |
 | observations per latent | 4 |
 | active state slots per wave | first of 2 predicted latent slots |
 | state modality weight | `1.0` (binary observed-slot mask) |
@@ -45,6 +46,13 @@ state slots. The default state mask is binary, matching the paper and the
 LingBot-VA implementation. `--state-weight` remains available for explicitly
 labelled confidence-weight ablations; values below `1.0` are not the default
 FBFM protocol.
+
+DreamZero reuses each native DiT prediction across one or more UniPC updates.
+The integration deliberately keeps the cached prediction unguided. For every
+skipped DiT update it reconstructs the clean endpoint from the current solver
+sample and sigma, recomputes the masked residual, and applies a new VJP using
+the most recent DiT Jacobian. This prevents one old guided velocity from being
+integrated repeatedly at indices such as `2,3,4,5`.
 
 ## External dependencies
 
@@ -61,6 +69,17 @@ or checkpoints. A deployment base workspace must provide:
 | UMT5 tokenizer | `assets/tokenizers/umt5-xxl` |
 
 The model and simulator environments are intentionally separate.
+
+The DreamZero source needs the small scheduler-callback patch before launching
+the server:
+
+```bash
+git -C "$BASE/dreamzero" apply \
+  "$REPO/patches/dreamzero_external_step_guidance.patch"
+```
+
+The patch does not modify the DiT cache mask or either UniPC scheduler. It only
+exposes the current scheduler sample and native cached velocity to this runtime.
 
 ## Source ownership
 
@@ -152,14 +171,11 @@ after every task.
 The comparison protocol uses a uniform 480-step episode horizon for every
 suite. This intentionally caps LIBERO-10 below RLinf's 520-step reference so
 all suites share one limit; the manifest records this choice. The default
-`uniform` pseudo-clock executes one committed overlap action, refreshes the
-aligned latent target from the newest causal observation window, and then
-releases one native DreamZero DiT evaluation. The rolling VAE window ends at
-the newest real observation and uses older real observations at two-action
-intervals; only missing history at a slot boundary is left-padded with its
-measured anchor. The target is re-encoded and versioned after every action and
-equals the complete anchor-plus-four-observation encoding at the final sample.
-This protocol is for deterministic
+`uniform` pseudo-clock executes one committed overlap action and then releases
+one native DreamZero DiT evaluation. Every real observation is retained, while
+the rolling VAE target is refreshed at the checkpoint's three-action sampling
+stride. Missing history at a slot boundary is left-padded with its measured
+anchor; no unobserved future frame is inserted. This protocol is for deterministic
 pseudo-asynchronous method evaluation, not wall-clock latency.
 
 The four-frame model-input history is separate from rolling feedback. Only

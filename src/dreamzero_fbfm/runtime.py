@@ -1,4 +1,4 @@
-"""Runtime hook that inserts joint FBFM at DreamZero DiT evaluations."""
+"""Runtime hook that applies joint FBFM at every DreamZero UniPC update."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from torch import Tensor
 
 from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ChunkConstraints, ConstraintMode
-from .guidance import joint_fbfm_guidance
+from .guidance import EndpointLinearization, GuidanceResult, joint_fbfm_guidance
 from .pseudo_clock import SolverClock
 
 
@@ -39,6 +39,17 @@ class EncodedFeedback:
     action_offset: int
     source_offsets: tuple[int, ...]
     complete: bool
+
+
+@dataclass(frozen=True)
+class PendingStepGuidance:
+    dit_step: int
+    result: GuidanceResult | None
+    sigma: float | None
+    context_version: int
+    feedback_drained: int
+    feedback_updates: tuple[EncodedFeedback, ...]
+    diagnostics: dict[str, float | int | bool]
 
 
 class DreamZeroFeedbackEncoder:
@@ -246,12 +257,23 @@ class DreamZeroFBFMRuntime:
         self._action_targets: Tensor | None = None
         self._action_mask: Tensor | None = None
         self._step = 0
+        self._linearization: EndpointLinearization | None = None
+        self._pending_guidance: PendingStepGuidance | None = None
+        self._latest_dit_step = -1
         self._lock = threading.RLock()
+        if not getattr(self.head, "supports_external_step_guidance", False):
+            raise RuntimeError(
+                "DreamZero is missing the external per-UniPC guidance callback patch"
+            )
         self._install_hook()
+        self.head.external_step_guidance = self._scheduler_guidance
+        self.head.external_step_complete = self._scheduler_step_complete
 
     def _solver_sigma(self, kwargs: dict[str, Any]) -> float:
         """Read the action sigma used by the active native scheduler step."""
-        timestep = kwargs.get("timestep_action")
+        return self._sigma_from_timestep(kwargs.get("timestep_action"))
+
+    def _sigma_from_timestep(self, timestep: Any) -> float:
         if not isinstance(timestep, Tensor) or timestep.numel() == 0:
             raise ValueError("DreamZero solver call is missing timestep_action")
         flat = timestep.detach().float().reshape(-1)
@@ -276,6 +298,9 @@ class DreamZeroFBFMRuntime:
             if first_parameter is not None and first_parameter.is_cuda:
                 torch.cuda.reset_peak_memory_stats(first_parameter.device)
             self._step = 0
+            self._linearization = None
+            self._pending_guidance = None
+            self._latest_dit_step = -1
             self._constraints = None
             self.feedback_encoder.reset()
             if pseudo_async:
@@ -349,6 +374,141 @@ class DreamZeroFBFMRuntime:
                     updates.append(update)
         return drained, updates
 
+    @staticmethod
+    def _unguided_diagnostics() -> dict[str, float | int | bool]:
+        return {
+            "guided": False,
+            "state_mask_nonzero": 0,
+            "action_mask_nonzero": 0,
+            "state_error_norm": 0.0,
+            "action_error_norm": 0.0,
+            "video_correction_norm": 0.0,
+            "action_correction_norm": 0.0,
+            "guidance_weight": 0.0,
+            "jacobian_reused": False,
+        }
+
+    def _constraint_snapshot(
+        self, constraints: ChunkConstraints
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        int,
+        int,
+        list[EncodedFeedback],
+    ]:
+        drained, feedback_updates = self._drain_feedback(constraints)
+        state_target, state_mask, action_target, action_mask, version = (
+            constraints.snapshot()
+        )
+        state_mask.mul_(self.state_weight)
+        return (
+            state_target,
+            state_mask,
+            action_target,
+            action_mask,
+            version,
+            drained,
+            feedback_updates,
+        )
+
+    def _scheduler_guidance(
+        self,
+        *,
+        scheduler_index: int,
+        model_evaluated: bool,
+        video_sample: Tensor,
+        action_sample: Tensor,
+        video_velocity: Tensor,
+        action_velocity: Tensor,
+        timestep_action: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if not 0 <= scheduler_index < self.scheduler_steps:
+            raise ValueError(f"invalid UniPC scheduler index {scheduler_index}")
+        if model_evaluated:
+            pending = self._pending_guidance
+            if pending is None or pending.dit_step != self._latest_dit_step:
+                raise RuntimeError("DiT guidance was not staged for its UniPC update")
+            self._pending_guidance = None
+        else:
+            constraints = self._ensure_constraints(video_sample, action_sample)
+            (
+                state_target,
+                state_mask,
+                action_target,
+                action_mask,
+                version,
+                drained,
+                feedback_updates,
+            ) = self._constraint_snapshot(constraints)
+            has_guidance = bool(
+                torch.any(state_mask).item() or torch.any(action_mask).item()
+            )
+            sigma = self._sigma_from_timestep(timestep_action) if has_guidance else None
+            if has_guidance:
+                if self._linearization is None:
+                    raise RuntimeError("skipped UniPC guidance has no cached DiT Jacobian")
+                with torch.enable_grad():
+                    result = joint_fbfm_guidance(
+                        video_sample=video_sample,
+                        action_sample=action_sample,
+                        video_velocity=video_velocity,
+                        action_velocity=action_velocity,
+                        video_target=state_target,
+                        video_mask=state_mask,
+                        action_target=action_target,
+                        action_mask=action_mask,
+                        sigma=sigma,
+                        beta=self.beta,
+                        decompose_vjp=self.diagnostic_vjp,
+                        linearization=self._linearization,
+                    )
+                diagnostics = result.diagnostics
+            else:
+                result = None
+                diagnostics = self._unguided_diagnostics()
+            pending = PendingStepGuidance(
+                dit_step=self._latest_dit_step,
+                result=result,
+                sigma=sigma,
+                context_version=version,
+                feedback_drained=drained,
+                feedback_updates=tuple(feedback_updates),
+                diagnostics=diagnostics,
+            )
+
+        updates = pending.feedback_updates
+        self.audit.write(
+            "scheduler_guidance_step",
+            mode=self.mode.value,
+            scheduler_index=scheduler_index,
+            dit_step=pending.dit_step,
+            model_evaluated=model_evaluated,
+            sigma=pending.sigma,
+            context_version=pending.context_version,
+            feedback_drained=pending.feedback_drained,
+            state_target_updates=len(updates),
+            feedback_action_offsets=[update.action_offset for update in updates],
+            feedback_state_slots=[update.slot for update in updates],
+            feedback_source_offsets=[list(update.source_offsets) for update in updates],
+            feedback_blocks_complete=[update.complete for update in updates],
+            **pending.diagnostics,
+        )
+        if pending.result is None:
+            return video_velocity.detach(), action_velocity.detach()
+        return pending.result.video_velocity, pending.result.action_velocity
+
+    def _scheduler_step_complete(self, *, scheduler_index: int) -> None:
+        next_index = scheduler_index + 1
+        block_complete = (
+            next_index == self.scheduler_steps
+            or self.native_dit_mask[next_index]
+        )
+        if block_complete:
+            self.clock.complete()
+
     def _install_hook(self) -> None:
         original: Callable[..., Any] = self.head._run_diffusion_steps
 
@@ -368,12 +528,19 @@ class DreamZeroFBFMRuntime:
             video = kwargs["noisy_input"].detach().clone().requires_grad_(True)
             action = kwargs["action"].detach().clone().requires_grad_(True)
             constraints = self._ensure_constraints(video, action)
-            drained, feedback_updates = self._drain_feedback(constraints)
-            state_target, state_mask, action_target, action_mask, version = constraints.snapshot()
-            state_mask.mul_(self.state_weight)
+            (
+                state_target,
+                state_mask,
+                action_target,
+                action_mask,
+                version,
+                drained,
+                feedback_updates,
+            ) = self._constraint_snapshot(constraints)
             has_guidance = bool(torch.any(state_mask).item() or torch.any(action_mask).item())
             call_kwargs = dict(kwargs, noisy_input=video, action=action)
             sigma = self._solver_sigma(kwargs) if has_guidance else None
+            self._linearization = None
 
             if has_guidance:
                 with torch.enable_grad():
@@ -395,27 +562,33 @@ class DreamZeroFBFMRuntime:
                         sigma=sigma,
                         beta=self.beta,
                         decompose_vjp=self.diagnostic_vjp,
+                        cache_linearization=True,
                     )
-                # The upstream caller applies CFG after this hook. Equal video
-                # branches make that operation an identity for the guided field.
+                self._linearization = result.linearization
+                # DreamZero must cache its native predictions. The optional
+                # scheduler callback applies the staged guided field only to the
+                # current UniPC update and reuses this Jacobian at skipped DiTs.
                 predictions = [
-                    (result.video_velocity, result.action_velocity),
-                    (result.video_velocity, unconditional_action.detach()),
+                    (conditional_video.detach(), conditional_action.detach()),
+                    (unconditional_video.detach(), unconditional_action.detach()),
                 ]
                 diagnostics = result.diagnostics
             else:
                 with torch.no_grad():
                     predictions = original(**kwargs)
-                diagnostics = {
-                    "guided": False,
-                    "state_mask_nonzero": 0,
-                    "action_mask_nonzero": 0,
-                    "state_error_norm": 0.0,
-                    "action_error_norm": 0.0,
-                    "video_correction_norm": 0.0,
-                    "action_correction_norm": 0.0,
-                    "guidance_weight": 0.0,
-                }
+                result = None
+                diagnostics = self._unguided_diagnostics()
+
+            self._latest_dit_step = self._step
+            self._pending_guidance = PendingStepGuidance(
+                dit_step=self._step,
+                result=result,
+                sigma=sigma,
+                context_version=version,
+                feedback_drained=drained,
+                feedback_updates=tuple(feedback_updates),
+                diagnostics=diagnostics,
+            )
 
             self.audit.write(
                 "solver_step",
@@ -444,7 +617,6 @@ class DreamZeroFBFMRuntime:
                 **diagnostics,
             )
             self._step += 1
-            self.clock.complete()
             return predictions
 
         self.head._run_diffusion_steps = hooked_run_diffusion_steps

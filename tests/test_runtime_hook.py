@@ -19,6 +19,7 @@ class FakeHead:
         self.num_frame_per_block = 2
         self.num_inference_steps = 16
         self.cfg_scale = 5.0
+        self.supports_external_step_guidance = True
         self.model = SimpleNamespace(action_dim=32)
         self.scheduler = SimpleNamespace(num_train_timesteps=1000)
         self.dit_step_mask = [
@@ -202,12 +203,15 @@ def test_runtime_default_uses_binary_state_mask(monkeypatch):
     torch.testing.assert_close(captured["video_mask"], expected, rtol=0, atol=0)
 
 
-def test_runtime_hook_guides_action_and_detaches_solver_graph():
+def test_runtime_guides_current_step_without_polluting_native_cache(tmp_path):
     policy = FakePolicy()
     normalizer = ActionNormalizer(
         torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
     )
-    runtime = DreamZeroFBFMRuntime(policy, normalizer, mode="RTC")
+    audit_path = tmp_path / "audit.jsonl"
+    runtime = DreamZeroFBFMRuntime(
+        policy, normalizer, mode="RTC", audit_path=str(audit_path)
+    )
     runtime.begin_chunk(np.full((8, 7), 0.5, dtype=np.float32), pseudo_async=False)
     video = torch.randn(1, 2, 2, 1, 1)
     action = torch.randn(1, 16, 32)
@@ -216,16 +220,55 @@ def test_runtime_hook_guides_action_and_detaches_solver_graph():
         action=action,
         kv_cache_metadata={"update_kv_cache": True},
     )
-    guided = policy.action_head._run_diffusion_steps(
+    cached = policy.action_head._run_diffusion_steps(
         noisy_input=video,
         action=action,
         timestep=torch.full((1, 2), 600),
         timestep_action=torch.full((1, 16), 600),
         kv_cache_metadata={"update_kv_cache": False},
     )
-    assert not torch.equal(guided[0][1], baseline[0][1])
-    assert not guided[0][0].requires_grad
-    assert not guided[0][1].requires_grad
+    for cached_branch, baseline_branch in zip(cached, baseline):
+        torch.testing.assert_close(cached_branch[0], baseline_branch[0])
+        torch.testing.assert_close(cached_branch[1], baseline_branch[1])
+
+    base_video = cached[1][0] + policy.action_head.cfg_scale * (
+        cached[0][0] - cached[1][0]
+    )
+    base_action = cached[0][1]
+    guided_video, guided_action = policy.action_head.external_step_guidance(
+        scheduler_index=0,
+        model_evaluated=True,
+        video_sample=video,
+        action_sample=action,
+        video_velocity=base_video,
+        action_velocity=base_action,
+        timestep_action=torch.full((1, 16), 600),
+    )
+    assert not torch.equal(guided_action, base_action)
+    assert not guided_video.requires_grad
+    assert not guided_action.requires_grad
+
+    skipped_video, skipped_action = policy.action_head.external_step_guidance(
+        scheduler_index=3,
+        model_evaluated=False,
+        video_sample=video + 0.1,
+        action_sample=action - 0.2,
+        video_velocity=base_video,
+        action_velocity=base_action,
+        timestep_action=torch.full((1, 16), 400),
+    )
+    assert not torch.equal(skipped_action, guided_action)
+    assert not skipped_video.requires_grad
+    assert not skipped_action.requires_grad
+    records = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    scheduler_records = [
+        record for record in records if record["event"] == "scheduler_guidance_step"
+    ]
+    assert [record["model_evaluated"] for record in scheduler_records] == [True, False]
+    assert scheduler_records[1]["jacobian_reused"] is True
     assert policy.action_head.dit_step_mask == [
         True, True, True, False, False, False, True, False,
         False, False, True, False, False, True, True, True,
