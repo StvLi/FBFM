@@ -36,6 +36,7 @@ def joint_fbfm_guidance(
     action_mask: Tensor,
     sigma: Tensor | float,
     beta: float = 10.0,
+    decompose_vjp: bool = False,
 ) -> GuidanceResult:
     """Apply one joint state-action endpoint VJP and detach the solver output."""
     if beta <= 0:
@@ -68,19 +69,82 @@ def joint_fbfm_guidance(
     action_endpoint = action_sample - sigma_value * action_velocity
     state_error = (video_target - video_endpoint) * video_mask
     action_error = (action_target - action_endpoint) * action_mask
-    video_correction, action_correction = torch.autograd.grad(
-        outputs=(video_endpoint, action_endpoint),
-        inputs=(video_sample, action_sample),
-        grad_outputs=(state_error.detach(), action_error.detach()),
-        retain_graph=False,
-        create_graph=False,
-        allow_unused=False,
-    )
+    component_diagnostics: dict[str, float] = {}
+    if decompose_vjp:
+        state_corrections = torch.autograd.grad(
+            outputs=video_endpoint,
+            inputs=(video_sample, action_sample),
+            grad_outputs=state_error.detach(),
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        action_corrections = torch.autograd.grad(
+            outputs=action_endpoint,
+            inputs=(video_sample, action_sample),
+            grad_outputs=action_error.detach(),
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+        state_video = (
+            torch.zeros_like(video_sample)
+            if state_corrections[0] is None
+            else state_corrections[0]
+        )
+        state_action = (
+            torch.zeros_like(action_sample)
+            if state_corrections[1] is None
+            else state_corrections[1]
+        )
+        action_video = (
+            torch.zeros_like(video_sample)
+            if action_corrections[0] is None
+            else action_corrections[0]
+        )
+        action_action = (
+            torch.zeros_like(action_sample)
+            if action_corrections[1] is None
+            else action_corrections[1]
+        )
+        video_correction = state_video + action_video
+        action_correction = state_action + action_action
+        component_diagnostics = {
+            "state_to_video_correction_norm": float(
+                state_video.detach().float().norm().item()
+            ),
+            "state_to_action_correction_norm": float(
+                state_action.detach().float().norm().item()
+            ),
+            "action_to_video_correction_norm": float(
+                action_video.detach().float().norm().item()
+            ),
+            "action_to_action_correction_norm": float(
+                action_action.detach().float().norm().item()
+            ),
+        }
+    else:
+        video_correction, action_correction = torch.autograd.grad(
+            outputs=(video_endpoint, action_endpoint),
+            inputs=(video_sample, action_sample),
+            grad_outputs=(state_error.detach(), action_error.detach()),
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )
     weight = guidance_weight(sigma, beta).to(video_sample.device)
     guided_video = (video_velocity - weight * video_correction).detach()
     guided_action = (action_velocity - weight * action_correction).detach()
     if not torch.isfinite(guided_video).all() or not torch.isfinite(guided_action).all():
         raise FloatingPointError("FBFM produced a non-finite guided velocity")
+    state_coordinates = int(
+        torch.count_nonzero(video_mask.expand_as(video_sample)).item()
+    )
+    action_coordinates = int(
+        torch.count_nonzero(action_mask.expand_as(action_sample)).item()
+    )
+    state_scale = state_coordinates**0.5 if state_coordinates else 1.0
+    action_scale = action_coordinates**0.5 if action_coordinates else 1.0
     return GuidanceResult(
         guided_video,
         guided_action,
@@ -88,10 +152,20 @@ def joint_fbfm_guidance(
             "guided": True,
             "state_mask_nonzero": int(torch.count_nonzero(video_mask).item()),
             "action_mask_nonzero": int(torch.count_nonzero(action_mask).item()),
+            "state_mask_coordinate_count": state_coordinates,
+            "action_mask_coordinate_count": action_coordinates,
             "state_error_norm": float(state_error.detach().float().norm().item()),
             "action_error_norm": float(action_error.detach().float().norm().item()),
+            "state_error_rms": float(state_error.detach().float().norm().item() / state_scale),
+            "action_error_rms": float(action_error.detach().float().norm().item() / action_scale),
+            "base_video_velocity_norm": float(video_velocity.detach().float().norm().item()),
+            "base_action_velocity_norm": float(action_velocity.detach().float().norm().item()),
+            "guided_video_velocity_norm": float(guided_video.float().norm().item()),
+            "guided_action_velocity_norm": float(guided_action.float().norm().item()),
             "video_correction_norm": float(video_correction.detach().float().norm().item()),
             "action_correction_norm": float(action_correction.detach().float().norm().item()),
             "guidance_weight": float(weight.item()),
+            "vjp_decomposed": decompose_vjp,
+            **component_diagnostics,
         },
     )

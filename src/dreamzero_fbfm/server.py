@@ -40,6 +40,7 @@ class ModelServer:
         audit_path: Path,
         beta: float = 10.0,
         state_weight: float = 1.0,
+        diagnostic_vjp: bool = False,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("model server must bind to 127.0.0.1")
@@ -54,6 +55,7 @@ class ModelServer:
             mode=mode,
             beta=beta,
             state_weight=state_weight,
+            diagnostic_vjp=diagnostic_vjp,
             audit_path=str(audit_path),
         )
         self.task_description: str | None = None
