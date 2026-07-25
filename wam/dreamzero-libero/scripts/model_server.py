@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--beta", type=float, default=10.0)
     parser.add_argument("--state-weight", type=float, default=1.0)
+    parser.add_argument("--diagnostic-vjp", action="store_true")
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)
     args = parser.parse_args()
@@ -62,6 +63,7 @@ def main() -> None:
         port=args.port,
         beta=args.beta,
         state_weight=args.state_weight,
+        diagnostic_vjp=args.diagnostic_vjp,
         audit_path=args.audit,
     )
     ready = {
@@ -70,6 +72,7 @@ def main() -> None:
         "host": args.host,
         "port": args.port,
         "state_weight": args.state_weight,
+        "diagnostic_vjp": args.diagnostic_vjp,
         "load": load_report,
     }
     if args.ready_file is not None:

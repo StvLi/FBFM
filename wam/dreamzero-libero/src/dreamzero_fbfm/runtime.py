@@ -192,6 +192,7 @@ class DreamZeroFBFMRuntime:
         solver_evaluations: int | None = None,
         state_weight: float = 1.0,
         beta: float = 10.0,
+        diagnostic_vjp: bool = False,
         audit_path: str | None = None,
     ) -> None:
         if delay != execution_horizon:
@@ -224,6 +225,7 @@ class DreamZeroFBFMRuntime:
             raise ValueError("state_weight must be in (0, 1]")
         self.state_weight = float(state_weight)
         self.beta = beta
+        self.diagnostic_vjp = bool(diagnostic_vjp)
         self.audit = JsonlAudit(audit_path)
         self.clock = SolverClock()
         self.feedback_encoder = DreamZeroFeedbackEncoder(policy)
@@ -291,6 +293,7 @@ class DreamZeroFBFMRuntime:
                 mode=self.mode.value,
                 pseudo_async=pseudo_async,
                 state_weight=self.state_weight,
+                diagnostic_vjp=self.diagnostic_vjp,
                 action_mask_nonzero=int(torch.count_nonzero(mask).item()),
             )
 
@@ -379,6 +382,7 @@ class DreamZeroFBFMRuntime:
                         action_mask=action_mask,
                         sigma=sigma,
                         beta=self.beta,
+                        decompose_vjp=self.diagnostic_vjp,
                     )
                 # The upstream caller applies CFG after this hook. Equal video
                 # branches make that operation an identity for the guided field.

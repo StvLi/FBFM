@@ -26,6 +26,7 @@ def test_joint_vjp_matches_coupled_linear_endpoint():
         action_mask=action_mask,
         sigma=sigma,
         beta=beta,
+        decompose_vjp=True,
     )
 
     endpoint_video = video.detach() - sigma * video_velocity.detach()
@@ -42,6 +43,25 @@ def test_joint_vjp_matches_coupled_linear_endpoint():
         result.action_velocity, action_velocity.detach() - weight * action_correction
     )
     assert result.diagnostics["guided"] is True
+    assert result.diagnostics["vjp_decomposed"] is True
+    assert result.diagnostics["state_mask_coordinate_count"] == 2
+    assert result.diagnostics["action_mask_coordinate_count"] == 2
+    torch.testing.assert_close(
+        torch.as_tensor(result.diagnostics["state_to_video_correction_norm"]),
+        ((1 - 0.2 * sigma) * state_error).norm().float(),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(result.diagnostics["state_to_action_correction_norm"]),
+        ((-0.3 * sigma) * state_error).norm().float(),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(result.diagnostics["action_to_video_correction_norm"]),
+        ((-0.4 * sigma) * action_error).norm().float(),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(result.diagnostics["action_to_action_correction_norm"]),
+        ((1 + 0.1 * sigma) * action_error).norm().float(),
+    )
     assert not result.video_velocity.requires_grad
     assert not result.action_velocity.requires_grad
 
