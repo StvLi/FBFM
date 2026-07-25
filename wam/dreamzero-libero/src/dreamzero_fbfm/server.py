@@ -13,6 +13,7 @@ import numpy as np
 
 from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ConstraintMode
+from .observation_history import CausalObservationHistory
 from .runtime import DreamZeroFBFMRuntime, FeedbackObservation, InferenceCancelled
 from .transport import decode_array, encode_array, receive_message, send_message
 
@@ -57,6 +58,7 @@ class ModelServer:
         )
         self.task_description: str | None = None
         self.job: InferenceJob | None = None
+        self.observation_history = CausalObservationHistory()
 
     def _decode_observation(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.task_description is None:
@@ -66,12 +68,24 @@ class ModelServer:
         state = decode_array(request.get("state"), dtype="float32")
         if main.shape != (256, 256, 3) or wrist.shape != main.shape or state.shape != (8,):
             raise ValueError(f"invalid LIBERO observation shapes {main.shape}, {wrist.shape}, {state.shape}")
-        return {
-            "main_images": main[None],
-            "wrist_images": wrist[None],
-            "states": state[None],
-            "task_descriptions": [self.task_description],
-        }
+        return {"main": main, "wrist": wrist, "state": state}
+
+    def _prepare_model_observation(
+        self, observation: dict[str, Any], request_type: str
+    ) -> dict[str, Any]:
+        prepared, frame_count = self.observation_history.prepare(
+            observation["main"],
+            observation["wrist"],
+            observation["state"],
+            self.task_description or "",
+        )
+        self.audit.write(
+            "model_input",
+            request_type=request_type,
+            video_frames=frame_count,
+            causal_start_frame=int(self.policy.action_head.current_start_frame),
+        )
+        return prepared
 
     def _predict(self, observation: dict[str, Any]) -> np.ndarray:
         actions, _ = self.policy.predict_action_batch(observation, mode="eval")
@@ -164,24 +178,28 @@ class ModelServer:
                 raise ValueError("reset requires task_description and integer seed")
             self.task_description = task
             self.reset_policy_state(self.policy, seed)
+            self.observation_history.reset()
             self.job = None
             return {"status": "ok", "type": "reset"}
         if request_type == "predict_sync":
-            observation = self._decode_observation(request)
+            observation = self._prepare_model_observation(
+                self._decode_observation(request), request_type
+            )
             self.runtime.begin_chunk(None, pseudo_async=False)
             actions = self._predict(observation)
             return {"status": "ok", "type": request_type, "actions": encode_array(actions)}
         if request_type == "predict_start":
-            observation = self._decode_observation(request)
+            raw_observation = self._decode_observation(request)
+            observation = self._prepare_model_observation(raw_observation, request_type)
             committed = decode_array(request.get("committed_actions"), dtype="float32")
             self.runtime.begin_chunk(
                 committed,
                 pseudo_async=True,
                 anchor_feedback=FeedbackObservation(
                     action_offset=0,
-                    main_image=observation["main_images"][0],
-                    wrist_image=observation["wrist_images"][0],
-                    state=observation["states"][0],
+                    main_image=raw_observation["main"],
+                    wrist_image=raw_observation["wrist"],
+                    state=raw_observation["state"],
                     task_description=self.task_description or "",
                 ),
             )
@@ -195,9 +213,9 @@ class ModelServer:
             self.runtime.submit_feedback(
                 FeedbackObservation(
                     action_offset=offset,
-                    main_image=observation["main_images"][0],
-                    wrist_image=observation["wrist_images"][0],
-                    state=observation["states"][0],
+                    main_image=observation["main"],
+                    wrist_image=observation["wrist"],
+                    state=observation["state"],
                     task_description=self.task_description or "",
                 )
             )
