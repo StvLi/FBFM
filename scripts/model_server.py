@@ -13,6 +13,8 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 FBFM_REPOSITORY = REPOSITORY.parents[1]
 sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
+from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -24,7 +26,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--beta", type=float, default=10.0)
-    parser.add_argument("--state-weight", type=float, default=1.0)
+    parser.add_argument("--state-weight", type=float, default=DEFAULT_STATE_WEIGHT)
     parser.add_argument("--diagnostic-vjp", action="store_true")
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)

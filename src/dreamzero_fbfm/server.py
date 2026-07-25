@@ -15,6 +15,7 @@ from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ConstraintMode
 from .observation_history import CausalObservationHistory
 from .runtime import DreamZeroFBFMRuntime, FeedbackObservation, InferenceCancelled
+from .settings import DEFAULT_STATE_WEIGHT
 from .transport import decode_array, encode_array, receive_message, send_message
 
 
@@ -39,7 +40,7 @@ class ModelServer:
         port: int,
         audit_path: Path,
         beta: float = 10.0,
-        state_weight: float = 1.0,
+        state_weight: float = DEFAULT_STATE_WEIGHT,
         diagnostic_vjp: bool = False,
     ) -> None:
         if host != "127.0.0.1":

@@ -52,12 +52,14 @@ first two refreshes can occur in one generation wave. A state target never enter
 solver-start history in that same generation.
 
 The active action overlap contains `8x7=56` physical coordinates, whereas one
-state latent contains `48x10x20=9600` coordinates. Both observed blocks use
-binary masks by default, as specified by the paper and the LingBot-VA route. A
-coordinate-count ratio such as `56/9600` equalizes the L1 sum of mask entries,
-but it suppresses the state's squared mask energy by a factor of 171 relative
-to the action block and is not the default joint-VJP protocol. Fractional
-`--state-weight` values remain available only as confidence-weight ablations.
+state latent contains `48x10x20=9600` coordinates. The action block remains a
+binary hard-overlap mask. The DreamZero route applies the state preconditioner
+`sqrt(56/9600)=0.0763762616`, which equalizes expected Euclidean mask energy
+under the diagnostic assumption of independent, equal-variance coordinates and
+an identity Jacobian. The older `56/9600` coefficient equalizes only the L1 sum
+of mask entries and makes state correction norms about 13.1 times weaker than
+this RMS-balanced value. A binary state coefficient of `1.0` and the L1-mass
+coefficient remain explicit ablations; neither is mixed into the default result.
 
 ## Preserved contracts
 

@@ -24,5 +24,5 @@ protocol:
   feedback_vae_sample_interval: 3
   feedback_observations_per_latent: 4
   feedback_encoding: causal_rolling_past
-  state_weight: 1.0
+  state_weight: 0.07637626158259733
   max_guidance_weight: 10.0

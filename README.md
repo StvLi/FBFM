@@ -36,16 +36,16 @@ time using measured latency. It adds:
 | rolling VAE sample interval | 3 action steps (checkpoint training stride) |
 | observations per latent | 4 |
 | active state slots per wave | first of 2 predicted latent slots |
-| state modality weight | `1.0` (binary observed-slot mask) |
+| state modality weight | `sqrt(56/9600) = 0.0763762616` |
 | guidance clip `beta` | 10 |
 
 `NONE`, `RTC`, and `FBFM` use the same model, native 8-DiT cache schedule, rollout,
 noise seeds and pseudo-clock. Only masks differ: `NONE` uses zero masks, `RTC`
 uses the normalized 7-channel action prefix, and `FBFM` adds observed latent
-state slots. The default state mask is binary, matching the paper and the
-LingBot-VA implementation. `--state-weight` remains available for explicitly
-labelled confidence-weight ablations; values below `1.0` are not the default
-FBFM protocol.
+state slots. The action overlap remains a binary hard constraint. DreamZero's
+default state coefficient RMS-balances its 9600-coordinate latent slot against
+the 56-coordinate action overlap. `--state-weight 1.0` remains available as the
+unbalanced binary-state ablation; `56/9600` is the L1-mass ablation.
 
 DreamZero reuses each native DiT prediction across one or more UniPC updates.
 The integration deliberately keeps the cached prediction unguided. For every
@@ -109,7 +109,7 @@ $BASE/envs/miniconda3/envs/dreamzero/bin/python $REPO/scripts/model_server.py \
   --base-workspace $BASE \
   --checkpoint $BASE/checkpoints/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000 \
   --tokenizer $BASE/assets/tokenizers/umt5-xxl \
-  --mode FBFM --state-weight 1.0 --port 18766 \
+  --mode FBFM --state-weight 0.07637626158259733 --port 18766 \
   --audit $REPO/results/smoke_fbfm/solver.jsonl \
   --ready-file $REPO/results/smoke_fbfm/ready.json
 ```
@@ -122,7 +122,7 @@ REPO=$FBFM_ROOT/wam/dreamzero-libero
 BASE=${DREAMZERO_BASE_WORKSPACE:-/home/deepcybo-lite/fbfm_ws}
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/libero_experiment.py \
-  --base-workspace $BASE --mode FBFM --state-weight 1.0 \
+  --base-workspace $BASE --mode FBFM --state-weight 0.07637626158259733 \
   --suite libero_spatial --task-id 0 \
   --trial-start 0 --trials 1 --max-steps 480 --port 18766 \
   --model-seed-rule fixed --solver-release-policy uniform \
@@ -155,7 +155,7 @@ server reports ready:
 CODE_COMMIT=$(git -C "$FBFM_ROOT" rev-parse --short HEAD)
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/run_libero_benchmark.py \
-  --base-workspace $BASE --mode FBFM --state-weight 1.0 \
+  --base-workspace $BASE --mode FBFM --state-weight 0.07637626158259733 \
   --trials 20 --max-steps 480 \
   --model-seed-rule fixed --solver-release-policy uniform \
   --code-commit "$CODE_COMMIT" --port 18766 \

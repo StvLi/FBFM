@@ -19,6 +19,7 @@ from dreamzero_fbfm.experiment_ledger import (
     task_directory,
     write_tables,
 )
+from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
 
 DEFAULT_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90")
 DEFAULT_MAX_STEPS = {
@@ -49,7 +50,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--suite", action="append", choices=DEFAULT_SUITES)
     parser.add_argument("--mode", choices=("NONE", "RTC", "FBFM"), default="FBFM")
-    parser.add_argument("--state-weight", type=float, default=1.0)
+    parser.add_argument("--state-weight", type=float, default=DEFAULT_STATE_WEIGHT)
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument(
         "--max-steps",

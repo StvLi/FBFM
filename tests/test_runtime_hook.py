@@ -11,6 +11,7 @@ from dreamzero_fbfm.runtime import (
     DreamZeroFeedbackEncoder,
     FeedbackObservation,
 )
+from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
 
 
 class FakeHead:
@@ -165,13 +166,13 @@ def test_runtime_updates_state_only_on_training_aligned_feedback(tmp_path):
     ]
 
 
-def test_runtime_default_uses_binary_state_mask(monkeypatch):
+def test_runtime_default_uses_rms_balanced_state_mask(monkeypatch):
     policy = FakePolicy()
     normalizer = ActionNormalizer(
         torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
     )
     runtime = DreamZeroFBFMRuntime(policy, normalizer, mode="FBFM")
-    assert runtime.state_weight == 1.0
+    assert runtime.state_weight == DEFAULT_STATE_WEIGHT
     runtime.begin_chunk(np.zeros((8, 7), dtype=np.float32), pseudo_async=False)
 
     encoder = runtime.feedback_encoder
@@ -199,7 +200,7 @@ def test_runtime_default_uses_binary_state_mask(monkeypatch):
         kv_cache_metadata={"update_kv_cache": False},
     )
 
-    expected = torch.tensor([[[[[1.0]], [[0.0]]]]])
+    expected = torch.tensor([[[[[DEFAULT_STATE_WEIGHT]], [[0.0]]]]])
     torch.testing.assert_close(captured["video_mask"], expected, rtol=0, atol=0)
 
 

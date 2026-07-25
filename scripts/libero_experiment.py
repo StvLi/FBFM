@@ -17,6 +17,7 @@ sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
 from dreamzero_fbfm.client import FBFMClient
 from dreamzero_fbfm.pseudo_clock import solver_grants
+from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
 
 
 DEFAULT_MAX_STEPS = {
@@ -70,7 +71,7 @@ def main() -> None:
     parser.add_argument(
         "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
     )
-    parser.add_argument("--state-weight", type=float, default=1.0)
+    parser.add_argument("--state-weight", type=float, default=DEFAULT_STATE_WEIGHT)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.max_steps is None:

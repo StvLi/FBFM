@@ -15,6 +15,7 @@ from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ChunkConstraints, ConstraintMode
 from .guidance import EndpointLinearization, GuidanceResult, joint_fbfm_guidance
 from .pseudo_clock import SolverClock
+from .settings import DEFAULT_STATE_WEIGHT
 
 
 class InferenceCancelled(RuntimeError):
@@ -213,7 +214,7 @@ class DreamZeroFBFMRuntime:
         delay: int = 8,
         execution_horizon: int = 8,
         solver_evaluations: int | None = None,
-        state_weight: float = 1.0,
+        state_weight: float = DEFAULT_STATE_WEIGHT,
         beta: float = 10.0,
         diagnostic_vjp: bool = False,
         audit_path: str | None = None,
