@@ -13,6 +13,8 @@ time using measured latency. It adds:
 - one block-diagonal state/action constraint at each joint solver evaluation;
 - endpoint VJP guidance with the paper's clipped few-step schedule;
 - native DreamZero VAE encoding for per-action rolling visual feedback;
+- native DreamZero causal inference history: one-frame warm-up followed by
+  four-frame inference-anchor requests with continuous KV-cache positions;
 - a deterministic pseudo-clock linking 8 executed actions to the checkpoint's
   8 native DiT evaluations across 16 UniPC scheduler steps;
 - a localhost protocol between the Python 3.11 model and Python 3.8 simulator;
@@ -27,6 +29,7 @@ time using measured latency. It adds:
 | executed suffix `s` | 8 |
 | UniPC scheduler steps | 16 |
 | native DiT evaluations | 8 |
+| causal model input | 1-frame warm-up, then latest 4 inference anchors |
 | grants per simulator step | 1 |
 | feedback sample stride | 2 observations |
 | observations per latent | 4 |
@@ -150,6 +153,12 @@ are completed by holding the latest real observation forward; the target is
 re-encoded and versioned after every action, and equals the native complete
 block encoding at the final sample. This protocol is for deterministic
 pseudo-asynchronous method evaluation, not wall-clock latency.
+
+The four-frame model-input history is separate from rolling feedback. Only
+`predict_sync` and `predict_start` anchors advance DreamZero's causal KV-cache
+history; per-action `feedback` observations update FBFM targets without
+entering that history. Sending one frame for every request triggers DreamZero's
+upstream `videos.shape[2] == 1` reset path and invalidates overlap results.
 
 `sync_libero_ledger.py` can mirror those four ledger files into a paper
 repository at a fixed interval. It exits automatically after all 130 task rows
