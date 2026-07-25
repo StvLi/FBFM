@@ -42,36 +42,44 @@ class EncodedFeedback:
 
 
 class DreamZeroFeedbackEncoder:
-    """Refresh native DreamZero latents after every executed action.
+    """Refresh DreamZero latents on the checkpoint's training-time video grid.
 
     DreamZero's causal VAE emits one future latent for four input video frames.
-    A partially observed block is encoded from a rolling window ending at the
-    newest real observation. Missing history at the left boundary is filled by
-    the real launch anchor. This keeps every hard target causal: no unobserved
-    future coordinate is synthesized and marked as measured.
+    LIBERO SFT samples those frames three environment steps apart. Every real
+    observation is accepted in order, but a hard latent target is refreshed only
+    when the next stride-3 sample arrives. Missing history at the left boundary
+    is filled with the measured launch anchor; no current observation is copied
+    into an unobserved future position.
     """
 
-    def __init__(self, policy: Any, *, observations_per_latent: int = 4) -> None:
-        if observations_per_latent <= 0:
-            raise ValueError("observations_per_latent must be positive")
+    def __init__(
+        self,
+        policy: Any,
+        *,
+        observations_per_latent: int = 4,
+        observation_interval: int = 3,
+    ) -> None:
+        if observations_per_latent <= 0 or observation_interval <= 0:
+            raise ValueError("feedback sampling dimensions must be positive")
         self.policy = policy
         self.head = policy.action_head
         self.observations_per_latent = observations_per_latent
+        self.observation_interval = observation_interval
+        self.actions_per_latent = observation_interval * observations_per_latent
         latent_slots = int(self.head.num_frame_per_block)
         action_horizon = int(self.head.action_horizon)
-        if latent_slots <= 0 or action_horizon % latent_slots:
-            raise ValueError("DreamZero action horizon must divide into video-latent slots")
-        self.actions_per_latent = action_horizon // latent_slots
-        if self.actions_per_latent % observations_per_latent:
-            raise ValueError("actions per latent must divide into VAE observation samples")
-        self.observation_interval = self.actions_per_latent // observations_per_latent
+        if latent_slots <= 0:
+            raise ValueError("DreamZero must expose at least one video-latent slot")
+        if action_horizon > latent_slots * self.actions_per_latent:
+            raise ValueError("DreamZero action horizon exceeds its feedback video horizon")
         self.latent_slots = latent_slots
         self.reset()
 
     def reset(self) -> None:
         self._slot_anchor: Tensor | None = None
         self._slot_anchor_offset = 0
-        self._slot_frames: dict[int, Tensor] = {}
+        self._sampled_frames: list[Tensor] = []
+        self._sampled_offsets: list[int] = []
         self._last_frame: Tensor | None = None
         self._last_offset = 0
         self._active_slot = 0
@@ -82,7 +90,6 @@ class DreamZeroFeedbackEncoder:
             raise ValueError("feedback anchor must have action_offset=0")
         self._slot_anchor = self._transform_frame(feedback)
         self._last_frame = self._slot_anchor
-        self._slot_frames = {0: self._slot_anchor}
 
     def add(self, feedback: FeedbackObservation) -> list[EncodedFeedback]:
         if self._slot_anchor is None:
@@ -95,6 +102,7 @@ class DreamZeroFeedbackEncoder:
 
         slot = (feedback.action_offset - 1) // self.actions_per_latent
         if slot >= self.latent_slots:
+            self._last_offset = feedback.action_offset
             return []
         if slot != self._active_slot:
             if self._last_frame is None:
@@ -102,21 +110,26 @@ class DreamZeroFeedbackEncoder:
             self._active_slot = slot
             self._slot_anchor = self._last_frame
             self._slot_anchor_offset = self._last_offset
-            self._slot_frames = {self._slot_anchor_offset: self._slot_anchor}
+            self._sampled_frames = []
+            self._sampled_offsets = []
 
         frame = self._transform_frame(feedback)
         self._last_frame = frame
         self._last_offset = feedback.action_offset
-        self._slot_frames[feedback.action_offset] = frame
-        position = (feedback.action_offset - 1) % self.actions_per_latent + 1
-        source_offsets = tuple(
-            max(
-                self._slot_anchor_offset,
-                feedback.action_offset - lag * self.observation_interval,
-            )
-            for lag in range(self.observations_per_latent, -1, -1)
+        position = feedback.action_offset - self._slot_anchor_offset
+        if position % self.observation_interval:
+            return []
+
+        self._sampled_frames.append(frame)
+        self._sampled_offsets.append(feedback.action_offset)
+        missing = self.observations_per_latent - len(self._sampled_frames)
+        if missing < 0:
+            raise RuntimeError("feedback encoder collected too many samples for one latent")
+        source_frames = [self._slot_anchor] * (missing + 1) + self._sampled_frames
+        source_offsets = (
+            (self._slot_anchor_offset,) * (missing + 1)
+            + tuple(self._sampled_offsets)
         )
-        source_frames = [self._slot_frames[offset] for offset in source_offsets]
         images = torch.cat(source_frames, dim=1)
         return [
             EncodedFeedback(
@@ -124,7 +137,7 @@ class DreamZeroFeedbackEncoder:
                 latent=self._encode(images),
                 action_offset=feedback.action_offset,
                 source_offsets=source_offsets,
-                complete=position == self.actions_per_latent,
+                complete=missing == 0,
             )
         ]
 

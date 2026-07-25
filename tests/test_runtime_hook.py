@@ -58,11 +58,11 @@ def _feedback(offset: int) -> FeedbackObservation:
     )
 
 
-def test_feedback_encoder_uses_only_causal_rolling_history():
+def test_feedback_encoder_uses_training_aligned_stride_three_history():
     encoder = object.__new__(DreamZeroFeedbackEncoder)
     encoder.observations_per_latent = 4
-    encoder.actions_per_latent = 8
-    encoder.observation_interval = 2
+    encoder.actions_per_latent = 12
+    encoder.observation_interval = 3
     encoder.latent_slots = 2
     encoder.reset()
     encoder._transform_frame = lambda item: torch.full((1, 1, 1), item.action_offset)
@@ -75,31 +75,27 @@ def test_feedback_encoder_uses_only_causal_rolling_history():
     encoder._encode = encode
     encoder.set_anchor(_feedback(0))
     outputs = []
-    for offset in range(1, 9):
+    for offset in range(1, 13):
         outputs.extend(encoder.add(_feedback(offset)))
 
-    assert len(outputs) == 8
-    assert [output.slot for output in outputs] == [0] * 8
-    assert [output.complete for output in outputs] == [False] * 7 + [True]
+    assert [output.action_offset for output in outputs] == [3, 6, 9, 12]
+    assert [output.slot for output in outputs] == [0] * 4
+    assert [output.complete for output in outputs] == [False] * 3 + [True]
     expected_windows = [
-        [0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 2],
-        [0, 0, 0, 1, 3],
-        [0, 0, 0, 2, 4],
-        [0, 0, 1, 3, 5],
-        [0, 0, 2, 4, 6],
-        [0, 1, 3, 5, 7],
-        [0, 2, 4, 6, 8],
+        [0, 0, 0, 0, 3],
+        [0, 0, 0, 3, 6],
+        [0, 0, 3, 6, 9],
+        [0, 3, 6, 9, 12],
     ]
     assert [window.reshape(-1).tolist() for window in windows] == expected_windows
-    assert outputs[-1].source_offsets == (0, 2, 4, 6, 8)
+    assert outputs[-1].source_offsets == (0, 3, 6, 9, 12)
 
 
 def test_feedback_encoder_refreshes_second_latent_slot():
     encoder = object.__new__(DreamZeroFeedbackEncoder)
     encoder.observations_per_latent = 4
-    encoder.actions_per_latent = 8
-    encoder.observation_interval = 2
+    encoder.actions_per_latent = 12
+    encoder.observation_interval = 3
     encoder.latent_slots = 2
     encoder.reset()
     encoder._transform_frame = lambda item: torch.full((1, 1, 1), item.action_offset)
@@ -107,15 +103,15 @@ def test_feedback_encoder_refreshes_second_latent_slot():
     encoder.set_anchor(_feedback(0))
 
     outputs = []
-    for offset in range(1, 17):
+    for offset in range(1, 25):
         outputs.extend(encoder.add(_feedback(offset)))
 
-    assert [output.slot for output in outputs] == [0] * 8 + [1] * 8
-    assert outputs[8].source_offsets == (8, 8, 8, 8, 9)
-    assert outputs[-1].source_offsets == (8, 10, 12, 14, 16)
+    assert [output.slot for output in outputs] == [0] * 4 + [1] * 4
+    assert outputs[4].source_offsets == (12, 12, 12, 12, 15)
+    assert outputs[-1].source_offsets == (12, 15, 18, 21, 24)
 
 
-def test_runtime_applies_one_slot_revision_per_feedback(tmp_path):
+def test_runtime_updates_state_only_on_training_aligned_feedback(tmp_path):
     policy = FakePolicy()
     normalizer = ActionNormalizer(
         torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
@@ -147,19 +143,25 @@ def test_runtime_applies_one_slot_revision_per_feedback(tmp_path):
             kv_cache_metadata={"update_kv_cache": False},
         )
         assert runtime._constraints is not None
-        assert runtime._constraints.version == offset
+        assert runtime._constraints.version == offset // 3
 
     records = [
         json.loads(line)
         for line in audit_path.read_text(encoding="utf-8").splitlines()
     ]
     solver_records = [record for record in records if record["event"] == "solver_step"]
-    assert [record["context_version"] for record in solver_records] == list(range(1, 9))
-    assert [record["feedback_action_offsets"] for record in solver_records] == [
-        [offset] for offset in range(1, 9)
+    assert [record["context_version"] for record in solver_records] == [
+        0, 0, 1, 1, 1, 2, 2, 2
     ]
-    assert [record["feedback_state_slots"] for record in solver_records] == [[0]] * 8
-    assert [record["state_target_updates"] for record in solver_records] == [1] * 8
+    assert [record["feedback_action_offsets"] for record in solver_records] == [
+        [], [], [3], [], [], [6], [], []
+    ]
+    assert [record["feedback_state_slots"] for record in solver_records] == [
+        [], [], [0], [], [], [0], [], []
+    ]
+    assert [record["state_target_updates"] for record in solver_records] == [
+        0, 0, 1, 0, 0, 1, 0, 0
+    ]
 
 
 def test_runtime_default_uses_binary_state_mask(monkeypatch):
@@ -177,7 +179,8 @@ def test_runtime_default_uses_binary_state_mask(monkeypatch):
     )
     encoder._encode = lambda images: images[:, -1]
     encoder.set_anchor(_feedback(0))
-    runtime.submit_feedback(_feedback(1))
+    for offset in range(1, 4):
+        runtime.submit_feedback(_feedback(offset))
 
     captured = {}
     original_guidance = runtime_module.joint_fbfm_guidance
