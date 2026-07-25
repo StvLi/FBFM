@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import dreamzero_fbfm.runtime as runtime_module
@@ -269,6 +270,14 @@ def test_runtime_guides_current_step_without_polluting_native_cache(tmp_path):
     ]
     assert [record["model_evaluated"] for record in scheduler_records] == [True, False]
     assert scheduler_records[1]["jacobian_reused"] is True
+    assert scheduler_records[0]["endpoint_velocity_source"] == "native_dit"
+    assert scheduler_records[1]["endpoint_velocity_source"] == "previous_guided"
+    assert scheduler_records[1]["base_action_velocity_norm"] == pytest.approx(
+        guided_action.float().norm().item()
+    )
+    assert scheduler_records[1]["native_action_velocity_norm"] == pytest.approx(
+        base_action.float().norm().item()
+    )
     assert policy.action_head.dit_step_mask == [
         True, True, True, False, False, False, True, False,
         False, False, True, False, False, True, True, True,

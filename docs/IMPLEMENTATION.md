@@ -4,15 +4,17 @@
 
 DreamZero transports predicted video latents `Z` and a 16x32 padded action tensor
 `A` in one DiT call. Let native DiT evaluation `k` produce base velocity `v_k`
-and endpoint Jacobian `J_k`. At each UniPC scheduler index `j` served by that
-cached DiT result, the runtime reconstructs
+and endpoint Jacobian `J_k`. Its first scheduler update starts from `v_k`; each
+following skipped-DiT update starts from the effective guided velocity
+`v_eff,j-1` returned by the preceding scheduler index. The runtime reconstructs
 
-`Xhat_j = X_j - sigma_j * v_k` and `e_j = W * (Y_j - Xhat_j)`.
+`Xhat_j = X_j - sigma_j * v_eff,j-1` and `e_j = W * (Y_j - Xhat_j)`.
 
 It then evaluates `g_j = J_k^T e_j`. The DiT velocity and Jacobian are refreshed
 only at the next native evaluation, but `Xhat_j`, `e_j`, the guidance schedule,
-and guided velocity `v_k - lambda(sigma_j) * g_j` are recomputed at every UniPC
-index. The joint VJP retains the state-to-action and action-to-state Jacobian
+and guided velocity `v_eff,j-1 - lambda(sigma_j) * g_j` are recomputed at every
+UniPC index. A fresh DiT evaluation resets `v_eff` to its new native base before
+guidance. The joint VJP retains the state-to-action and action-to-state Jacobian
 blocks. Since DreamZero runs from decreasing `sigma` rather than increasing
 paper time `tau`, the correction has the minus sign shown above.
 

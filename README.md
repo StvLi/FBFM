@@ -50,9 +50,11 @@ FBFM protocol.
 DreamZero reuses each native DiT prediction across one or more UniPC updates.
 The integration deliberately keeps the cached prediction unguided. For every
 skipped DiT update it reconstructs the clean endpoint from the current solver
-sample and sigma, recomputes the masked residual, and applies a new VJP using
-the most recent DiT Jacobian. This prevents one old guided velocity from being
-integrated repeatedly at indices such as `2,3,4,5`.
+sample, sigma, and previous scheduler step's effective guided velocity. It then
+recomputes the masked residual and applies a new VJP using the most recent DiT
+Jacobian. This prevents one old guided velocity from being integrated repeatedly
+at indices such as `2,3,4,5`, while retaining the correction already made by the
+preceding index.
 
 ## External dependencies
 

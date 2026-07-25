@@ -50,6 +50,7 @@ class PendingStepGuidance:
     feedback_drained: int
     feedback_updates: tuple[EncodedFeedback, ...]
     diagnostics: dict[str, float | int | bool]
+    endpoint_velocity_source: str
 
 
 class DreamZeroFeedbackEncoder:
@@ -259,6 +260,7 @@ class DreamZeroFBFMRuntime:
         self._step = 0
         self._linearization: EndpointLinearization | None = None
         self._pending_guidance: PendingStepGuidance | None = None
+        self._effective_velocity: tuple[Tensor, Tensor] | None = None
         self._latest_dit_step = -1
         self._lock = threading.RLock()
         if not getattr(self.head, "supports_external_step_guidance", False):
@@ -300,6 +302,7 @@ class DreamZeroFBFMRuntime:
             self._step = 0
             self._linearization = None
             self._pending_guidance = None
+            self._effective_velocity = None
             self._latest_dit_step = -1
             self._constraints = None
             self.feedback_encoder.reset()
@@ -433,6 +436,9 @@ class DreamZeroFBFMRuntime:
                 raise RuntimeError("DiT guidance was not staged for its UniPC update")
             self._pending_guidance = None
         else:
+            if self._effective_velocity is None:
+                raise RuntimeError("skipped UniPC step has no effective velocity")
+            endpoint_video_velocity, endpoint_action_velocity = self._effective_velocity
             constraints = self._ensure_constraints(video_sample, action_sample)
             (
                 state_target,
@@ -454,8 +460,8 @@ class DreamZeroFBFMRuntime:
                     result = joint_fbfm_guidance(
                         video_sample=video_sample,
                         action_sample=action_sample,
-                        video_velocity=video_velocity,
-                        action_velocity=action_velocity,
+                        video_velocity=endpoint_video_velocity,
+                        action_velocity=endpoint_action_velocity,
                         video_target=state_target,
                         video_mask=state_mask,
                         action_target=action_target,
@@ -477,6 +483,7 @@ class DreamZeroFBFMRuntime:
                 feedback_drained=drained,
                 feedback_updates=tuple(feedback_updates),
                 diagnostics=diagnostics,
+                endpoint_velocity_source="previous_guided",
             )
 
         updates = pending.feedback_updates
@@ -494,11 +501,24 @@ class DreamZeroFBFMRuntime:
             feedback_state_slots=[update.slot for update in updates],
             feedback_source_offsets=[list(update.source_offsets) for update in updates],
             feedback_blocks_complete=[update.complete for update in updates],
+            endpoint_velocity_source=pending.endpoint_velocity_source,
+            native_video_velocity_norm=float(
+                video_velocity.detach().float().norm().item()
+            ),
+            native_action_velocity_norm=float(
+                action_velocity.detach().float().norm().item()
+            ),
             **pending.diagnostics,
         )
         if pending.result is None:
-            return video_velocity.detach(), action_velocity.detach()
-        return pending.result.video_velocity, pending.result.action_velocity
+            guided = (video_velocity.detach(), action_velocity.detach())
+        else:
+            guided = (
+                pending.result.video_velocity,
+                pending.result.action_velocity,
+            )
+        self._effective_velocity = guided
+        return guided
 
     def _scheduler_step_complete(self, *, scheduler_index: int) -> None:
         next_index = scheduler_index + 1
@@ -588,6 +608,7 @@ class DreamZeroFBFMRuntime:
                 feedback_drained=drained,
                 feedback_updates=tuple(feedback_updates),
                 diagnostics=diagnostics,
+                endpoint_velocity_source="native_dit",
             )
 
             self.audit.write(
