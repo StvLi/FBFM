@@ -70,7 +70,7 @@ def main() -> None:
     parser.add_argument(
         "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
     )
-    parser.add_argument("--state-weight", type=float, default=56 / 9600)
+    parser.add_argument("--state-weight", type=float, default=1.0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.max_steps is None:

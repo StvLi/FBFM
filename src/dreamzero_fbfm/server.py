@@ -39,7 +39,7 @@ class ModelServer:
         port: int,
         audit_path: Path,
         beta: float = 10.0,
-        state_weight: float = 56 / 9600,
+        state_weight: float = 1.0,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("model server must bind to 127.0.0.1")

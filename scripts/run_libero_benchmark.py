@@ -49,7 +49,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--suite", action="append", choices=DEFAULT_SUITES)
     parser.add_argument("--mode", choices=("NONE", "RTC", "FBFM"), default="FBFM")
-    parser.add_argument("--state-weight", type=float, default=56 / 9600)
+    parser.add_argument("--state-weight", type=float, default=1.0)
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument(
         "--max-steps",

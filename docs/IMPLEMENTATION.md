@@ -51,10 +51,12 @@ second slot remains governed by the pretrained prior. A state target never enter
 solver-start history in that same generation.
 
 The active action overlap contains `8x7=56` physical coordinates, whereas one
-state latent contains `48x10x20=9600` coordinates. The fixed state block weight is
-therefore `56/9600`; this gives the two active modality blocks equal aggregate
-coordinate weight before the joint VJP. The unweighted/binary state-mask choice is
-retained as a documented ablation, not used as the default matched run.
+state latent contains `48x10x20=9600` coordinates. Both observed blocks use
+binary masks by default, as specified by the paper and the LingBot-VA route. A
+coordinate-count ratio such as `56/9600` equalizes the L1 sum of mask entries,
+but it suppresses the state's squared mask energy by a factor of 171 relative
+to the action block and is not the default joint-VJP protocol. Fractional
+`--state-weight` values remain available only as confidence-weight ablations.
 
 ## Preserved contracts
 

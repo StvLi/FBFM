@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+import dreamzero_fbfm.runtime as runtime_module
 from dreamzero_fbfm.constraints import ActionNormalizer
 from dreamzero_fbfm.runtime import (
     DreamZeroFBFMRuntime,
@@ -159,6 +160,43 @@ def test_runtime_applies_one_slot_revision_per_feedback(tmp_path):
     ]
     assert [record["feedback_state_slots"] for record in solver_records] == [[0]] * 8
     assert [record["state_target_updates"] for record in solver_records] == [1] * 8
+
+
+def test_runtime_default_uses_binary_state_mask(monkeypatch):
+    policy = FakePolicy()
+    normalizer = ActionNormalizer(
+        torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
+    )
+    runtime = DreamZeroFBFMRuntime(policy, normalizer, mode="FBFM")
+    assert runtime.state_weight == 1.0
+    runtime.begin_chunk(np.zeros((8, 7), dtype=np.float32), pseudo_async=False)
+
+    encoder = runtime.feedback_encoder
+    encoder._transform_frame = lambda item: torch.full(
+        (1, 1, 2, 1, 1), float(item.action_offset)
+    )
+    encoder._encode = lambda images: images[:, -1]
+    encoder.set_anchor(_feedback(0))
+    runtime.submit_feedback(_feedback(1))
+
+    captured = {}
+    original_guidance = runtime_module.joint_fbfm_guidance
+
+    def capture_guidance(**kwargs):
+        captured["video_mask"] = kwargs["video_mask"].detach().clone()
+        return original_guidance(**kwargs)
+
+    monkeypatch.setattr(runtime_module, "joint_fbfm_guidance", capture_guidance)
+    policy.action_head._run_diffusion_steps(
+        noisy_input=torch.randn(1, 2, 2, 1, 1),
+        action=torch.randn(1, 16, 32),
+        timestep=torch.full((1, 2), 600),
+        timestep_action=torch.full((1, 16), 600),
+        kv_cache_metadata={"update_kv_cache": False},
+    )
+
+    expected = torch.tensor([[[[[1.0]], [[0.0]]]]])
+    torch.testing.assert_close(captured["video_mask"], expected, rtol=0, atol=0)
 
 
 def test_runtime_hook_guides_action_and_detaches_solver_graph():
