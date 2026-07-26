@@ -98,11 +98,23 @@ historical runs used the legacy `56/9600` state weight and must not be combined
 with binary-mask results under one protocol label.
 
 The current RMS-balanced, relinearized object-6 validation is complete at
-`3/10 = 30.0%` (95% Wilson interval `10.8%-60.3%`), matching the paired native
-base's `3/10` point estimate. Its A6000 result root is
-`results/libero_object6_rms00764_fbfm_10_13de791`; the complete record and
-negative binary/recurrent diagnostics are in the paper experiment repository's
+`4/20 = 20.0%` (95% Wilson interval `8.1%-41.6%`), versus the paired native
+base at `5/20 = 25.0%` (95% Wilson interval `11.2%-46.9%`). Its A6000 result
+root is `results/libero_object6_rms00764_fbfm_10_13de791`; the historical
+directory name still contains `10`, but its ledger and summary now contain
+trials 0-19. The complete record and negative binary/recurrent diagnostics are
+in the paper experiment repository's
 `experiments/dreamzero_object6_binary_mask_diagnosis.md`.
+
+The 20-trial extension exposed a rare but severe solver outlier in FBFM trial
+18, wave 16. Eight generated actions had norms above 100, with a maximum of
+168.37 and maximum absolute coordinate 152.81; native base's maximum action
+norm across all 20 trials was 1.57. Scheduler indices 7-9 reused a Jacobian
+whose correction grew from 138.15 at index 6 to 11260.61 at index 9. RMS
+modality balancing therefore fixes the typical scale mismatch but does not
+guarantee that a cached Jacobian remains inside its local linearization domain.
+Do not report the current branch as numerically stable until a trust-region or
+guarded native-update fallback is implemented and retested.
 
 ## Table management
 

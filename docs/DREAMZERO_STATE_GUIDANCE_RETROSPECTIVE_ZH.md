@@ -3,9 +3,9 @@
 更新时间：2026-07-26
 
 本文复盘从发现 DreamZero 状态约束使用 `56/9600`、可能被过度削弱开始，
-到当前 RMS-balanced FBFM 在 `libero_object/task_006` 上以 `3/10` 追平
-native base 的全过程。本文只汇报已经运行过的代码和实验，并将已证实结论、
-工作假设及仍待验证的问题分开。
+到 RMS-balanced FBFM 在 `libero_object/task_006` 的前 10 次测试中以 `3/10`
+暂时追平 native base，再扩展到 FBFM `4/20`、base `5/20` 的全过程。本文只汇报
+已经运行过的代码和实验，并将已证实结论、工作假设及仍待验证的问题分开。
 
 ## 1. 问题与固定实验协议
 
@@ -15,7 +15,7 @@ native base 的全过程。本文只汇报已经运行过的代码和实验，�
 LIBERO suite: libero_object
 task id: 6
 instruction: pick up the butter and place it in the basket
-official init ids: 0-9（正式 10-episode 对照）
+official init ids: 0-19（正式 20-episode 配对对照）
 environment seed: 0
 model seed: fixed 0
 maximum horizon: 480
@@ -284,7 +284,7 @@ sqrt(56/9600) = 0.07637626158259733
 `6.74-7.01`，对应 state-to-action correction 为 `0.581-0.592`，没有再发生
 逐 index 爆炸。
 
-### 9.2 正式 10-episode 对照
+### 9.2 前 10 个 episode 的阶段结果
 
 | 方法 | 成功 | 成功 trial | 平均步数 | 平均 episode 时间 | 平均 wave 时间 |
 | --- | ---: | --- | ---: | ---: | ---: |
@@ -295,20 +295,55 @@ sqrt(56/9600) = 0.07637626158259733
 只有 trial 6 共同成功；FBFM-only 为 trial 2、7，base-only 为 trial 0、8。
 因此 FBFM 改变了闭环轨迹，而不是数值上退化成 base。
 
-正式 FBFM 运行的稳定性：
+### 9.3 扩展后的正式 20-episode 对照
+
+| 方法 | 成功 | 成功 trial | 平均步数 | 平均 episode 时间 | 平均 wave 时间 |
+| --- | ---: | --- | ---: | ---: | ---: |
+| native DreamZero base | 5/20 | 0, 6, 8, 13, 18 | 427.95 | 64.29 s | 1.123 s |
+| RMS-balanced FBFM | 4/20 | 2, 6, 7, 13 | 426.85 | 131.28 s | 2.391 s |
+
+最终点估计为 base `25%`、FBFM `20%`，差值 `-5` 个百分点。95% Wilson 区间分别为
+base `11.2%-46.9%`、FBFM `8.1%-41.6%`。配对结果为：共同成功 2 条，FBFM-only
+2 条，base-only 3 条，共同失败 13 条。20 次样本仍不足以证明真实成功率存在差异；
+两侧 exact McNemar 检验在 5 个 discordant pair 上为 `p=1.0`。
+
+20-episode FBFM 运行的资源和动作统计：
 
 ```text
-3998 executed actions
-action norm mean / P95 / max: 1.171 / 1.383 / 8.693
-maximum absolute action coordinate: 7.969
+8537 executed actions
+action norm mean / P95 / max: 1.292 / 1.387 / 168.370
+maximum absolute action coordinate: 152.813
 server errors: 0
 GPU allocated first/last 200 evaluations: 26.003 / 26.081 GiB
 GPU allocated peak: 27.250 GiB
 ```
 
 显存没有随推理波次线性增长，说明当前 feedback VAE、VJP 和缓存路径没有保留计算图。
-仍有少量 action outlier，需要在更大样本中继续观察。FBFM 平均 wall-clock 时间约为
-native base 的 `1.98x`；这是工程开销指标，不参与伪异步数学时钟定义。
+但 20 条数据否定了“RMS 已彻底消除动作爆炸”的判断。trial 18 的 wave 16 生成了
+连续 8 个异常动作（step 128-135），最大 action norm `168.370`，而完整 base 的最大
+action norm 仅为 `1.566`。该异常只占尾部，因而 FBFM P95 仍为正常的 `1.387`。
+FBFM 平均 wall-clock 时间约为 native base 的 `2.04x`；这是工程开销指标，不参与
+伪异步数学时钟定义。
+
+### 9.4 trial 18 尾部正反馈定位
+
+trial 18、wave 16 在 action 120-127 仍正常，异常从下一段 action 128 开始。对应
+solver block 的关键演化为：
+
+| Scheduler index | DiT/Jacobian | state residual | action correction | guided action velocity |
+| ---: | --- | ---: | ---: | ---: |
+| 2 | refresh | 10.30 | 6.79 | 76.56 |
+| 3-5 | reuse | 10.42-10.96 | 7.55-8.59 | 84.06-94.27 |
+| 6 | refresh | 10.94 | 138.15 | 1153.64 |
+| 7 | reuse | 60.32 | 699.83 | 4589.35 |
+| 8 | reuse | 280.51 | 2928.63 | 15195.36 |
+| 9 | reuse | 1116.46 | 11260.61 | 46455.02 |
+
+index 6 的 DiT/Jacobian 刷新是转折点；随后 index 7-9 在同一 Jacobian 上重算不断
+增大的 endpoint residual，进入局部线性近似失效后的正反馈。RMS 预条件器解决了
+一般情况下的 state/action 坐标尺度，但不能约束单个异常 Jacobian 的算子范数，也
+没有给缓存 Jacobian 设置 trust region。因此当前实现已解决普遍性爆炸，却仍存在
+低频、极高幅度的 solver instability。
 
 ## 10. 当前可以得出的原理性结论
 
@@ -322,8 +357,9 @@ cross-modal Jacobian 完全不同。如果不做模态预条件，9600 维状态
 ### 10.2 L1 mask mass 与 VJP 的 L2 能量不是同一件事
 
 旧 `56/9600` 只平衡 mask 元素之和，在欧氏修正范数下使状态比 action 弱约 13 倍。
-`1.0` 又使状态在进入 Jacobian 前强约 13 倍。RMS 系数正好位于两者之间，并在本次
-数值诊断中消除了正反馈爆炸。
+`1.0` 又使状态在进入 Jacobian 前强约 13 倍。RMS 系数正好位于两者之间，并消除了
+大多数 wave 中的普遍性爆炸，但 20-episode 尾部结果证明它不能单独限制异常
+Jacobian 引起的低频正反馈。
 
 ### 10.3 state target 的语义比“每步都反馈”更重要
 
@@ -346,21 +382,29 @@ hard overlap 本身不是本轮发现的首个故障源，但它会把异常生�
 昂贵的成功率测试。只看单次 correction 平均值不足以判断安全性，必须同时检查极值、
 最终物理 action 以及跨 wave 演化。
 
+### 10.6 缓存 Jacobian 需要局部有效域控制
+
+按当前设计，在跳过 DiT 的 index 重新计算 `Y-Xhat` 是正确的；但继续使用旧 `J_k`
+隐含假设当前 solver sample 仍处于该 Jacobian 的局部线性有效域。trial 18 表明这一
+假设会偶发失效。下一步应优先评估 correction trust region、相对 native velocity
+的 norm clip，或在残差/修正增长率越界时回退为当前 index 的无引导 native update。
+这些机制应限制 VJP 数值稳定性，而不是改变 hard-overlap 支持集或伪异步时序。
+
 ## 11. 尚不能得出的结论与后续实验
 
-当前 `3/10` 只能说明：在这个任务和这 10 个官方 init 上，RMS-balanced 版本已从
-binary-state 的 `0/20` 灾难恢复到 native base 的相同点估计。它不能证明：
+最终 20 次结果说明：RMS-balanced 版本已从 binary-state 的 `0/20` 灾难恢复到
+接近 native base 的点估计（`4/20` 对 `5/20`），但仍有低频数值爆炸。它不能证明：
 
 - FBFM 已在整个 LIBERO benchmark 上追平或超过 base；
-- 两种方法真实成功率相等；10 次的 Wilson 区间仍很宽；
+- 两种方法真实成功率相等；20 次的 Wilson 区间仍然高度重叠且较宽；
 - 当前 `0.076376` 是最优系数；它只是有理论依据且通过数值门控的默认点；
 - 先前队友报告的约 `90%` 与这里属于同一任务、checkpoint、seed 和 rollout 协议。
 
-正在把同一任务扩展到官方 init 0-19。完成后应至少报告以下三组 20-episode 结果：
+当前已经完成 native base 与 RMS FBFM 两组 20 次。仍应补充 matched `NONE`，形成：
 
-1. native base：官方 DreamZero rollout；
-2. matched `NONE`：同一 pseudo-async overlap 工程路径但零 guidance；
-3. RMS FBFM：action hard overlap + stride-3 rolling state feedback。
+1. native base：已完成，`5/20`；
+2. matched `NONE`：尚未完成，同一 pseudo-async overlap 工程路径但零 guidance；
+3. RMS FBFM：已完成，`4/20`，存在 trial 18 solver outlier。
 
 可再增加 `RTC` 和状态系数 `{56/9600, sqrt(56/9600), 1.0}` 消融。这样才能把
 native rollout 差异、action overlap、state feedback 和状态预条件器的影响分开。
@@ -374,17 +418,19 @@ active branch:
 active code commit:
   13de791
 
-active branch tip / handover commit:
-  fb701b1
+retrospective document commit before the 20-episode extension:
+  18924ce
 
 A6000 repository:
   /home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO
 
 RMS FBFM result:
   results/libero_object6_rms00764_fbfm_10_13de791
+  (directory name is historical; summary.json now contains 20 trials)
 
 native base result:
   results/libero_object6_matched_base_10_e04459b
+  (directory name is historical; summary.json now contains 20 trials)
 
 detailed experiment ledger:
   /home/oem/tmp_ws/aaai_paper/experiments/
