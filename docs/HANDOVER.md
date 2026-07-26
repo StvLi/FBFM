@@ -10,6 +10,8 @@ Updated: 2026-07-26
 | Monorepo branch | `fix/dreamzero-binary-state-mask` |
 | Imported standalone repository | `/home/oem/tmp_ws/DreamZero-FBFM-LIBERO` |
 | A6000 integration repository | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO` |
+| Active validation branch | `fix/dreamzero-relinearized-unipc-guidance` |
+| Active validation revision | `13de791` |
 | Imported standalone branch | `runnable-dreamzero-fbfm-libero` |
 | Rolling method revision | `118211b` |
 | Canonical audit/metadata revision | `1ee00fa` |
@@ -40,9 +42,13 @@ shards are read through host memory before the GPU transfer.
 ## Method mapping
 
 DreamZero transports video and action in one DiT call. FBFM reconstructs the
-joint endpoint at each native DiT evaluation, applies a block-diagonal observed
-state/action discrepancy, and computes one joint VJP. Cross-modal Jacobian terms
-are therefore retained. The integration preserves these upstream contracts:
+joint endpoint and applies a block-diagonal state/action discrepancy at every
+UniPC scheduler index. The full endpoint Jacobian is refreshed at the eight
+native DiT evaluations and reused at skipped DiT indices while the current
+sample, sigma, endpoint residual, and VJP are recomputed. Native velocities,
+not guided velocities, remain in `prev_predictions`. Cross-modal Jacobian terms
+are therefore retained without replacing DreamZero's cache schedule. The
+integration preserves these upstream contracts:
 
 - 16 native UniPC scheduler steps and the checkpoint's 8-evaluation DiT cache mask;
 - the released checkpoint, CFG, VAE, causal cache, action normalization, and 7D action output;
@@ -50,15 +56,15 @@ are therefore retained. The integration preserves these upstream contracts:
 - zero masks and the original numerical path in `NONE` mode.
 
 The action block constrains the committed `8 x 7 = 56` physical coordinates.
-The visual block constrains one `48 x 10 x 20 = 9600` latent slot. After every
-action, the newest real observation closes a five-frame causal rolling VAE window.
-Missing history is left-padded with the measured current-wave anchor; no
-unobserved future frame is copied into a hard target. The source window progresses
-from `[0,0,0,0,1]` to `[0,2,4,6,8]`; the latter is the complete block. The slot is re-encoded, refreshed and
-versioned before each of the eight DiT evaluations. Its default mask weight is
-now binary (`1.0`), matching the paper and LingBot-VA. Fractional weights are
-explicit ablations. See `docs/IMPLEMENTATION.md` for the solver equations and
-hook boundary.
+The visual block constrains one `48 x 10 x 20 = 9600` latent slot. Real feedback
+is sampled at the checkpoint's three-action video stride. Missing history is
+left-padded with the measured current-wave anchor; no unobserved future frame is
+copied into a hard target. The first two windows available in an eight-action
+wave are `[0,0,0,0,3]` and `[0,0,0,3,6]`. The action mask remains binary. The
+default DreamZero state coefficient is now the Euclidean coordinate-balance
+value `sqrt(56/9600)=0.07637626158259733`; `1.0` and `56/9600` are explicit
+binary-state and L1-mass ablations. See `docs/IMPLEMENTATION.md` for the solver
+equations and hook boundary.
 
 ## Experiment state
 
@@ -91,6 +97,13 @@ working, but does not by itself explain or recover the performance gap. These
 historical runs used the legacy `56/9600` state weight and must not be combined
 with binary-mask results under one protocol label.
 
+The current RMS-balanced, relinearized object-6 validation is complete at
+`3/10 = 30.0%` (95% Wilson interval `10.8%-60.3%`), matching the paired native
+base's `3/10` point estimate. Its A6000 result root is
+`results/libero_object6_rms00764_fbfm_10_13de791`; the complete record and
+negative binary/recurrent diagnostics are in the paper experiment repository's
+`experiments/dreamzero_object6_binary_mask_diagnosis.md`.
+
 ## Table management
 
 The rolling pilot tables are stored in the paper repository as:
@@ -106,8 +119,8 @@ launched, and use a new result root and filename prefix.
 
 ## Validation and caveats
 
-- Canonical CPU regression suite: 23 tests passed.
-- A6000 standalone route suite: 17 applicable tests passed. Two monorepo-path
+- Canonical CPU regression suite: 24 applicable tests passed.
+- A6000 standalone route suite: 24 applicable tests passed. Two monorepo-path
   tests are intentionally inapplicable to the standalone deployment layout.
 - The smoke succeeded in 168/480 steps; the formal pilot completed all 20 trials.
 - The solver audit contains 6,969 finite evaluations, 0 server errors, context
