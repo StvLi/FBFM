@@ -166,7 +166,8 @@ def test_runtime_updates_state_only_on_training_aligned_feedback(tmp_path):
     ]
 
 
-def test_runtime_default_uses_rms_balanced_state_mask(monkeypatch):
+def test_runtime_default_uses_l1_mass_balanced_state_mask(monkeypatch):
+    assert DEFAULT_STATE_WEIGHT == 56 / 9600
     policy = FakePolicy()
     normalizer = ActionNormalizer(
         torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32

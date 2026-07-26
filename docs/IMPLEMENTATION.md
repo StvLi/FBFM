@@ -53,13 +53,12 @@ solver-start history in that same generation.
 
 The active action overlap contains `8x7=56` physical coordinates, whereas one
 state latent contains `48x10x20=9600` coordinates. The action block remains a
-binary hard-overlap mask. The DreamZero route applies the state preconditioner
-`sqrt(56/9600)=0.0763762616`, which equalizes expected Euclidean mask energy
-under the diagnostic assumption of independent, equal-variance coordinates and
-an identity Jacobian. The older `56/9600` coefficient equalizes only the L1 sum
-of mask entries and makes state correction norms about 13.1 times weaker than
-this RMS-balanced value. A binary state coefficient of `1.0` and the L1-mass
-coefficient remain explicit ablations; neither is mixed into the default result.
+binary hard-overlap mask. This experiment branch applies the L1-mass state
+preconditioner `56/9600=0.0058333333`. It equalizes the sums of the action and
+state mask blocks and makes state correction norms about 13.1 times weaker than
+the RMS-balanced coefficient under an equal-variance, identity-Jacobian
+approximation. The RMS coefficient `sqrt(56/9600)=0.0763762616` and binary state
+coefficient `1.0` remain explicit command-line ablations.
 
 ## Preserved contracts
 
