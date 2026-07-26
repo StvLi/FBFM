@@ -4,8 +4,9 @@
 
 本文复盘从发现 DreamZero 状态约束使用 `56/9600`、可能被过度削弱开始，
 到 RMS-balanced FBFM 在 `libero_object/task_006` 的前 10 次测试中以 `3/10`
-暂时追平 native base，再扩展到 FBFM `4/20`、base `5/20` 的全过程。本文只汇报
-已经运行过的代码和实验，并将已证实结论、工作假设及仍待验证的问题分开。
+暂时追平 native base，再扩展到 RMS FBFM `4/20`、base `5/20`，最后在修正后的
+同一实现上重新启用 `56/9600` 并取得前 10 次 `6/10` 的全过程。本文只汇报已经
+运行过的代码和实验，并将已证实结论、工作假设及仍待验证的问题分开。
 
 ## 1. 问题与固定实验协议
 
@@ -47,17 +48,18 @@ v_j    = v_k - lambda(sigma_j) * g_j
 其中：
 
 - `W` 表示哪些 state/action 坐标已经被真实观测或执行，支持集仍为二值 hard mask；
-- `P` 是跨模态预条件器，动作块系数为 `1`，当前状态块系数为
-  `sqrt(56/9600)=0.0763762616`；
+- `P` 是跨模态预条件器，动作块系数为 `1`；当前 L1-mass 实验分支的状态块系数为
+  `56/9600=0.0058333333`，RMS 对照分支为 `sqrt(56/9600)=0.0763762616`；
 - `v_k` 和 `J_k` 只在 DreamZero 原生 8 次 DiT evaluation 时刷新；
 - `Xhat_j`、残差、VJP 和引导速度在全部 16 个 UniPC index 上重新计算；
 - `prev_predictions` 只缓存未引导的原生 `v_k`，不缓存 `v_j`。
 
 当前代码把状态预条件系数代数等价地乘入 `state_mask`。为避免论文表述混乱，
 建议理论部分明确写成“二值 hard-overlap 矩阵 `W` + 模态预条件器 `P`”。如果把
-两者合并为一个有效矩阵，则有效状态系数确实为非二值的 `0.076376`。
+两者合并为一个有效矩阵，则 L1/RMS 分支的有效状态系数分别为非二值的
+`0.005833`/`0.076376`。
 
-## 3. 为什么最初的 `56/9600` 有问题
+## 3. 为什么最初怀疑 `56/9600` 过弱
 
 一轮 overlap 中被约束的物理 action 坐标数为：
 
@@ -345,44 +347,109 @@ index 6 的 DiT/Jacobian 刷新是转折点；随后 index 7-9 在同一 Jacobia
 没有给缓存 Jacobian 设置 trust region。因此当前实现已解决普遍性爆炸，却仍存在
 低频、极高幅度的 solver instability。
 
-## 10. 当前可以得出的原理性结论
+## 10. 尝试七：在修正后的实现上恢复 `56/9600`
 
-### 10.1 FBFM 的约束强度不能只由 mask 是否二值决定
+RMS 20 次测试暴露 trial 18 的极端尾部后，我们重新评估最初的 L1-mass 系数。
+关键区别是：这次只改变 `P_state`，保留此前已经修正的全部工程语义：
+
+- causal rolling-past feedback；
+- 与 checkpoint 对齐的 stride-3 VAE 编码；
+- 16 个 UniPC index、8 次原生 DiT evaluation；
+- native velocity cache 与逐 index endpoint residual 重算；
+- 相同 `H=16, d=8, s=8` 伪异步协议、seed 和 official init。
+
+提交与分支：
+
+```text
+branch: experiment/dreamzero-l1mass-state-weight
+commit: cb08c9e552730d26cc446885e79a3e270a270d0c
+default P_state: 56/9600 = 0.005833333333333334
+```
+
+### 10.1 前 10 个 episode 的严格配对阶段结果
+
+| 方法 | 成功 | 成功 trial | 平均步数 | 平均 episode 时间 | action norm mean/P95/max |
+| --- | ---: | --- | ---: | ---: | ---: |
+| native DreamZero base | 3/10 | 0, 6, 8 | 414.8 | 62.21 s | 1.16 / 1.42 / 1.57（20 次整体） |
+| RMS-balanced FBFM | 3/10 | 2, 6, 7 | 399.8 | 123.16 s | 1.17 / 1.38 / 8.69 |
+| L1-mass FBFM | 6/10 | 0, 2, 5, 6, 7, 8 | 324.8 | 100.12 s | 1.179 / 1.414 / 1.612 |
+
+L1 相对 RMS 和 base 的前 10 次点估计均提高 `30` 个百分点。其 95% Wilson 区间为
+`31.3%-83.2%`，仍与两个 `3/10` 对照的 `10.8%-60.3%` 重叠。配对标签显示：
+
+- L1 保留 RMS 的全部成功 trial `2、6、7`，并增加 `0、5、8`；
+- L1 保留 base 的全部成功 trial `0、6、8`，并增加 `2、5、7`；
+- L1 对两个对照各有 3 个单侧新增成功、0 个丢失成功，双侧 exact McNemar
+  `p=0.25`，趋势很强但样本不足以称为统计显著。
+
+前 10 次共有 3248 个执行动作，全部有限，最大 action norm `1.612`、最大绝对坐标
+`1.165`。这与 RMS trial 8 的 norm `8.69` 以及后续 trial 18 的 norm `168.37`
+形成明显对照。至少在当前前缀中，L1 系数既保留了非零状态反馈带来的轨迹改变，
+又提供了更强的闭环阻尼。
+
+### 10.2 本轮最重要的认识修正
+
+最初看到旧版本 `56/9600` 成功率偏低时，我们把主要问题归因于“状态约束被过度
+削弱”。现在可以更精确地修正这句话：
+
+1. `56/9600` 在 L2 坐标能量意义下确实比 RMS 平衡弱约 13.1 倍；这个数学判断不变。
+2. 旧版本表现弱不能单独归因于该系数，因为旧版本同时存在不因果 target、训练
+   stride 错位和 guided velocity 污染 DreamZero cache 等实现问题。
+3. RMS 坐标平衡只考虑坐标数，没有包含真实 `J_state->action` 的算子增益。DreamZero
+   joint DiT 的 cross-modal Jacobian 会把看似适中的 state residual 放大到 action，
+   因此 RMS 在闭环中可能仍然过强。
+4. 在修正时序和缓存后，L1 系数不再等价于“几乎没有状态反馈”。它足以改变成功
+   集合，并在前 10 次中同时优于 RMS 和 base；更小的增益反而避免 solver 离开缓存
+   Jacobian 的局部线性有效域。
+
+因此当前最合理的工程结论是：将二值 `W` 与模态增益 `P` 分开；保留 hard overlap，
+并把 `P_state=56/9600` 作为批量实验候选默认值。它不是从理论上证明的全局最优值，
+而是当前同时通过成功率和动作稳定性门控的系数。
+
+本节记录的是完整且可配对的前 10 次阶段结果。20-episode 运行仍在进行，最终成功率、
+动作尾部和 solver audit 完成前，不应把 `6/10` 写成最终 benchmark 结果。
+
+## 11. 当前可以得出的原理性结论
+
+### 11.1 FBFM 的约束强度不能只由 mask 是否二值决定
 
 二值 `W` 只定义 hard-overlap 的支持集。视频 latent 和 action 的维度、尺度以及
 cross-modal Jacobian 完全不同。如果不做模态预条件，9600 维状态块会在欧氏 VJP
 中压倒 56 维 action 块。`P_state=sqrt(56/9600)` 是在简单等方差/单位 Jacobian
 假设下的第一阶坐标平衡，不是经验性把反馈任意调小。
 
-### 10.2 L1 mask mass 与 VJP 的 L2 能量不是同一件事
+### 11.2 L1 mask mass 与 VJP 的 L2 能量不是同一件事
 
 旧 `56/9600` 只平衡 mask 元素之和，在欧氏修正范数下使状态比 action 弱约 13 倍。
 `1.0` 又使状态在进入 Jacobian 前强约 13 倍。RMS 系数正好位于两者之间，并消除了
 大多数 wave 中的普遍性爆炸，但 20-episode 尾部结果证明它不能单独限制异常
 Jacobian 引起的低频正反馈。
 
-### 10.3 state target 的语义比“每步都反馈”更重要
+新的 L1 前 10 次结果进一步说明，L2 坐标能量平衡不是闭环最优性的充分条件。
+真实 Jacobian 增益和 solver 的局部线性有效域比单纯坐标计数更重要。
+
+### 11.3 state target 的语义比“每步都反馈”更重要
 
 每次执行 action 后都可以接收 observation，但不能把未观测未来帧伪装为 hard
 target。rolling feedback 必须同时满足：因果、仅使用已观测帧、与 checkpoint
 训练视频 stride 对齐。当前实现保留每步 observation，在 stride-3 位置刷新 latent，
 这并不等价于丢弃中间环境状态。
 
-### 10.4 solver 加速缓存必须缓存原生场，不能缓存受约束后的场
+### 11.4 solver 加速缓存必须缓存原生场，不能缓存受约束后的场
 
 DreamZero 复用 DiT velocity 是模型自身的加速设计。FBFM guidance 是当前 solver
 状态和当前约束的函数，不能作为新的原生 velocity 写回跨 index 缓存。正确做法是
 缓存 native `v_k/J_k`，每个 index 重算 endpoint residual 和 VJP；否则同一高噪声
 修正会被重复积分或递归放大。
 
-### 10.5 hard action overlap 会传播错误，也会提供必要一致性
+### 11.5 hard action overlap 会传播错误，也会提供必要一致性
 
 hard overlap 本身不是本轮发现的首个故障源，但它会把异常生成的 committed action
 带入下一轮约束，形成闭环正反馈。因此必须先通过 VJP/action-norm 数值门控，再进行
 昂贵的成功率测试。只看单次 correction 平均值不足以判断安全性，必须同时检查极值、
 最终物理 action 以及跨 wave 演化。
 
-### 10.6 缓存 Jacobian 需要局部有效域控制
+### 11.6 缓存 Jacobian 需要局部有效域控制
 
 按当前设计，在跳过 DiT 的 index 重新计算 `Y-Xhat` 是正确的；但继续使用旧 `J_k`
 隐含假设当前 solver sample 仍处于该 Jacobian 的局部线性有效域。trial 18 表明这一
@@ -390,14 +457,14 @@ hard overlap 本身不是本轮发现的首个故障源，但它会把异常生�
 的 norm clip，或在残差/修正增长率越界时回退为当前 index 的无引导 native update。
 这些机制应限制 VJP 数值稳定性，而不是改变 hard-overlap 支持集或伪异步时序。
 
-## 11. 尚不能得出的结论与后续实验
+## 12. 尚不能得出的结论与后续实验
 
 最终 20 次结果说明：RMS-balanced 版本已从 binary-state 的 `0/20` 灾难恢复到
 接近 native base 的点估计（`4/20` 对 `5/20`），但仍有低频数值爆炸。它不能证明：
 
 - FBFM 已在整个 LIBERO benchmark 上追平或超过 base；
 - 两种方法真实成功率相等；20 次的 Wilson 区间仍然高度重叠且较宽；
-- 当前 `0.076376` 是最优系数；它只是有理论依据且通过数值门控的默认点；
+- 当前 `0.005833` 是全任务最优系数；现有 L1 结果仍只有单任务前 10 次；
 - 先前队友报告的约 `90%` 与这里属于同一任务、checkpoint、seed 和 rollout 协议。
 
 当前已经完成 native base 与 RMS FBFM 两组 20 次。仍应补充 matched `NONE`，形成：
@@ -405,18 +472,19 @@ hard overlap 本身不是本轮发现的首个故障源，但它会把异常生�
 1. native base：已完成，`5/20`；
 2. matched `NONE`：尚未完成，同一 pseudo-async overlap 工程路径但零 guidance；
 3. RMS FBFM：已完成，`4/20`，存在 trial 18 solver outlier。
+4. L1-mass FBFM：20 次运行中，已完成的前 10 次为 `6/10`。
 
 可再增加 `RTC` 和状态系数 `{56/9600, sqrt(56/9600), 1.0}` 消融。这样才能把
 native rollout 差异、action overlap、state feedback 和状态预条件器的影响分开。
 
-## 12. 代码与数据索引
+## 13. 代码与数据索引
 
 ```text
 active branch:
-  fix/dreamzero-relinearized-unipc-guidance
+  experiment/dreamzero-l1mass-state-weight
 
 active code commit:
-  13de791
+  cb08c9e552730d26cc446885e79a3e270a270d0c
 
 retrospective document commit before the 20-episode extension:
   18924ce
@@ -431,6 +499,9 @@ RMS FBFM result:
 native base result:
   results/libero_object6_matched_base_10_e04459b
   (directory name is historical; summary.json now contains 20 trials)
+
+L1-mass FBFM result (20-trial run in progress):
+  results/libero_object6_l1mass005833_relinearized_fbfm_20_13de791
 
 detailed experiment ledger:
   /home/oem/tmp_ws/aaai_paper/experiments/
