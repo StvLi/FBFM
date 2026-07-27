@@ -15,7 +15,7 @@ from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ChunkConstraints, ConstraintMode
 from .guidance import EndpointLinearization, GuidanceResult, joint_fbfm_guidance
 from .pseudo_clock import SolverClock
-from .settings import DEFAULT_STATE_WEIGHT
+from .settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 
 
 class InferenceCancelled(RuntimeError):
@@ -215,6 +215,7 @@ class DreamZeroFBFMRuntime:
         execution_horizon: int = 8,
         solver_evaluations: int | None = None,
         state_weight: float = DEFAULT_STATE_WEIGHT,
+        state_feedback_kp: float = DEFAULT_STATE_FEEDBACK_KP,
         beta: float = 10.0,
         diagnostic_vjp: bool = False,
         audit_path: str | None = None,
@@ -247,7 +248,10 @@ class DreamZeroFBFMRuntime:
         self.native_dit_mask = native_mask
         if not 0.0 < state_weight <= 1.0:
             raise ValueError("state_weight must be in (0, 1]")
+        if not np.isfinite(state_feedback_kp) or state_feedback_kp <= 0.0:
+            raise ValueError("state_feedback_kp must be finite and positive")
         self.state_weight = float(state_weight)
+        self.state_feedback_kp = float(state_feedback_kp)
         self.beta = beta
         self.diagnostic_vjp = bool(diagnostic_vjp)
         self.audit = JsonlAudit(audit_path)
@@ -331,6 +335,8 @@ class DreamZeroFBFMRuntime:
                 mode=self.mode.value,
                 pseudo_async=pseudo_async,
                 state_weight=self.state_weight,
+                state_feedback_kp=self.state_feedback_kp,
+                effective_state_weight=self.state_weight * self.state_feedback_kp,
                 diagnostic_vjp=self.diagnostic_vjp,
                 action_mask_nonzero=int(torch.count_nonzero(mask).item()),
             )
@@ -375,17 +381,18 @@ class DreamZeroFBFMRuntime:
                     updates.append(update)
         return drained, updates
 
-    @staticmethod
-    def _unguided_diagnostics() -> dict[str, float | int | bool]:
+    def _unguided_diagnostics(self) -> dict[str, float | int | bool]:
         return {
             "guided": False,
             "state_mask_nonzero": 0,
             "action_mask_nonzero": 0,
             "state_error_norm": 0.0,
+            "aligned_state_error_norm": 0.0,
             "action_error_norm": 0.0,
             "video_correction_norm": 0.0,
             "action_correction_norm": 0.0,
             "guidance_weight": 0.0,
+            "state_feedback_kp": self.state_feedback_kp,
             "jacobian_reused": False,
         }
 
@@ -463,6 +470,7 @@ class DreamZeroFBFMRuntime:
                         action_mask=action_mask,
                         sigma=sigma,
                         beta=self.beta,
+                        state_feedback_kp=self.state_feedback_kp,
                         decompose_vjp=self.diagnostic_vjp,
                         linearization=self._linearization,
                     )
@@ -562,6 +570,7 @@ class DreamZeroFBFMRuntime:
                         action_mask=action_mask,
                         sigma=sigma,
                         beta=self.beta,
+                        state_feedback_kp=self.state_feedback_kp,
                         decompose_vjp=self.diagnostic_vjp,
                         cache_linearization=True,
                     )

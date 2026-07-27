@@ -11,7 +11,7 @@ from dreamzero_fbfm.runtime import (
     DreamZeroFeedbackEncoder,
     FeedbackObservation,
 )
-from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
+from dreamzero_fbfm.settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 
 
 class FakeHead:
@@ -174,6 +174,7 @@ def test_runtime_default_uses_l1_mass_balanced_state_mask(monkeypatch):
     )
     runtime = DreamZeroFBFMRuntime(policy, normalizer, mode="FBFM")
     assert runtime.state_weight == DEFAULT_STATE_WEIGHT
+    assert runtime.state_feedback_kp == DEFAULT_STATE_FEEDBACK_KP == 1.0
     runtime.begin_chunk(np.zeros((8, 7), dtype=np.float32), pseudo_async=False)
 
     encoder = runtime.feedback_encoder
@@ -190,6 +191,7 @@ def test_runtime_default_uses_l1_mass_balanced_state_mask(monkeypatch):
 
     def capture_guidance(**kwargs):
         captured["video_mask"] = kwargs["video_mask"].detach().clone()
+        captured["state_feedback_kp"] = kwargs["state_feedback_kp"]
         return original_guidance(**kwargs)
 
     monkeypatch.setattr(runtime_module, "joint_fbfm_guidance", capture_guidance)
@@ -203,6 +205,7 @@ def test_runtime_default_uses_l1_mass_balanced_state_mask(monkeypatch):
 
     expected = torch.tensor([[[[[DEFAULT_STATE_WEIGHT]], [[0.0]]]]])
     torch.testing.assert_close(captured["video_mask"], expected, rtol=0, atol=0)
+    assert captured["state_feedback_kp"] == 1.0
 
 
 def test_runtime_guides_current_step_without_polluting_native_cache(tmp_path):

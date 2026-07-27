@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -47,6 +48,7 @@ def joint_fbfm_guidance(
     action_mask: Tensor,
     sigma: Tensor | float,
     beta: float = 10.0,
+    state_feedback_kp: float = 1.0,
     decompose_vjp: bool = False,
     linearization: EndpointLinearization | None = None,
     cache_linearization: bool = False,
@@ -59,6 +61,8 @@ def joint_fbfm_guidance(
     """
     if beta <= 0:
         raise ValueError("beta must be positive")
+    if not math.isfinite(state_feedback_kp) or state_feedback_kp <= 0:
+        raise ValueError("state_feedback_kp must be finite and positive")
     if video_sample.shape != video_velocity.shape or action_sample.shape != action_velocity.shape:
         raise ValueError("sample/velocity shape mismatch")
     if video_target.shape != video_sample.shape or action_target.shape != action_sample.shape:
@@ -75,10 +79,12 @@ def joint_fbfm_guidance(
                 "state_mask_nonzero": 0,
                 "action_mask_nonzero": 0,
                 "state_error_norm": 0.0,
+                "aligned_state_error_norm": 0.0,
                 "action_error_norm": 0.0,
                 "video_correction_norm": 0.0,
                 "action_correction_norm": 0.0,
                 "guidance_weight": 0.0,
+                "state_feedback_kp": float(state_feedback_kp),
             },
         )
 
@@ -87,7 +93,8 @@ def joint_fbfm_guidance(
     )
     video_endpoint = video_sample - sigma_value * video_velocity
     action_endpoint = action_sample - sigma_value * action_velocity
-    state_error = (video_target - video_endpoint) * video_mask
+    aligned_state_error = (video_target - video_endpoint) * video_mask
+    state_error = state_feedback_kp * aligned_state_error
     action_error = (action_target - action_endpoint) * action_mask
     if linearization is None:
         active_linearization = EndpointLinearization(
@@ -202,6 +209,9 @@ def joint_fbfm_guidance(
             "state_mask_coordinate_count": state_coordinates,
             "action_mask_coordinate_count": action_coordinates,
             "state_error_norm": float(state_error.detach().float().norm().item()),
+            "aligned_state_error_norm": float(
+                aligned_state_error.detach().float().norm().item()
+            ),
             "action_error_norm": float(action_error.detach().float().norm().item()),
             "state_error_rms": float(state_error.detach().float().norm().item() / state_scale),
             "action_error_rms": float(action_error.detach().float().norm().item() / action_scale),
@@ -212,6 +222,7 @@ def joint_fbfm_guidance(
             "video_correction_norm": float(video_correction.detach().float().norm().item()),
             "action_correction_norm": float(action_correction.detach().float().norm().item()),
             "guidance_weight": float(weight.item()),
+            "state_feedback_kp": float(state_feedback_kp),
             "vjp_decomposed": decompose_vjp,
             "jacobian_reused": linearization is not None,
             **component_diagnostics,

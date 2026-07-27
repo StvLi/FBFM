@@ -7,7 +7,10 @@ DreamZero transports predicted video latents `Z` and a 16x32 padded action tenso
 and endpoint Jacobian `J_k`. At each UniPC scheduler index `j` served by that
 cached DiT result, the runtime reconstructs
 
-`Xhat_j = X_j - sigma_j * v_k` and `e_j = W * (Y_j - Xhat_j)`.
+`Xhat_j = X_j - sigma_j * v_k`. The modality residuals are
+
+`e_Z = kp * P_Z * W_Z * (Y_Z - Zhat_j)` and
+`e_A = W_A * (Y_A - Ahat_j)`.
 
 It then evaluates `g_j = J_k^T e_j`. The DiT velocity and Jacobian are refreshed
 only at the next native evaluation, but `Xhat_j`, `e_j`, the guidance schedule,
@@ -53,12 +56,12 @@ solver-start history in that same generation.
 
 The active action overlap contains `8x7=56` physical coordinates, whereas one
 state latent contains `48x10x20=9600` coordinates. The action block remains a
-binary hard-overlap mask. This experiment branch applies the L1-mass state
-preconditioner `56/9600=0.0058333333`. It equalizes the sums of the action and
-state mask blocks and makes state correction norms about 13.1 times weaker than
-the RMS-balanced coefficient under an equal-variance, identity-Jacobian
-approximation. The RMS coefficient `sqrt(56/9600)=0.0763762616` and binary state
-coefficient `1.0` remain explicit command-line ablations.
+binary hard-overlap mask. This experiment branch fixes the L1-mass state
+preconditioner `P_Z=56/9600=0.0058333333`, which equalizes the sums of the action
+and state mask blocks. A separate positive proportional gain `kp` scales only
+the aligned state residual before the joint VJP; the action residual remains at
+unit gain. Thus `kp=1` reproduces the completed L1-mass method while keeping the
+interpretable alignment coefficient unchanged.
 
 ## Preserved contracts
 
@@ -72,8 +75,10 @@ coefficient `1.0` remain explicit command-line ablations.
 ## Audit contract
 
 Each native `solver_step` record contains mode, DiT index, sigma, feedback count,
-constraint version, mask populations, endpoint errors, VJP norms, guidance weight,
-and allocated CUDA bytes. Each `scheduler_guidance_step` additionally records its
-UniPC index and whether the Jacobian was refreshed or reused. Exceptions are
-written as server error records. Episode records include task/init/seed, success,
-executed steps, wave count, timing and the deterministic grant schedule.
+constraint version, mask populations, aligned/effective state errors, `kp`, VJP
+norms, guidance weight, and allocated CUDA bytes. Each
+`scheduler_guidance_step` additionally records its UniPC index and whether the
+Jacobian was refreshed or reused. Exceptions are written as server error records.
+Episode records include task/init/seed, success, executed steps, wave count,
+timing, the alignment weight, `kp`, their effective product, and the deterministic
+grant schedule.

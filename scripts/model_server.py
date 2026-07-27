@@ -13,7 +13,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 FBFM_REPOSITORY = REPOSITORY.parents[1]
 sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
-from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
+from dreamzero_fbfm.settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 
 
 def main() -> None:
@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--beta", type=float, default=10.0)
     parser.add_argument("--state-weight", type=float, default=DEFAULT_STATE_WEIGHT)
+    parser.add_argument(
+        "--state-feedback-kp", type=float, default=DEFAULT_STATE_FEEDBACK_KP
+    )
     parser.add_argument("--diagnostic-vjp", action="store_true")
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path)
@@ -48,6 +51,7 @@ def main() -> None:
     os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
     from fbfm.model_runtime import load_policy, reset_policy_state
+
     from dreamzero_fbfm.constraints import ActionNormalizer
     from dreamzero_fbfm.server import ModelServer
 
@@ -65,6 +69,7 @@ def main() -> None:
         port=args.port,
         beta=args.beta,
         state_weight=args.state_weight,
+        state_feedback_kp=args.state_feedback_kp,
         diagnostic_vjp=args.diagnostic_vjp,
         audit_path=args.audit,
     )
@@ -74,6 +79,8 @@ def main() -> None:
         "host": args.host,
         "port": args.port,
         "state_weight": args.state_weight,
+        "state_feedback_kp": args.state_feedback_kp,
+        "effective_state_weight": args.state_weight * args.state_feedback_kp,
         "diagnostic_vjp": args.diagnostic_vjp,
         "load": load_report,
     }

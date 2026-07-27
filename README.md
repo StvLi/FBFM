@@ -36,17 +36,18 @@ time using measured latency. It adds:
 | rolling VAE sample interval | 3 action steps (checkpoint training stride) |
 | observations per latent | 4 |
 | active state slots per wave | first of 2 predicted latent slots |
-| state modality weight | `56/9600 = 0.0058333333` |
+| state alignment weight | `56/9600 = 0.0058333333` |
+| state feedback gain `kp` | `1.0` |
 | guidance clip `beta` | 10 |
 
 `NONE`, `RTC`, and `FBFM` use the same model, native 8-DiT cache schedule, rollout,
 noise seeds and pseudo-clock. Only masks differ: `NONE` uses zero masks, `RTC`
 uses the normalized 7-channel action prefix, and `FBFM` adds observed latent
-state slots. The action overlap remains a binary hard constraint. This experiment
-branch defaults to the L1-mass coefficient `56/9600`, which is showing a strong
-preliminary result on `libero_object/task_006` but is not yet a completed
-benchmark result. `--state-weight 0.07637626158259733` selects the RMS-balanced
-ablation and `--state-weight 1.0` selects the unbalanced binary-state ablation.
+state slots. The action overlap remains a binary hard constraint. The state
+alignment coefficient stays fixed at the interpretable L1-mass value `56/9600`.
+`--state-feedback-kp` independently scales only the aligned state residual; it
+does not scale action overlap. The default `kp=1` is numerically identical to the
+completed L1-mass experiment.
 
 DreamZero reuses each native DiT prediction across one or more UniPC updates.
 The integration deliberately keeps the cached prediction unguided. For every
@@ -110,7 +111,8 @@ $BASE/envs/miniconda3/envs/dreamzero/bin/python $REPO/scripts/model_server.py \
   --base-workspace $BASE \
   --checkpoint $BASE/checkpoints/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000 \
   --tokenizer $BASE/assets/tokenizers/umt5-xxl \
-  --mode FBFM --state-weight 0.005833333333333334 --port 18766 \
+  --mode FBFM --state-weight 0.005833333333333334 \
+  --state-feedback-kp 1.0 --port 18766 \
   --audit $REPO/results/smoke_fbfm/solver.jsonl \
   --ready-file $REPO/results/smoke_fbfm/ready.json
 ```
@@ -124,6 +126,7 @@ BASE=${DREAMZERO_BASE_WORKSPACE:-/home/deepcybo-lite/fbfm_ws}
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/libero_experiment.py \
   --base-workspace $BASE --mode FBFM --state-weight 0.005833333333333334 \
+  --state-feedback-kp 1.0 \
   --suite libero_spatial --task-id 0 \
   --trial-start 0 --trials 1 --max-steps 480 --port 18766 \
   --model-seed-rule fixed --solver-release-policy uniform \
@@ -146,6 +149,25 @@ PYTHONPATH=src:../.. python -m pytest
 Primary generated files are ignored under `results/`: `episodes.jsonl`,
 `summary.json`, `solver.jsonl`, and the model-load ready report.
 
+## State-feedback kp search
+
+The screening search fixes `--state-weight 0.005833333333333334` and varies only
+`--state-feedback-kp`. Its initial logarithmic points are `0.001`, `1`, and
+`100`. The `kp=1` point reuses the matching rows from the completed L1-mass
+record. Each new point runs four fixed tasks (`libero_spatial` 1 and 9;
+`libero_object` 0 and 6), official init IDs 0-4, fixed model seed 0, and a
+distinct result directory. Later points bisect a selected interval
+geometrically:
+
+```text
+next_kp = sqrt(lower_kp * upper_kp)
+```
+
+The machine-readable protocol is in `config/kp_search.yaml`. The model server
+and benchmark client must receive the same `--state-weight` and
+`--state-feedback-kp`; the reset handshake rejects a mismatch before an episode
+starts.
+
 ## Full 130-task benchmark
 
 The model server accepts sequential simulator clients without reloading the
@@ -157,6 +179,7 @@ CODE_COMMIT=$(git -C "$FBFM_ROOT" rev-parse --short HEAD)
 PYTHONPATH=$REPO/src MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
   $BASE/envs/miniconda3/envs/libero/bin/python $REPO/scripts/run_libero_benchmark.py \
   --base-workspace $BASE --mode FBFM --state-weight 0.005833333333333334 \
+  --state-feedback-kp 1.0 \
   --trials 20 --max-steps 480 \
   --model-seed-rule fixed --solver-release-policy uniform \
   --code-commit "$CODE_COMMIT" --port 18766 \

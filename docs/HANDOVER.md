@@ -60,12 +60,13 @@ The visual block constrains one `48 x 10 x 20 = 9600` latent slot. Real feedback
 is sampled at the checkpoint's three-action video stride. Missing history is
 left-padded with the measured current-wave anchor; no unobserved future frame is
 copied into a hard target. The first two windows available in an eight-action
-wave are `[0,0,0,0,3]` and `[0,0,0,3,6]`. The action mask remains binary. This
-experiment branch defaults to the L1-mass state coefficient
-`56/9600=0.005833333333333334`. The RMS value
-`sqrt(56/9600)=0.07637626158259733` and binary-state value `1.0` remain explicit
-command-line ablations. See `docs/IMPLEMENTATION.md` for the solver equations
-and hook boundary.
+wave are `[0,0,0,0,3]` and `[0,0,0,3,6]`. The action mask remains binary. The
+state alignment coefficient is fixed at the L1-mass value
+`56/9600=0.005833333333333334`. A separate `state_feedback_kp` scales only the
+aligned state residual, with `kp=1` reproducing the completed L1-mass result.
+The initial search points are `0.001`, `1`, and `100`; the middle point reuses
+the existing record. See `docs/IMPLEMENTATION.md` for the solver equations and
+hook boundary.
 
 ## Experiment state
 

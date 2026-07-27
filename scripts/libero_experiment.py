@@ -17,8 +17,10 @@ sys.path[:0] = [str(REPOSITORY / "src"), str(FBFM_REPOSITORY)]
 
 from dreamzero_fbfm.client import FBFMClient
 from dreamzero_fbfm.pseudo_clock import solver_grants
-from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
-
+from dreamzero_fbfm.settings import (
+    DEFAULT_STATE_FEEDBACK_KP,
+    DEFAULT_STATE_WEIGHT,
+)
 
 DEFAULT_MAX_STEPS = {
     "libero_spatial": 480,
@@ -72,6 +74,9 @@ def main() -> None:
         "--model-seed-rule", choices=("fixed", "trial_offset"), default="fixed"
     )
     parser.add_argument("--state-weight", type=float, default=DEFAULT_STATE_WEIGHT)
+    parser.add_argument(
+        "--state-feedback-kp", type=float, default=DEFAULT_STATE_FEEDBACK_KP
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.max_steps is None:
@@ -117,7 +122,13 @@ def main() -> None:
     try:
         for trial_id in range(args.trial_start, args.trial_start + args.trials):
             model_seed = args.seed if args.model_seed_rule == "fixed" else args.seed + trial_id
-            client.reset(task.language, model_seed)
+            client.reset(
+                task.language,
+                model_seed,
+                mode=args.mode,
+                state_weight=args.state_weight,
+                state_feedback_kp=args.state_feedback_kp,
+            )
             env = OffScreenRenderEnv(
                 bddl_file_name=str(bddl_path), camera_heights=256, camera_widths=256
             )
@@ -221,6 +232,10 @@ def main() -> None:
                     "scheduler_steps": 16,
                     "dit_evaluations": 8,
                     "state_weight": args.state_weight,
+                    "state_feedback_kp": args.state_feedback_kp,
+                    "effective_state_weight": (
+                        args.state_weight * args.state_feedback_kp
+                    ),
                     "solver_grants": list(grants),
                     "solver_release_policy": args.solver_release_policy,
                     "model_seed_rule": args.model_seed_rule,

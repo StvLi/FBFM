@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import socket
 import threading
 import time
@@ -15,7 +16,7 @@ from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ConstraintMode
 from .observation_history import CausalObservationHistory
 from .runtime import DreamZeroFBFMRuntime, FeedbackObservation, InferenceCancelled
-from .settings import DEFAULT_STATE_WEIGHT
+from .settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 from .transport import decode_array, encode_array, receive_message, send_message
 
 
@@ -41,6 +42,7 @@ class ModelServer:
         audit_path: Path,
         beta: float = 10.0,
         state_weight: float = DEFAULT_STATE_WEIGHT,
+        state_feedback_kp: float = DEFAULT_STATE_FEEDBACK_KP,
         diagnostic_vjp: bool = False,
     ) -> None:
         if host != "127.0.0.1":
@@ -56,12 +58,33 @@ class ModelServer:
             mode=mode,
             beta=beta,
             state_weight=state_weight,
+            state_feedback_kp=state_feedback_kp,
             diagnostic_vjp=diagnostic_vjp,
             audit_path=str(audit_path),
         )
         self.task_description: str | None = None
         self.job: InferenceJob | None = None
         self.observation_history = CausalObservationHistory()
+
+    def _validate_client_protocol(self, request: dict[str, Any]) -> None:
+        expected_mode = request.get("expected_mode")
+        if expected_mode is not None and expected_mode != self.runtime.mode.value:
+            raise ValueError(
+                f"client/server mode mismatch: client={expected_mode} "
+                f"server={self.runtime.mode.value}"
+            )
+        for name in ("state_weight", "state_feedback_kp"):
+            expected_key = f"expected_{name}"
+            if expected_key not in request:
+                continue
+            expected = request[expected_key]
+            actual = getattr(self.runtime, name)
+            if isinstance(expected, bool) or not isinstance(expected, (int, float)):
+                raise TypeError(f"expected_{name} must be numeric")
+            if not math.isclose(float(expected), actual, rel_tol=0.0, abs_tol=1e-15):
+                raise ValueError(
+                    f"client/server {name} mismatch: client={expected} server={actual}"
+                )
 
     def _decode_observation(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.task_description is None:
@@ -163,6 +186,12 @@ class ModelServer:
                             send_message(connection, response)
                             if request_type == "close":
                                 break
+                except (OSError, TimeoutError) as error:
+                    self.audit.write(
+                        "client_connection_error",
+                        peer=str(peer),
+                        error=f"{type(error).__name__}: {error}",
+                    )
                 finally:
                     self.runtime.cancel()
                     self.job = None
@@ -179,11 +208,18 @@ class ModelServer:
             seed = request.get("seed")
             if not isinstance(task, str) or not task or not isinstance(seed, int):
                 raise ValueError("reset requires task_description and integer seed")
+            self._validate_client_protocol(request)
             self.task_description = task
             self.reset_policy_state(self.policy, seed)
             self.observation_history.reset()
             self.job = None
-            return {"status": "ok", "type": "reset"}
+            return {
+                "status": "ok",
+                "type": "reset",
+                "mode": self.runtime.mode.value,
+                "state_weight": self.runtime.state_weight,
+                "state_feedback_kp": self.runtime.state_feedback_kp,
+            }
         if request_type == "predict_sync":
             observation = self._prepare_model_observation(
                 self._decode_observation(request), request_type

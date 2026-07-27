@@ -6,6 +6,7 @@ from dreamzero_fbfm.guidance import guidance_weight, joint_fbfm_guidance
 def test_joint_vjp_matches_coupled_linear_endpoint():
     sigma = 0.6
     beta = 10.0
+    state_feedback_kp = 2.5
     video = torch.tensor([[0.4, -0.2]], dtype=torch.float64, requires_grad=True)
     action = torch.tensor([[0.1, 0.7]], dtype=torch.float64, requires_grad=True)
     video_velocity = 0.2 * video + 0.3 * action
@@ -26,12 +27,14 @@ def test_joint_vjp_matches_coupled_linear_endpoint():
         action_mask=action_mask,
         sigma=sigma,
         beta=beta,
+        state_feedback_kp=state_feedback_kp,
         decompose_vjp=True,
     )
 
     endpoint_video = video.detach() - sigma * video_velocity.detach()
     endpoint_action = action.detach() - sigma * action_velocity.detach()
-    state_error = video_mask * (video_target - endpoint_video)
+    aligned_state_error = video_mask * (video_target - endpoint_video)
+    state_error = state_feedback_kp * aligned_state_error
     action_error = action_mask * (action_target - endpoint_action)
     video_correction = (1 - 0.2 * sigma) * state_error + (-0.4 * sigma) * action_error
     action_correction = (-0.3 * sigma) * state_error + (1 + 0.1 * sigma) * action_error
@@ -46,6 +49,11 @@ def test_joint_vjp_matches_coupled_linear_endpoint():
     assert result.diagnostics["vjp_decomposed"] is True
     assert result.diagnostics["state_mask_coordinate_count"] == 2
     assert result.diagnostics["action_mask_coordinate_count"] == 2
+    assert result.diagnostics["state_feedback_kp"] == state_feedback_kp
+    torch.testing.assert_close(
+        torch.as_tensor(result.diagnostics["aligned_state_error_norm"]),
+        aligned_state_error.norm().float(),
+    )
     torch.testing.assert_close(
         torch.as_tensor(result.diagnostics["state_to_video_correction_norm"]),
         ((1 - 0.2 * sigma) * state_error).norm().float(),
@@ -64,6 +72,29 @@ def test_joint_vjp_matches_coupled_linear_endpoint():
     )
     assert not result.video_velocity.requires_grad
     assert not result.action_velocity.requires_grad
+
+
+def test_state_feedback_kp_must_be_finite_and_positive():
+    video = torch.zeros(1, 1, requires_grad=True)
+    action = torch.zeros(1, 1, requires_grad=True)
+    for invalid in (0.0, -1.0, float("inf"), float("nan")):
+        try:
+            joint_fbfm_guidance(
+                video_sample=video,
+                action_sample=action,
+                video_velocity=video,
+                action_velocity=action,
+                video_target=torch.zeros_like(video),
+                video_mask=torch.ones_like(video),
+                action_target=torch.zeros_like(action),
+                action_mask=torch.ones_like(action),
+                sigma=0.5,
+                state_feedback_kp=invalid,
+            )
+        except ValueError as error:
+            assert "state_feedback_kp" in str(error)
+        else:
+            raise AssertionError(f"invalid state_feedback_kp was accepted: {invalid}")
 
 
 def test_zero_masks_are_exact_baseline_and_detached():
