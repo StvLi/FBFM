@@ -152,8 +152,10 @@ run() {
 }
 
 split_extra_args() {
-  # shellcheck disable=SC2206
-  EXTRA_ARGS=( ${FBFM_PIP_EXTRA_ARGS:-} )
+  EXTRA_ARGS=()
+  if [[ -n "${FBFM_PIP_EXTRA_ARGS:-}" ]]; then
+    IFS=' ' read -r -a EXTRA_ARGS <<<"$FBFM_PIP_EXTRA_ARGS"
+  fi
 }
 split_extra_args
 
@@ -248,9 +250,9 @@ install_for() {
       pip_run "$python" install pytest
       pip_file "$python" "$REPO_ROOT/wam/lingbot-va/requirements.txt"
       pip_editable "$python" "$REPO_ROOT/wam/lingbot-va" --no-deps
-      if ((SKIP_UPSTREAM == 0)); then
-        pip_editable "$python" "$EXTERNAL_ROOT/lingbot-va" --no-deps
-      fi
+      # The route directory contains the runnable FBFM integration.  The
+      # pinned clean upstream checkout is provenance only; installing it after
+      # this package would shadow the FBFM bridge on sys.path.
       ;;
     robotwin)
       pip_file "$python" "$EXTERNAL_ROOT/RoboTwin/script/requirements.txt"

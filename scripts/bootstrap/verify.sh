@@ -148,32 +148,41 @@ for key in "${UPSTREAMS[@]}"; do
   check_license "$key" "$dir"
 done
 
-# A patch is valid against a clean pinned Wan checkout when either applying it
-# or reversing it succeeds.  The reverse case means the user already applied
-# the overlay and is still reproducible.
-wan_dir="$EXTERNAL_ROOT/${DEST[wan]}"
-patch_candidates=(
-  "$REPO_ROOT/third_party/patches/wan2.2_fbfm.patch"
-  "$REPO_ROOT/wam/wan2.2/patches/wan2.2_fbfm.patch"
-)
-wan_patch=""
-for candidate in "${patch_candidates[@]}"; do
-  [[ -f "$candidate" ]] && { wan_patch="$candidate"; break; }
-done
-if [[ -n "$wan_patch" && -d "$wan_dir" && -e "$wan_dir/.git" ]]; then
-  # --cached checks against the pinned index and deliberately ignores overlay
-  # files already present in the working tree.  This makes verification useful
-  # both before and after the route-specific fetch script applies the patch.
-  if git -C "$wan_dir" apply --check --cached "$wan_patch" >/dev/null 2>&1; then
-    note "Wan2.2 FBFM patch applies cleanly to the pinned source index"
-  elif git -C "$wan_dir" apply --reverse --check "$wan_patch" >/dev/null 2>&1; then
-    note "Wan2.2 FBFM patch is already applied"
-  else
-    error "Wan2.2 FBFM patch does not apply to $wan_dir"
+# Check patches against each pinned Git index.  --cached deliberately ignores
+# overlay files already present in a working tree, so this remains read-only and
+# works both before and after fetch_upstreams.sh applies the patch.
+is_selected() {
+  local wanted="$1" selected
+  for selected in "${UPSTREAMS[@]}"; do
+    [[ "$selected" != "$wanted" ]] || return 0
+  done
+  return 1
+}
+
+check_integration_patch() {
+  local key="$1" label="$2" patch="$3"
+  local dir="$EXTERNAL_ROOT/${DEST[$key]}"
+  is_selected "$key" || return 0
+  if [[ ! -f "$patch" ]]; then
+    required_or_warn "$label patch not found: $patch"
+    return 0
   fi
-elif [[ "$ROUTE" == wan || "$ROUTE" == all ]]; then
-  required_or_warn "Wan2.2 FBFM patch not found (expected third_party/patches/wan2.2_fbfm.patch)"
-fi
+  [[ -d "$dir" && -e "$dir/.git" ]] || return 0
+  if git -C "$dir" apply --check --cached "$patch" >/dev/null 2>&1; then
+    note "$label patch applies cleanly to the pinned source index"
+  elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
+    note "$label patch is already applied"
+  else
+    error "$label patch does not apply to $dir"
+  fi
+}
+
+check_integration_patch robotwin "RoboTwin raster-backend" \
+  "$REPO_ROOT/wam/lingbot-va/patches/robotwin_raster_backend.patch"
+check_integration_patch dreamzero "DreamZero scheduler-callback" \
+  "$REPO_ROOT/wam/dreamzero-libero/patches/dreamzero_external_step_guidance.patch"
+check_integration_patch wan "Wan2.2 FBFM" \
+  "$REPO_ROOT/wam/wan2.2/patches/wan2.2_fbfm.patch"
 
 check_path() {
   local label="$1" path="$2"

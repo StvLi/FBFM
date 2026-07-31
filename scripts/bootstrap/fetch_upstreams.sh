@@ -19,7 +19,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/bootstrap/fetch_upstreams.sh [options]
 
-Fetch source-only upstreams at the revisions used by the paper.
+Fetch upstreams at the revisions used by the paper.  Checked-in integration
+patches are applied only after each pinned revision is verified.
 
 Options:
   --route ROUTE          all, lingbot, dreamzero, wan, or sim (default: all)
@@ -122,6 +123,42 @@ repo_dirty() {
   [[ -n "$(git -C "$1" status --porcelain --untracked-files=normal 2>/dev/null)" ]]
 }
 
+patched_tree_matches() {
+  local dest="$1" patch="$2" tmpdir index extra
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/fbfm-patch-index.XXXXXX")"
+  index="$tmpdir/index"
+  if ! GIT_INDEX_FILE="$index" git -C "$dest" read-tree HEAD \
+    || ! GIT_INDEX_FILE="$index" git -C "$dest" apply --cached "$patch" \
+    || ! GIT_INDEX_FILE="$index" git -C "$dest" diff --quiet; then
+    rm -rf -- "$tmpdir"
+    return 1
+  fi
+  extra="$(GIT_INDEX_FILE="$index" git -C "$dest" ls-files --others --exclude-standard)"
+  rm -rf -- "$tmpdir"
+  [[ -z "$extra" ]]
+}
+
+apply_integration_patch() {
+  local key="$1" label="$2" patch="$3"
+  local dest="$EXTERNAL_ROOT/${DEST[$key]}"
+  [[ -f "$patch" ]] || die "$label patch is missing: $patch"
+
+  if git -C "$dest" apply --reverse --check "$patch" >/dev/null 2>&1; then
+    patched_tree_matches "$dest" "$patch" \
+      || die "$dest contains the $label patch plus other local changes; refusing to continue"
+    log "$label patch already applied"
+    return 0
+  fi
+  repo_dirty "$dest" \
+    && die "$dest has local changes unrelated to the $label patch; refusing to apply it"
+  git -C "$dest" apply --check "$patch" \
+    || die "$label patch does not apply to pinned revision ${REV[$key]}"
+  git -C "$dest" apply "$patch"
+  patched_tree_matches "$dest" "$patch" \
+    || die "$label checkout differs from the expected patched tree after apply"
+  log "applied $label patch"
+}
+
 ensure_upstream() {
   local key="$1"
   local dest="$EXTERNAL_ROOT/${DEST[$key]}"
@@ -183,6 +220,26 @@ ensure_upstream() {
 
 for key in "${UPSTREAMS[@]}"; do
   ensure_upstream "$key"
+  case "$key" in
+    robotwin)
+      patch="$REPO_ROOT/wam/lingbot-va/patches/robotwin_raster_backend.patch"
+      label="RoboTwin raster-backend"
+      ;;
+    dreamzero)
+      patch="$REPO_ROOT/wam/dreamzero-libero/patches/dreamzero_external_step_guidance.patch"
+      label="DreamZero scheduler-callback"
+      ;;
+    wan)
+      patch="$REPO_ROOT/wam/wan2.2/patches/wan2.2_fbfm.patch"
+      label="Wan2.2 FBFM"
+      ;;
+    *) continue ;;
+  esac
+  if ((DRY_RUN)); then
+    run git -C "$EXTERNAL_ROOT/${DEST[$key]}" apply "$patch"
+  else
+    apply_integration_patch "$key" "$label" "$patch"
+  fi
 done
 
 if ((DRY_RUN == 0)); then

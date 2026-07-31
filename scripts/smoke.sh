@@ -109,7 +109,7 @@ run_dreamzero() {
   # assertions that only apply to the standalone A6000 checkout.  Route tests
   # are all CPU-only and do not import the model checkpoint.
   PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-    PYTHONPATH="$REPO_ROOT/wam/dreamzero-libero/src:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    PYTHONPATH="$REPO_ROOT/wam/dreamzero-libero/src:$REPO_ROOT/wam/dreamzero-libero:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$py" -m pytest -p no:cacheprovider -q \
       --ignore="$REPO_ROOT/wam/dreamzero-libero/tests/test_root_fbfm_modules.py" \
       "$REPO_ROOT/wam/dreamzero-libero/tests"
@@ -131,8 +131,8 @@ run_wan() {
     runtime_root="${FBFM_EXTERNAL_ROOT:-$REPO_ROOT/external}/Wan2.2"
   fi
   if [[ -z "$runtime_root" || ! -d "$runtime_root" ]]; then
-    echo "smoke: patched Wan2.2 checkout is absent; run wam/wan2.2/scripts/fetch_upstream.sh (skipping)" >&2
-    return 0
+    echo "smoke: patched Wan2.2 checkout is absent; run scripts/bootstrap/fetch_upstreams.sh --route wan" >&2
+    return 1
   fi
 
   local test_file="$runtime_root/tests/test_fbfm_state_feedback.py"
@@ -142,8 +142,8 @@ run_wan() {
   [[ -f "$entrypoint" ]] || entrypoint="$overlay_root/generate_fbfm.py"
   [[ -f "$vae_validator" ]] || vae_validator="$overlay_root/scripts/validate_fbfm_vae.py"
   [[ -f "$test_file" && -f "$entrypoint" ]] || {
-    echo "smoke: Wan2.2 FBFM overlay files are absent; skipping" >&2
-    return 0
+    echo "smoke: Wan2.2 FBFM overlay files are absent" >&2
+    return 1
   }
 
   PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \

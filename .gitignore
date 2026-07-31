@@ -25,3 +25,12 @@ wheels/
 
 # Local simulator outputs and videos
 wam/lingbot-va/robotwin_outputs/
+
+# Reproduction bootstrap outputs and non-redistributable artifacts
+external/
+.venvs/
+checkpoints/
+*.db3
+*.bag
+wam/*/results/*
+wam/wan2.2/artifacts/raw/
