@@ -6,9 +6,8 @@ import os
 va_demo_train_cfg = EasyDict(__name__='Config: VA demo train')
 va_demo_train_cfg.update(va_demo_cfg)
 
-# va_demo_train_cfg.resume_from = '/robby/share/Robotics/lilin1/code/Wan_VA_Release/train_out/checkpoints/checkpoint_step_10'
 
-va_demo_train_cfg.dataset_path = '/path/to/your/dataset'
+va_demo_train_cfg.dataset_path = os.environ.get("VA_DEMO_DATASET_PATH", "data/demo")
 va_demo_train_cfg.empty_emb_path = os.path.join(va_demo_train_cfg.dataset_path, 'empty_emb.pt')
 va_demo_train_cfg.enable_wandb = True
 va_demo_train_cfg.load_worker = 16

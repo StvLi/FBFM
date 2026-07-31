@@ -4,8 +4,8 @@
 # WAM Baseline 2节点分布式训练编排脚本
 # =============================================================================
 
-# 强制指定为绝对路径
-SCRIPT_DIR="/share/project/caomingyu/WAM_baseline/lingbot-va"
+# Shared checkout path; override when cluster nodes mount it elsewhere.
+SCRIPT_DIR="${LINGBOT_VA_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # 统一生成时间戳，确保多机日志对齐
 export SHARED_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -14,12 +14,12 @@ echo "本次多机训练的统一时间戳为: ${SHARED_TIMESTAMP}"
 echo "========================================================"
 
 # ============================ 可配置区域 ============================
-# TODO: 每次重新申请机器后，请修改这里的 job ID
-base_prefix="job-821c2a06-14a8-4617-be55-9411c6d095ea" 
+# Scheduler prefix is deployment-specific and must be supplied explicitly.
+base_prefix="${LINGBOT_CLUSTER_PREFIX:?set LINGBOT_CLUSTER_PREFIX to the common scheduler job prefix}"
 
 TRAIN_SCRIPT="${SCRIPT_DIR}/script/run_va_posttrain_a2d.sh"
 
-ENV_ACTIVATE='eval "$(conda shell.bash hook)" && conda activate /share/project/caomingyu/WAM_baseline/envs/lingbot-va/'
+ENV_ACTIVATE="${LINGBOT_ENV_ACTIVATE:-:}"
 
 MASTER_PORT=29501
 GPUS_PER_NODE=8

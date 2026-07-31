@@ -6,9 +6,8 @@ import os
 va_robotwin_train_cfg = EasyDict(__name__='Config: VA robotwin train')
 va_robotwin_train_cfg.update(va_robotwin_cfg)
 
-# va_robotwin_train_cfg.resume_from = '/robby/share/Robotics/lilin1/code/Wan_VA_Release/train_out/checkpoints/checkpoint_step_10'
 
-va_robotwin_train_cfg.dataset_path = '/share/project/zjk/lingbot-va/data'
+va_robotwin_train_cfg.dataset_path = os.environ.get("ROBOTWIN_TRAIN_DATASET", "data/robotwin")
 va_robotwin_train_cfg.empty_emb_path = os.path.join(va_robotwin_train_cfg.dataset_path, 'empty_emb.pt')
 va_robotwin_train_cfg.enable_wandb = False
 va_robotwin_train_cfg.load_worker = 16

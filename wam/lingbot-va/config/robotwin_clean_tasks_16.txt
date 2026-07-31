@@ -1,0 +1,16 @@
+move_playingcard_away
+move_stapler_pad
+pick_diverse_bottles
+pick_dual_bottles
+place_a2b_left
+place_a2b_right
+place_container_plate
+place_fan
+place_mouse_pad
+place_object_scale
+place_object_stand
+place_phone_stand
+press_stapler
+rotate_qrcode
+stamp_seal
+turn_switch

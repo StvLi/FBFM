@@ -22,7 +22,7 @@ MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"}
 
-BASE_SAVE_ROOT=${SAVE_ROOT:-"/share/project/caomingyu/WAM_baseline/lingbot_va_results"}
+BASE_SAVE_ROOT=${SAVE_ROOT:-"results/lingbot_va_results"}
 FINAL_SAVE_ROOT="${BASE_SAVE_ROOT}/${TIMESTAMP}"
 
 overrides=""
@@ -37,14 +37,14 @@ export WANDB_PROJECT="your project"
 
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
-export NCCL_IB_DISABLE=0
-export GLOO_SOCKET_IFNAME=eth0
-export NCCL_SOCKET_IFNAME=eth0
-export NCCL_IB_HCA=mlx5_100,mlx5_101,mlx5_102,mlx5_103,mlx5_104,mlx5_105,mlx5_106,mlx5_107
-export NCCL_IB_GID_INDEX=7
-export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-7}"
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 
-ENV_PYTHON="/share/project/caomingyu/WAM_baseline/envs/lingbot-va/bin/python"
+ENV_PYTHON=${LINGBOT_TRAIN_PYTHON:-python}
 
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
 ${ENV_PYTHON} -m torch.distributed.run \

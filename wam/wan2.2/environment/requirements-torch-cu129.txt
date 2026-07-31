@@ -1,0 +1,5 @@
+# Audited GPU stack. pip interprets 2.9.0 wheels from this index as +cu129.
+--index-url https://download.pytorch.org/whl/cu129
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0

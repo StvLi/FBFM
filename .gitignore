@@ -22,3 +22,29 @@ wheels/
 
 # 显式取消跟踪所有 .pyc 文件 (确保此行存在且未被注释)
 *.pyc
+
+# Local simulator outputs and videos
+wam/lingbot-va/robotwin_outputs/
+
+# Machine-local deployment scratchpad. The portable bootstrap and task-set
+# launchers supersede this install/download/run-all script.
+wam/lingbot-va/script/deploy_and_run_clean16.sh
+
+# Reproduction bootstrap outputs and non-redistributable artifacts
+external/
+.venvs/
+checkpoints/
+.cache/
+cache/
+caches/
+*.db3
+*.bag
+*.mcap
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+wam/*/results/*
+wam/wan2.2/artifacts/raw/

@@ -1,7 +1,10 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import queue
+import random
 import sys
+import threading
 import time
 from functools import partial
 from PIL import Image
@@ -10,6 +13,7 @@ from diffusers.utils import export_to_video
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
@@ -38,6 +42,12 @@ from utils import (
 )
 
 # FBFM核心组件
+from lingbot_va_bridge import FeedbackSlotTracker
+from lingbot_va_bridge import SlotAlignedStateBuffer
+from lingbot_va_bridge import SolverStepClock
+from lingbot_va_bridge import ChunkConstraintContext
+from lingbot_va_bridge import ConstraintMode
+from lingbot_va_bridge import latent_to_state_vectors
 from lingbot_va_bridge import VA_PrevChunkAdapter as PrevChunkAdapter           # 跨Chunk数据维护
 from lingbot_va_bridge import WrapperedFlowMatchScheduler as FlowMatchScheduler # FBFM流匹配实现
 from fbfm.policies.fbfm.configuration_rtc import RTCConfig
@@ -50,6 +60,12 @@ class VA_Server:
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
+        self._live_feedback_queue = queue.Queue()
+        self._inference_state_lock = threading.RLock()
+        self._inference_running = False
+        self._solver_phase = "idle"
+        self._cancel_requested = threading.Event()
+        self._solver_step_clock = SolverStepClock()
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
         self.rtc_config = RTCConfig(
@@ -107,6 +123,11 @@ class VA_Server:
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
+        self.feedback_streaming_vae = None
+        self.feedback_streaming_vae_half = None
+        feedback_enabled = ConstraintMode.parse(
+            getattr(self.job_config, 'constraint_mode', 'NONE')
+        ) is ConstraintMode.FBFM
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -115,6 +136,62 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+            if feedback_enabled:
+                self.feedback_streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+        if feedback_enabled:
+            self.feedback_streaming_vae = WanVAEStreamingWrapper(self.vae)
+
+    def _encode_obs_with_stream_wrappers(self, obs, streaming_vae, streaming_vae_half):
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        if len(images) < 1:
+            return None
+
+        videos = []
+        for k_i, k in enumerate(self.job_config.obs_cam_keys):
+            if self.env_type == 'robotwin_tshape':
+                if k_i == 0:
+                    height_i, width_i = self.height, self.width
+                else:
+                    height_i, width_i = self.height // 2, self.width // 2
+            else:
+                height_i, width_i = self.height, self.width
+
+            history_video_k = torch.from_numpy(
+                np.stack([each[k] for each in images])
+            ).float().permute(3, 0, 1, 2)
+            history_video_k = F.interpolate(
+                history_video_k,
+                size=(height_i, width_i),
+                mode='bilinear',
+                align_corners=False,
+            ).unsqueeze(0)
+            videos.append(history_video_k)
+
+        if self.env_type == 'robotwin_tshape':
+            videos_high = videos[0] / 255.0 * 2.0 - 1.0
+            videos_left_and_right = torch.cat(videos[1:], dim=0) / 255.0 * 2.0 - 1.0
+            vae_device = next(streaming_vae.vae.parameters()).device
+            enc_out_high = streaming_vae.encode_chunk(videos_high.to(vae_device).to(self.dtype))
+            enc_out_left_and_right = streaming_vae_half.encode_chunk(
+                videos_left_and_right.to(vae_device).to(self.dtype)
+            )
+            enc_out = torch.cat(
+                [torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1), enc_out_high],
+                dim=-2,
+            )
+        else:
+            videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
+            vae_device = next(streaming_vae.vae.parameters()).device
+            enc_out = streaming_vae.encode_chunk(videos.to(vae_device).to(self.dtype))
+
+        mu, logvar = torch.chunk(enc_out, 2, dim=1)
+        latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
+        latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
+        mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
+        video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+        return video_latent.to(self.device)
 
     def _get_t5_prompt_embeds(
         self,
@@ -333,73 +410,38 @@ class VA_Server:
         return input_dict
 
     def _encode_obs(self, obs):
-        images = obs['obs']
-        if not isinstance(images, list):
-            images = [images]
-        if len(images) < 1:
-            return None
-        
-        # # VAE 的 3D 卷积需要至少 2 帧，如果不足则重复最后一帧
-        # min_frames = 2
-        # if len(images) < min_frames:
-        #     original_len = len(images)
-        #     last_image = images[-1]
-        #     images = images + [last_image] * (min_frames - len(images))
-        #     logger.warning(f"Input has only {original_len} frames, padding to {min_frames} frames by repeating the last frame")
-        
-        videos = []
-        for k_i, k in enumerate(self.job_config.obs_cam_keys):
-            if self.env_type == 'robotwin_tshape':
-                if k_i == 0:  # camera high
-                    height_i, width_i = self.height, self.width
-                else:
-                    height_i, width_i = self.height // 2, self.width // 2
-            else:
-                height_i, width_i = self.height, self.width
+        return self._encode_obs_with_stream_wrappers(
+            obs,
+            streaming_vae=self.streaming_vae,
+            streaming_vae_half=self.streaming_vae_half,
+        )
 
-            history_video_k = torch.from_numpy(
-                np.stack([each[k]
-                          for each in images])).float().permute(3, 0, 1, 2)
-            history_video_k = F.interpolate(history_video_k,
-                                            size=(height_i, width_i),
-                                            mode='bilinear',
-                                            align_corners=False).unsqueeze(0)
-            videos.append(history_video_k)
-
-        if self.env_type == 'robotwin_tshape':
-            videos_high = videos[0] / 255.0 * 2.0 - 1.0
-            videos_left_and_right = torch.cat(videos[1:],
-                                              dim=0) / 255.0 * 2.0 - 1.0
-            vae_device = next(self.streaming_vae.vae.parameters()).device
-            enc_out_high = self.streaming_vae.encode_chunk(
-                videos_high.to(vae_device).to(self.dtype))
-            enc_out_left_and_right = self.streaming_vae_half.encode_chunk(
-                videos_left_and_right.to(vae_device).to(self.dtype))
-            enc_out = torch.cat([
-                torch.cat(enc_out_left_and_right.split(1, dim=0), dim=-1),
-                enc_out_high
-            ],
-                                dim=-2)
-        else:
-            videos = torch.cat(videos, dim=0) / 255.0 * 2.0 - 1.0
-            vae_device = next(self.streaming_vae.vae.parameters()).device
-            videos_chunk = videos.to(vae_device).to(self.dtype)
-            enc_out = self.streaming_vae.encode_chunk(videos_chunk)
-
-        mu, logvar = torch.chunk(enc_out, 2, dim=1)
-        latents_mean = torch.tensor(self.vae.config.latents_mean).to(mu.device)
-        latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
-        mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
-        video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
-        return video_latent.to(self.device)
-
-    def _reset(self, prompt=None):
-        logger.info('Reset.')
+    def _reset(self, prompt=None, seed=None):
+        logger.info('Reset. seed=%s', seed)
+        self.noise_generator = None
+        if seed is not None:
+            self.noise_generator = torch.Generator(device=self.device)
+            self.noise_generator.manual_seed(int(seed))
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
         self.last_action = None
+        self.last_obs = None
+        self.first_epoch = True
+        if getattr(self, 'active_constraint_context', None) is not None:
+            self.active_constraint_context.close()
+        self.active_constraint_context = None
+        with self._inference_state_lock:
+            self._inference_running = False
+            self._solver_phase = "idle"
+        self._cancel_requested.clear()
+        self._solver_step_clock.start(clock_id=None, enabled=False)
+        while True:
+            try:
+                self._live_feedback_queue.get_nowait()
+            except queue.Empty:
+                break
         if hasattr(self, 'prev_chunk_left_over'):
             delattr(self, 'prev_chunk_left_over')
         #### clean vae and transformer cache
@@ -416,6 +458,7 @@ class VA_Server:
         else:
             self.latent_height, self.latent_width = self.height // 16, self.width // 16 * len(
                 self.job_config.obs_cam_keys)
+        self._build_feedback_state_buffer()
 
         patch_size = self.job_config.patch_size
         latent_token_per_chunk = (self.job_config.frame_chunk_size *
@@ -462,11 +505,536 @@ class VA_Server:
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
+    def _build_feedback_state_buffer(self):
+        latent_channel = getattr(self.transformer.config, 'in_channels', 48)
+        state_dim = latent_channel * self.latent_height * self.latent_width
+        self.feedback_obs_per_state = getattr(self.job_config, 'feedback_obs_per_state', 4)
+        self.feedback_state_buffer = SlotAlignedStateBuffer(
+            state_dim=state_dim,
+            slot_count=self.job_config.frame_chunk_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.feedback_slot_tracker = FeedbackSlotTracker(
+            obs_per_state=self.feedback_obs_per_state
+        )
+        self.feedback_pending_obs = []
+        self.feedback_stream_seeded = False
+        self.feedback_has_received_window = False
+        self.feedback_constraint_active = False
+        self.feedback_target_frame_st_id = self.frame_st_id
+        self.feedback_last_observation_action_step = None
+        self.feedback_window_start_action_step = None
+        self._clear_feedback_encoder_cache()
+
+    def _clear_feedback_encoder_cache(self):
+        if self.feedback_streaming_vae is not None:
+            self.feedback_streaming_vae.clear_cache()
+        if self.feedback_streaming_vae_half is not None:
+            self.feedback_streaming_vae_half.clear_cache()
+
+    def _clear_feedback_state_buffer(self, clear_stream_cache=True):
+        if hasattr(self, 'feedback_state_buffer'):
+            self.feedback_state_buffer.clear()
+        if hasattr(self, 'feedback_slot_tracker'):
+            self.feedback_slot_tracker.reset()
+        self.feedback_pending_obs = []
+        self.feedback_constraint_active = False
+        self.feedback_target_frame_st_id = self.frame_st_id
+        self.feedback_window_start_action_step = None
+        if clear_stream_cache:
+            self._clear_feedback_encoder_cache()
+            self.feedback_stream_seeded = False
+            self.feedback_has_received_window = False
+
+    def _start_feedback_accumulation_window(self, start_action_step=None):
+        if hasattr(self, 'feedback_state_buffer'):
+            self.feedback_state_buffer.clear()
+        if hasattr(self, 'feedback_slot_tracker'):
+            self.feedback_slot_tracker.reset()
+        self.feedback_pending_obs = []
+        self.feedback_constraint_active = True
+        self.feedback_target_frame_st_id = self.frame_st_id
+        self.feedback_window_start_action_step = start_action_step
+
+    def _encode_feedback_obs_chunk(self, obs_sequence):
+        return self._encode_obs_with_stream_wrappers(
+            dict(obs=obs_sequence),
+            streaming_vae=self.feedback_streaming_vae,
+            streaming_vae_half=self.feedback_streaming_vae_half,
+        )
+
+    def _prime_feedback_stream_initial_obs(self, obs):
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        if not images or self.feedback_stream_seeded:
+            return
+        latent_model_input = self._encode_feedback_obs_chunk(images[:1])
+        self.feedback_stream_seeded = True
+        self.feedback_has_received_window = False
+        logger.info(
+            "FBFM feedback stream primed: raw_obs=1 latent_frames=%s frame_st_id=%s",
+            latent_model_input.shape[2] if latent_model_input is not None else 0,
+            self.frame_st_id,
+        )
+
+    def _append_feedback_state_from_latent(self, latent_model_input, expected_slots):
+        latent_vectors = latent_to_state_vectors(
+            latent_model_input,
+            latent_channel=getattr(self.transformer.config, 'in_channels', 48),
+            latent_height=self.latent_height,
+            latent_width=self.latent_width,
+        )
+        if len(latent_vectors) != expected_slots:
+            raise RuntimeError(
+                "feedback latent/frame count mismatch: "
+                f"expected {expected_slots} latent slot(s), got {len(latent_vectors)}"
+            )
+
+        appended_states = 0
+        for latent_vector in latent_vectors:
+            local_slot = len(self.feedback_state_buffer)
+            global_slot_id = self.feedback_target_frame_st_id + local_slot
+            appended = self.feedback_state_buffer.append_state(latent_vector)
+            appended_states += int(appended)
+            if appended:
+                live_appended = False
+                context = getattr(self, "active_constraint_context", None)
+                if (
+                    context is not None
+                    and getattr(self.job_config, "feedback_live_enabled", True)
+                    and getattr(self, "_solver_phase", "idle") == "video"
+                ):
+                    live_appended = context.update_state_slot(
+                        global_slot_id=global_slot_id,
+                        state=latent_vector,
+                    )
+                logger.info(
+                    "FBFM feedback state aligned: local_slot=%s global_frame_id=%s "
+                    "frame_st_id=%s live=%s context_version=%s",
+                    local_slot,
+                    global_slot_id,
+                    self.feedback_target_frame_st_id,
+                    live_appended,
+                    context.version if context is not None else None,
+                )
+        return appended_states
+
+    def _ingest_feedback_observations(self, obs_sequence, append_constraints):
+        if not obs_sequence:
+            return 0
+        if (
+            append_constraints
+            and hasattr(self, 'feedback_state_buffer')
+            and len(self.feedback_state_buffer) >= self.feedback_state_buffer.slot_count
+        ):
+            self.feedback_pending_obs = []
+            logger.info(
+                "FBFM feedback ignored: state slots full for target_frame_st_id=%s raw_obs=%s",
+                self.feedback_target_frame_st_id,
+                len(obs_sequence),
+            )
+            return 0
+        appended_states = 0
+        self.feedback_pending_obs.extend(obs_sequence)
+        obs_per_state = self.feedback_obs_per_state
+        while len(self.feedback_pending_obs) >= obs_per_state:
+            obs_chunk = self.feedback_pending_obs[:obs_per_state]
+            self.feedback_pending_obs = self.feedback_pending_obs[obs_per_state:]
+            latent_model_input = self._encode_feedback_obs_chunk(obs_chunk)
+            if hasattr(self, 'feedback_slot_tracker'):
+                self.feedback_slot_tracker.append(obs_per_state)
+            if append_constraints:
+                appended_states += self._append_feedback_state_from_latent(
+                    latent_model_input,
+                    expected_slots=1,
+                )
+                if len(self.feedback_state_buffer) >= self.feedback_state_buffer.slot_count:
+                    if len(self.feedback_pending_obs) > 0:
+                        logger.info(
+                            "FBFM feedback dropping pending obs after filling state slots: pending_obs=%s",
+                            len(self.feedback_pending_obs),
+                        )
+                    self.feedback_pending_obs = []
+                    break
+            else:
+                latent_frames = latent_model_input.shape[2] if latent_model_input is not None else 0
+                logger.info(
+                    "FBFM feedback context advanced: raw_obs=%s latent_frames=%s pending_obs=%s",
+                    len(obs_chunk),
+                    latent_frames,
+                    len(self.feedback_pending_obs),
+                )
+        return appended_states
+
+    def _select_new_feedback_observations(self, images):
+        if not self.feedback_stream_seeded:
+            self._prime_feedback_stream_initial_obs(dict(obs=images[:1]))
+            self.feedback_has_received_window = True
+            return images[1:]
+
+        if not self.feedback_has_received_window:
+            self.feedback_has_received_window = True
+            return images[1:] if len(images) > 1 else []
+
+        return images[-1:] if images else []
+
+    def _feedback(self, obs):
+        self.feedback_last_observation_action_step = obs.get(
+            'observation_action_step',
+            getattr(self, 'feedback_last_observation_action_step', None),
+        )
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        new_obs = self._select_new_feedback_observations(images)
+        observation_action_step = obs.get('observation_action_step')
+        window_start_action_step = getattr(
+            self, 'feedback_window_start_action_step', None
+        )
+        is_after_window_start = (
+            observation_action_step is None
+            or window_start_action_step is None
+            or observation_action_step > window_start_action_step
+        )
+        appended = self._ingest_feedback_observations(
+            new_obs,
+            append_constraints=(
+                self.feedback_constraint_active and is_after_window_start
+            ),
+        )
+        _, state_mask, _ = self.feedback_state_buffer.export()
+        logger.info(
+            (
+                "FBFM feedback appended: raw_window=%s new_obs=%s appended_states=%s "
+                "total_state_feedback=%s pending_obs=%s state_mask=%s frame_st_id=%s "
+                "target_frame_st_id=%s observation_action_step=%s "
+                "window_start_action_step=%s after_window_start=%s context_chunk_id=%s"
+            ),
+            len(images),
+            len(new_obs),
+            appended,
+            len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
+            len(self.feedback_pending_obs),
+            state_mask.tolist(),
+            self.frame_st_id,
+            self.feedback_target_frame_st_id,
+            self.feedback_last_observation_action_step,
+            window_start_action_step,
+            is_after_window_start,
+            getattr(getattr(self, 'active_constraint_context', None), 'chunk_id', None),
+        )
+
+    def is_inference_running(self):
+        with self._inference_state_lock:
+            return self._inference_running
+
+    def enqueue_live_feedback(self, obs):
+        """Queue raw feedback without touching CUDA or distributed collectives."""
+        constraint_mode = ConstraintMode.parse(
+            getattr(self.job_config, 'constraint_mode', 'NONE')
+        )
+        if constraint_mode is not ConstraintMode.FBFM:
+            return {
+                "feedback_queued": False,
+                "feedback_ignored_mode": constraint_mode.value,
+                "feedback_queue_size": self._live_feedback_queue.qsize(),
+            }
+        self._live_feedback_queue.put(obs)
+        return {
+            "feedback_queued": True,
+            "feedback_queue_size": self._live_feedback_queue.qsize(),
+        }
+
+    def request_inference_cancel(self):
+        self._cancel_requested.set()
+        self._solver_step_clock.wake()
+        return {"cancel_requested": True}
+
+    def advance_solver_steps(self, obs):
+        """Grant deterministic video-flow progress from the simulation clock."""
+        return self._solver_step_clock.grant_and_wait(
+            clock_id=obs.get('solver_clock_id'),
+            count=int(obs.get('solver_step_grant', 0)),
+            timeout=obs.get('solver_clock_timeout'),
+        )
+
+    def _wait_for_solver_step_grant(self):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            proceed = self._solver_step_clock.consume(self._cancel_requested)
+        else:
+            proceed = False
+        if dist.is_initialized():
+            payload = [proceed if dist.get_rank() == 0 else None]
+            dist.broadcast_object_list(payload, src=0)
+            proceed = payload[0]
+        return proceed
+
+    def _drain_live_feedback(self):
+        """Apply queued feedback at a solver-step boundary on every rank."""
+        feedback_batch = []
+        cancel_requested = False
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            cancel_requested = self._cancel_requested.is_set()
+            while True:
+                try:
+                    feedback_batch.append(self._live_feedback_queue.get_nowait())
+                except queue.Empty:
+                    break
+        if dist.is_initialized():
+            payload = [
+                (feedback_batch, cancel_requested)
+                if dist.get_rank() == 0 else None
+            ]
+            dist.broadcast_object_list(payload, src=0)
+            feedback_batch, cancel_requested = payload[0]
+        for feedback_obs in feedback_batch:
+            self._feedback(feedback_obs)
+        return len(feedback_batch), cancel_requested
+
+    def _sync_cancel_requested(self):
+        cancel_requested = (
+            self._cancel_requested.is_set()
+            if not dist.is_initialized() or dist.get_rank() == 0
+            else False
+        )
+        if dist.is_initialized():
+            payload = [cancel_requested if dist.get_rank() == 0 else None]
+            dist.broadcast_object_list(payload, src=0)
+            cancel_requested = payload[0]
+        return cancel_requested
+
+    def _export_feedback_states(self, state_num):
+        if not hasattr(self, 'feedback_state_buffer'):
+            return None, None, 0
+        states, state_mask, constrained_num = self.feedback_state_buffer.export()
+        if state_num != states.shape[0]:
+            raise ValueError(
+                f"feedback slot count mismatch: buffer has {states.shape[0]} slots, expected {state_num}"
+            )
+        return states, state_mask, constrained_num
+
+    def _preprocess_previous_action_target(self):
+        """Map the public action chunk back to Lingbot's model coordinates."""
+        if self.last_action is None:
+            return None
+        action_model_input = self.preprocess_action(self.last_action)
+        action_model_input[:, ~self.action_mask] = 0
+        return action_model_input[0, ..., 0].contiguous()
+
+    def _make_prev_chunk_adapter(
+        self,
+        constrain_mode: str,
+        *,
+        inference_delay: int | None = None,
+        execution_horizon: int | None = None,
+    ):
+        frame_chunk_size = self.job_config.frame_chunk_size
+        action_per_frame = self.action_per_frame
+        action_num = frame_chunk_size * action_per_frame
+        latent_channel = getattr(self.transformer.config, 'in_channels', 48)
+        state_num = frame_chunk_size
+        state_dim = latent_channel * self.latent_height * self.latent_width
+        default_delay = min(16, action_num // 2)
+        if inference_delay is None:
+            inference_delay = getattr(
+                self.job_config, 'rtc_inference_delay', default_delay
+            )
+        if execution_horizon is None:
+            execution_horizon = getattr(
+                self.job_config,
+                'rtc_execution_horizon',
+                action_num - inference_delay,
+            )
+        prev_states, prev_state_mask, prev_state_constrained_num = self._export_feedback_states(state_num)
+
+        adapter = PrevChunkAdapter(
+            constrain_mode=constrain_mode,
+            prev_actions=self._preprocess_previous_action_target(),
+            used_action_channel_ids=self.job_config.used_action_channel_ids,
+            action_num=action_num,
+            action_dim=self.job_config.action_dim,
+            frame_chunk_size=frame_chunk_size,
+            action_per_frame=action_per_frame,
+            state_num=state_num,
+            latent_channel=latent_channel,
+            latent_height=self.latent_height,
+            latent_width=self.latent_width,
+            state_dim=state_dim,
+            prev_states=prev_states,
+            prev_state_constrained_num=prev_state_constrained_num,
+            prev_state_mask=prev_state_mask,
+            device=self.device,
+            dtype=self.dtype,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+            rtc_attention_schedule=getattr(
+                self.job_config, 'rtc_attention_schedule', 'EXP'
+            ),
+        )
+        logger.info(
+            "FBFM adapter summary: mode=%s state_count=%s action_target_count=%s "
+            "feedback_buffer_len=%s state_mask=%s H=%s d=%s s=%s action_mask=%s",
+            adapter.constraint_mode.value,
+            adapter.state_constrained_num,
+            adapter.action_constrained_num,
+            len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
+            prev_state_mask.tolist() if prev_state_mask is not None else None,
+            action_num,
+            inference_delay,
+            execution_horizon,
+            adapter.get_action_prefix_weights().flatten().tolist(),
+        )
+        return adapter
+
+    def _make_constraint_context(self, adapter):
+        state_targets = adapter.get_constrained_states()
+        # Read the raw feedback mask here. ChunkConstraintContext owns mode gating.
+        if adapter._explicit_state_mask is None:
+            raw_state_mask = torch.zeros(
+                adapter._state_num, device=self.device, dtype=self.dtype
+            )
+        else:
+            raw_state_mask = adapter._explicit_state_mask
+        state_mask = raw_state_mask[None, None, :, None, None].contiguous()
+        temporal_action_mask = adapter._rtc_action_mask.reshape(
+            adapter._frame_chunk_size, adapter._action_per_frame
+        )[None, None, :, :, None]
+        channel_action_mask = self.action_mask.to(
+            device=self.device, dtype=self.dtype
+        )[None, :, None, None, None]
+        context = ChunkConstraintContext(
+            mode=adapter.constraint_mode,
+            chunk_id=self.frame_st_id,
+            target_frame_st_id=self.feedback_target_frame_st_id,
+            action_targets=adapter.get_constrained_actions(),
+            action_mask=temporal_action_mask * channel_action_mask,
+            state_targets=state_targets,
+            state_mask=state_mask,
+        )
+        old_context = getattr(self, 'active_constraint_context', None)
+        if old_context is not None:
+            old_context.close()
+        self.active_constraint_context = context
+        return context
+
+    def _run_chunk_inference(self, obs):
+        constraint_mode = ConstraintMode.parse(
+            getattr(self.job_config, 'constraint_mode', 'NONE')
+        )
+        cuda_memory_enabled = (
+            self.device.type == "cuda" and torch.cuda.is_available()
+        )
+        if cuda_memory_enabled:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        if not getattr(self.job_config, "feedback_live_enabled", True):
+            drained_feedback, cancel_requested = self._drain_live_feedback()
+            if cancel_requested:
+                return {"cancelled": True}
+            if drained_feedback:
+                logger.info(
+                    "FBFM-static snapshot prepared before context creation: count=%s",
+                    drained_feedback,
+                )
+        self.prev_chunk_left_over = self._make_prev_chunk_adapter(
+            constraint_mode.value,
+            inference_delay=obs.get('rtc_inference_delay'),
+            execution_horizon=obs.get('rtc_execution_horizon'),
+        )
+        self._make_constraint_context(self.prev_chunk_left_over)
+        logger.info(
+            "FBFM chunk inference starting: chunk_id=%s mode=%s state_version=%s",
+            self.frame_st_id,
+            constraint_mode.value,
+            self.active_constraint_context.version,
+        )
+        with self._inference_state_lock:
+            was_running = self._inference_running
+            self._inference_running = True
+        if not was_running:
+            self._cancel_requested.clear()
+        try:
+            self._solver_phase = "video"
+            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+        finally:
+            self._solver_step_clock.close()
+            self._solver_phase = "idle"
+            with self._inference_state_lock:
+                self._inference_running = False
+            if cuda_memory_enabled:
+                mib = 1024**2
+                logger.info(
+                    "FBFM GPU memory chunk_id=%s mode=%s allocated_mib=%.1f "
+                    "reserved_mib=%.1f peak_allocated_mib=%.1f "
+                    "peak_reserved_mib=%.1f",
+                    self.frame_st_id,
+                    constraint_mode.value,
+                    torch.cuda.memory_allocated(self.device) / mib,
+                    torch.cuda.memory_reserved(self.device) / mib,
+                    torch.cuda.max_memory_allocated(self.device) / mib,
+                    torch.cuda.max_memory_reserved(self.device) / mib,
+                )
+        if action is None:
+            return {"cancelled": True}
+        self.last_action = action
+        self.first_epoch = False
+        return dict(action=action)
+
+    def _log_solver_diagnostics(
+        self,
+        *,
+        phase,
+        scheduler,
+        step,
+        total_steps,
+        chunk_id,
+        state_version=0,
+        drained_feedback=0,
+    ):
+        diagnostics = getattr(scheduler, "last_step_diagnostics", {})
+        if not diagnostics or diagnostics.get("cache_only", False):
+            return
+        last_numerical_step = max(total_steps - 2, 0)
+        should_log = (
+            step == 0
+            or step == last_numerical_step
+            or bool(drained_feedback)
+            or (phase == "video" and diagnostics.get("has_guidance", False))
+        )
+        if not should_log:
+            return
+        logger.info(
+            "FBFM solver diagnostics phase=%s chunk_id=%s step=%s/%s "
+            "state_version=%s feedback_count=%s guided=%s mask_nonzero=%s "
+            "sigma=%.6f tau=%.6f error_norm=%.6f correction_norm=%.6f "
+            "guidance_weight=%.6f base_velocity_norm=%.6f guided_velocity_norm=%.6f",
+            phase,
+            chunk_id,
+            step,
+            last_numerical_step,
+            state_version,
+            drained_feedback,
+            diagnostics.get("has_guidance", False),
+            diagnostics.get("mask_nonzero", 0),
+            diagnostics.get("sigma", 0.0),
+            diagnostics.get("tau", 0.0),
+            diagnostics.get("error_norm", 0.0),
+            diagnostics.get("correction_norm", 0.0),
+            diagnostics.get("guidance_weight", 0.0),
+            diagnostics.get("base_velocity_norm", 0.0),
+            diagnostics.get("guided_velocity_norm", 0.0),
+        )
+
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
+            if ConstraintMode.parse(
+                getattr(self.job_config, 'constraint_mode', 'NONE')
+            ) is ConstraintMode.FBFM:
+                self._prime_feedback_stream_initial_obs(obs)
 
         latents = torch.randn(1,
                               48,
@@ -474,14 +1042,16 @@ class VA_Server:
                               self.latent_height,
                               self.latent_width,
                               device=self.device,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              generator=getattr(self, 'noise_generator', None))
         actions = torch.randn(1,
                               self.job_config.action_dim,
                               frame_chunk_size,
                               self.action_per_frame,
                               1,
                               device=self.device,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              generator=getattr(self, 'noise_generator', None))
 
         video_inference_step = self.job_config.num_inference_steps
         action_inference_step = self.job_config.action_num_inference_steps
@@ -503,9 +1073,26 @@ class VA_Server:
              1),  # pad 1 element at the end (right side) of the last dimension
             mode='constant',
             value=0)
+        expected_pseudo_steps = obs.get('pseudo_video_solver_steps')
+        if (
+            obs.get('pseudo_async_clock', False)
+            and expected_pseudo_steps is not None
+            and int(expected_pseudo_steps) != len(timesteps)
+        ):
+            raise ValueError(
+                "pseudo video solver budget mismatch: "
+                f"client={expected_pseudo_steps}, server={len(timesteps)}"
+            )
     
         # 1. Video Generation Loop
         for i, t in enumerate(tqdm(timesteps)):
+            if not self._wait_for_solver_step_grant():
+                logger.info("Chunk inference cancelled at virtual solver step %s", i)
+                return None, None
+            drained_feedback, cancel_requested = self._drain_live_feedback()
+            if cancel_requested:
+                logger.info("Chunk inference cancelled at video solver step %s", i)
+                return None, None
             last_step = i == len(timesteps) - 1
             latent_cond = init_latent[:, :, 0:1].to(self.dtype) if frame_st_id == 0 else None
             
@@ -525,21 +1112,53 @@ class VA_Server:
                 need_patch=True
             )
             
+            state_targets, state_weights, state_version = (
+                self.active_constraint_context.snapshot_state_constraints()
+            )
+            logger.debug(
+                "FBFM solver state snapshot: chunk_id=%s solver_step=%s version=%s mask=%s",
+                self.active_constraint_context.chunk_id,
+                i,
+                state_version,
+                state_weights.flatten().tolist(),
+            )
+            if drained_feedback:
+                logger.info(
+                    "FBFM live feedback consumed: chunk_id=%s solver_step=%s count=%s version=%s",
+                    self.active_constraint_context.chunk_id,
+                    i,
+                    drained_feedback,
+                    state_version,
+                )
             latents = self.scheduler.step(
                 original_denoise_step_partial=denoise_fn,
                 x_t=latents,
                 timestep=t,
                 sample=latents,
-                to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_states() if hasattr(self, 'prev_chunk_left_over') else None,
-                weights=self.prev_chunk_left_over.get_state_prefix_weights() if hasattr(self, 'prev_chunk_left_over') else None,
+                cache_only=last_step,
+                constrained_y=state_targets,
+                weights=state_weights,
                 device=self.device
+            )
+            self._log_solver_diagnostics(
+                phase="video",
+                scheduler=self.scheduler,
+                step=i,
+                total_steps=len(timesteps),
+                chunk_id=frame_st_id,
+                state_version=state_version,
+                drained_feedback=drained_feedback,
             )
             
             latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
         
         # 2. Action Generation Loop
+        self._solver_phase = "action"
         for i, t in enumerate(tqdm(action_timesteps)):
+            cancel_requested = self._sync_cancel_requested()
+            if cancel_requested:
+                logger.info("Chunk inference cancelled at action solver step %s", i)
+                return None, None
             last_step = i == len(action_timesteps) - 1
             action_cond = torch.zeros(
                 [1, self.job_config.action_dim, 1, self.action_per_frame, 1],
@@ -560,19 +1179,37 @@ class VA_Server:
                 need_patch=False
             )
             
+            action_targets, action_weights, _ = (
+                self.active_constraint_context.snapshot_action_constraints()
+            )
             actions = self.action_scheduler.step(
                 original_denoise_step_partial=denoise_fn,
                 x_t=actions,
                 timestep=t,
                 sample=actions,
-                to_final=last_step,
-                constrained_y=self.prev_chunk_left_over.get_constrained_actions(),
-                weights=self.prev_chunk_left_over.get_action_prefix_weights(),
+                cache_only=last_step,
+                constrained_y=action_targets,
+                weights=action_weights,
                 device=self.device
+            )
+            self._log_solver_diagnostics(
+                phase="action",
+                scheduler=self.action_scheduler,
+                step=i,
+                total_steps=len(action_timesteps),
+                chunk_id=frame_st_id,
             )
 
             actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
+        if not torch.isfinite(latents).all().item():
+            raise FloatingPointError(
+                f"non-finite video latent detected for chunk {frame_st_id}"
+            )
+        if not torch.isfinite(actions).all().item():
+            raise FloatingPointError(
+                f"non-finite action latent detected for chunk {frame_st_id}"
+            )
         actions[:, ~self.action_mask] *= 0
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
@@ -582,12 +1219,6 @@ class VA_Server:
         torch.cuda.empty_cache()
         return actions, latents
 
-    def _feedback(self, obs):
-        # 1. 将obs转换成latent
-        latent_model_input = self._encode_obs(obs)
-        # 2. 将latent输入加入反馈队列（权重自主维护）
-        self.prev_chunk_left_over.append_new_state(latent_model_input)
-        
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
@@ -598,7 +1229,15 @@ class VA_Server:
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
+        if latent_model_input is None:
+            raise ValueError("KV-cache update did not produce a real observation latent")
         action_model_input = self.preprocess_action(obs['state'])
+        if action_model_input.shape[2] != latent_model_input.shape[2]:
+            raise ValueError(
+                "real KV-cache update requires time-aligned observation/action "
+                f"frames, got observations={latent_model_input.shape[2]} "
+                f"actions={action_model_input.shape[2]} frame_st_id={self.frame_st_id}"
+            )
         action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
@@ -626,14 +1265,25 @@ class VA_Server:
     def infer(self, obs):
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
+        seed = obs.get('seed', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        generate_after_kv_cache = obs.get('generate_after_kv_cache', False)
         feedback = obs.get('feedback', False)    # 状态反馈标志
+        immediate_return = obs.get('immediate_return', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
+            self._reset(prompt=prompt, seed=seed)
             return dict()
         elif feedback:
+            constraint_mode = ConstraintMode.parse(
+                getattr(self.job_config, 'constraint_mode', 'NONE')
+            )
+            if constraint_mode is not ConstraintMode.FBFM:
+                return {
+                    "feedback_queued": False,
+                    "feedback_ignored_mode": constraint_mode.value,
+                }
             # FBFM 处理中间帧逻辑
             # 第4帧获取到之后才会进入这个循环
             logger.info(f"################# Feedback #################")
@@ -641,42 +1291,57 @@ class VA_Server:
             return dict()
         elif compute_kv_cache:
             logger.info(f"################# Compute KV Cache #################")
-            self._compute_kv_cache(obs)
+            if generate_after_kv_cache:
+                self._cancel_requested.clear()
+                self._solver_step_clock.start(
+                    clock_id=obs.get('solver_clock_id'),
+                    enabled=bool(obs.get('pseudo_async_clock', False)),
+                )
+                with self._inference_state_lock:
+                    self._inference_running = True
+            try:
+                self._compute_kv_cache(obs)
+            except Exception:
+                if generate_after_kv_cache:
+                    self._solver_step_clock.close()
+                    with self._inference_state_lock:
+                        self._inference_running = False
+                raise
+
+            if not self.first_epoch:
+                logger.info(f"################# Start Feedback Accumulation Window #################")
+                if len(self.feedback_pending_obs) > 0:
+                    logger.warning(
+                        "FBFM feedback context had incomplete pending obs before accumulation: pending_obs=%s",
+                        len(self.feedback_pending_obs),
+                    )
+                self._start_feedback_accumulation_window(
+                    start_action_step=obs.get(
+                        'feedback_window_start_action_step'
+                    )
+                )
+                _, state_mask, _ = self.feedback_state_buffer.export()
+                logger.info(
+                    (
+                        "FBFM feedback accumulation started: target_frame_st_id=%s "
+                        "state_slots=%s pending_obs=%s state_mask=%s stream_seeded=%s"
+                    ),
+                    self.feedback_target_frame_st_id,
+                    len(self.feedback_state_buffer) if hasattr(self, 'feedback_state_buffer') else 0,
+                    len(self.feedback_pending_obs),
+                    state_mask.tolist(),
+                    self.feedback_stream_seeded,
+                )
+                self.last_obs = obs
+
+            if generate_after_kv_cache:
+                return self._run_chunk_inference(obs)
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-
-            frame_chunk_size = self.job_config.frame_chunk_size
-            action_per_frame = self.action_per_frame
-            action_num = frame_chunk_size * action_per_frame
-
-            latent_channel = getattr(self.transformer.config, 'in_channels', 48)
-
-            state_num = frame_chunk_size
-            state_dim = latent_channel * self.latent_height * self.latent_width
-
-            # Build PrevChunk adapter so FBFM constraints can work with VA outputs.
-            self.prev_chunk_left_over = PrevChunkAdapter(
-                constrain_mode="Feedback",
-                prev_actions=self.last_action,
-                used_action_channel_ids=self.job_config.used_action_channel_ids,
-                action_num=action_num,
-                action_dim=self.job_config.action_dim,
-                frame_chunk_size=frame_chunk_size,
-                action_per_frame=action_per_frame,
-                state_num=state_num,
-                latent_channel=latent_channel,
-                latent_height=self.latent_height,
-                latent_width=self.latent_width,
-                state_dim=state_dim,
-                device=self.device,
-                dtype=self.dtype,
-                inference_delay=16,
-            )
-
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            self.last_action = action
-            return dict(action=action)
+            if immediate_return:
+                self._solver_step_clock.start(clock_id=None, enabled=False)
+                return self._run_chunk_inference(obs)
     
     def decode_one_video(self, latents, output_type):
         latents = latents.to(self.vae.dtype)
@@ -796,6 +1461,14 @@ def run(args):
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     init_distributed(world_size, local_rank, rank)
+    startup_seed = os.environ.get("LINGBOT_VA_STARTUP_SEED")
+    if startup_seed is not None:
+        startup_seed = int(startup_seed)
+        random.seed(startup_seed)
+        np.random.seed(startup_seed)
+        torch.manual_seed(startup_seed)
+        torch.cuda.manual_seed_all(startup_seed)
+        logger.info("LingBot server startup seed=%s", startup_seed)
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size

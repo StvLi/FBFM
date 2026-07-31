@@ -1,0 +1,12 @@
+place_burger_fries
+place_empty_cup
+place_shoe
+scan_object
+adjust_bottle
+beat_block_hammer
+click_alarmclock
+click_bell
+grab_roller
+lift_pot
+move_can_pot
+move_pillbottle_pad

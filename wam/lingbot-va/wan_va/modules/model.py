@@ -16,20 +16,37 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
 from typing import Callable, ClassVar
-from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-    and_masks,
-    or_masks
-)
 from functools import partial
 
 try:
+    from torch.nn.attention.flex_attention import (
+        _mask_mod_signature,
+        BlockMask,
+        create_block_mask,
+        flex_attention,
+        and_masks,
+        or_masks,
+    )
+    HAS_FLEX_ATTENTION = True
+except ImportError:
+    _mask_mod_signature = None
+    BlockMask = None
+    create_block_mask = None
+    flex_attention = None
+    and_masks = None
+    or_masks = None
+    HAS_FLEX_ATTENTION = False
+
+try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except Exception:
+    try:
+        from flash_attn import flash_attn_func
+        HAS_FLASH_ATTN = True
+    except Exception:
+        flash_attn_func = None
+        HAS_FLASH_ATTN = False
 
 __all__ = ['WanTransformer3DModel']
 
@@ -40,10 +57,12 @@ def custom_sdpa(q, k, v):
     return out.transpose(1, 2)
 
 class FlexAttnFunc(nn.Module):
-    flex_attn: ClassVar[Callable] = torch.compile(
-        flex_attention, dynamic=True, 
+    flex_attn: ClassVar[Callable | None] = (
+        torch.compile(flex_attention, dynamic=True) if HAS_FLEX_ATTENTION else None
     )
-    compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
+    compiled_create_block_mask: ClassVar[Callable | None] = (
+        torch.compile(create_block_mask) if HAS_FLEX_ATTENTION else None
+    )
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
 
@@ -52,6 +71,10 @@ class FlexAttnFunc(nn.Module):
         is_cross=False,
     ) -> None:
         super().__init__()
+        if not HAS_FLEX_ATTENTION:
+            raise ImportError(
+                "torch.nn.attention.flex_attention is unavailable in the current torch build"
+            )
         self.is_cross = is_cross
     
     def forward(
@@ -302,6 +325,8 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
+            if not HAS_FLASH_ATTN:
+                raise ImportError("flash_attn is unavailable in the current environment")
             self.attn_op = flash_attn_func
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)

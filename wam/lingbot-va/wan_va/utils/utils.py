@@ -60,11 +60,10 @@ def save_async(obj, file_path):
     if torch.is_tensor(obj) or (isinstance(obj, dict) and any(
             torch.is_tensor(v) for v in obj.values())):
         if torch.is_tensor(obj):
-            if obj.is_cuda:
-                obj = obj.cpu()
+            obj = obj.detach().to(device="cpu", copy=True)
         elif isinstance(obj, dict):
             obj = {
-                k: v.cpu() if torch.is_tensor(v) else v
+                k: v.detach().to(device="cpu", copy=True) if torch.is_tensor(v) else v
                 for k, v in obj.items()
             }
         executor.submit(torch.save, obj, file_path)

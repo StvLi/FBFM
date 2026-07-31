@@ -1,0 +1,2787 @@
+diff --git a/.gitignore b/.gitignore
+index de347da..3b4d1d3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,4 +4,5 @@ __pycache__/
+ tmp_examples*
+ new_checkpoint*
+ batch_test*
+-nohup*
+\ No newline at end of file
++nohup*
++results/
+diff --git a/docs/FBFM_STATE_FEEDBACK.md b/docs/FBFM_STATE_FEEDBACK.md
+new file mode 100644
+index 0000000..ce79317
+--- /dev/null
++++ b/docs/FBFM_STATE_FEEDBACK.md
+@@ -0,0 +1,118 @@
++# Wan2.2 visual state feedback
++
++This route applies FBFM only to Wan2.2's video flow. It intentionally has no
++action flow, RTC mask, robot proprioception, or cross-modal action Jacobian.
++
++## Temporal contract
++
++Wan2.2-TI2V-5B uses a causal VAE with temporal stride 4. The launch image is
++native I2V slot 0. Every following group of four measured frames produces one
++future feedback slot:
++
++```text
++raw frame 0      -> native I2V anchor, latent slot 0
++raw frames 1-4   -> feedback latent slot 1
++raw frames 5-8   -> feedback latent slot 2
++...
++```
++
++No current frame is copied into an unobserved future position. The feedback
++video must include the launch frame, have the same scene timing as the target
++prediction, and contain four future frames for every requested feedback slot.
++Solver release steps are zero-based boundaries in `[0, sample_steps)`.
++
++At each solver boundary the pipeline:
++
++1. releases all raw feedback events scheduled for that boundary;
++2. encodes them with an independent causal VAE feature cache;
++3. updates the slot-aligned latent target and binary temporal mask;
++4. recomputes the video endpoint and endpoint VJP;
++5. sends the guided video velocity to the native UniPC scheduler.
++
++The two FBFM VJP branches use per-block DiT gradient checkpointing by default.
++This does not alter DIRECT or no-gradient forward evaluation, but avoids
++retaining every 5B transformer activation at once for full 720P feedback.
++
++The direct baseline uses the same frame loop, prompt, noise seed, CFG, and
++solver. Its feedback mask is always zero.
++
++The CLI inherits the official TI2V-5B checkpoint defaults unless explicitly
++overridden: 720P maximum area, 121 frames, 50 UniPC steps, shift 5, and CFG 5.
++Shorter horizons and smaller areas are integration-test settings, not the
++official deployment protocol.
++
++Each run writes a JSON audit beside the video, including feedback slot/version
++updates, per-step VJP norms, and peak CUDA allocation during the solver loop.
++
++The default visual-state coefficient is `1.0`. The `56/9600` coefficient used
++by DreamZero compensates for the different state and action dimensions in its
++joint feedback objective. This pipeline has no action variables, so applying
++that coefficient would incorrectly attenuate the only residual. The current
++implementation does not clip the correction norm; use the per-step audit norms
++to diagnose unstable full-weight runs without silently changing the FBFM
++objective.
++
++The independent proportional gain `--kp` scales the complete feedback velocity
++correction after the state residual and VJP have been computed:
++
++```text
++guided_velocity = base_velocity - kp * guidance_weight * correction
++```
++
++Its default is `1.0` for backward compatibility. Gain ablations must keep
++`--state-weight 1.0` and vary `--kp`, so the visual-state objective itself is
++not confused with controller damping.
++
++The CLI enables deterministic CUDA algorithms by default and forwards that
++setting to FlashAttention's deterministic backward path. Keep determinism
++enabled for paired comparisons; use `--no-deterministic` only for
++backend/performance diagnosis.
++
++The Blackwell environment provides `flash_attn==2.8.3.post1`, built for
++`sm_120` against the installed PyTorch CUDA 12.9 runtime. A BF16 forward and
++backward smoke test passes. The attention dispatcher retains a PyTorch SDPA
++fallback with key masking and output-dtype restoration, so DIRECT and FBFM
++always share the same attention backend.
++
++The streaming implementation can be checked against the native full-video VAE
++without loading the text encoder or DiT:
++
++```bash
++python scripts/validate_fbfm_vae.py --ckpt-dir /path/to/Wan2.2-TI2V-5B
++```
++
++## Commands
++
++Set the external checkpoint once for the generation examples:
++
++```bash
++export WAN22_CKPT_DIR=/path/to/Wan2.2-TI2V-5B
++```
++
++Direct prediction:
++
++```bash
++python generate_fbfm.py \
++  --mode DIRECT \
++  --image examples/i2v_input.JPG \
++  --prompt "The scene evolves with rapid object motion." \
++  --output results/direct.mp4
++```
++
++FBFM with two observed latent slots released at solver steps 10 and 20:
++
++```bash
++python generate_fbfm.py \
++  --mode FBFM \
++  --feedback-video /path/to/measured_sequence.mp4 \
++  --feedback-release-steps 10,20 \
++  --kp 0.05 \
++  --prompt "The scene evolves with rapid object motion." \
++  --output results/fbfm.mp4
++```
++
++For a cheap integration smoke test, use `--frame-num 9 --sample-steps 2
++--max-area 114688` and release one slot at step 1. `--max-area` is only a debug
++override; paper runs should use an official `--size`. Paper comparisons should
++use the same explicit release schedule in every paired trial and evaluate only
++unconstrained future slots after each feedback point.
+diff --git a/generate_fbfm.py b/generate_fbfm.py
+new file mode 100644
+index 0000000..7a6f3b5
+--- /dev/null
++++ b/generate_fbfm.py
+@@ -0,0 +1,235 @@
++"""Run paired direct/FBFM visual prediction with Wan2.2 TI2V-5B."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import logging
++import os
++from pathlib import Path
++
++import imageio.v3 as iio
++import torch
++from PIL import Image
++from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
++from wan.fbfm.feedback import (
++    DEFAULT_KP,
++    DEFAULT_STATE_WEIGHT,
++    FeedbackMode,
++    evenly_spaced_release_steps,
++)
++from wan.fbfm.pipeline import WanTI2VFBFM
++from wan.utils.utils import save_video
++
++IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
++LOGGER = logging.getLogger(__name__)
++
++
++def load_frame_sequence(path: str | Path) -> list[Image.Image]:
++    """Load a video or lexically ordered image directory into RGB frames."""
++    source = Path(path)
++    if source.is_dir():
++        files = sorted(
++            item for item in source.iterdir() if item.suffix.lower() in IMAGE_SUFFIXES
++        )
++        if not files:
++            raise ValueError(f"no images found in {source}")
++        return [Image.open(item).convert("RGB") for item in files]
++    if not source.is_file():
++        raise FileNotFoundError(source)
++    return [Image.fromarray(frame).convert("RGB") for frame in iio.imiter(source)]
++
++
++def parse_release_steps(value: str | None) -> list[int]:
++    if value is None or not value.strip():
++        return []
++    steps = [int(item.strip()) for item in value.split(",")]
++    if steps != sorted(steps):
++        raise ValueError("feedback release steps must be sorted")
++    return steps
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Wan2.2 visual-only FBFM state-feedback inference"
++    )
++    parser.add_argument(
++        "--ckpt-dir",
++        default=os.environ.get("WAN22_CKPT_DIR"),
++    )
++    parser.add_argument("--mode", choices=["DIRECT", "FBFM"], required=True)
++    parser.add_argument(
++        "--image", help="Launch image; defaults to feedback video frame 0"
++    )
++    parser.add_argument(
++        "--feedback-video",
++        help="Ground-truth video or frame directory including the launch frame",
++    )
++    parser.add_argument(
++        "--feedback-release-steps",
++        help="Comma-separated solver steps, one for each four-frame feedback group",
++    )
++    parser.add_argument(
++        "--feedback-slots",
++        type=int,
++        default=1,
++        help="Number of evenly released slots when explicit release steps are omitted",
++    )
++    parser.add_argument("--prompt", required=True)
++    parser.add_argument("--negative-prompt", default="")
++    parser.add_argument("--size", choices=["1280*704", "704*1280"], default="1280*704")
++    parser.add_argument(
++        "--max-area",
++        type=int,
++        help="Override output pixel area for integration tests; paper runs should use --size",
++    )
++    parser.add_argument(
++        "--frame-num",
++        type=int,
++        help="Defaults to the official checkpoint configuration",
++    )
++    parser.add_argument(
++        "--sample-steps",
++        type=int,
++        help="Defaults to the official checkpoint configuration",
++    )
++    parser.add_argument(
++        "--sample-shift",
++        type=float,
++        help="Defaults to the official checkpoint configuration",
++    )
++    parser.add_argument(
++        "--guide-scale",
++        type=float,
++        help="Defaults to the official checkpoint configuration",
++    )
++    parser.add_argument("--beta", type=float, default=10.0)
++    parser.add_argument(
++        "--kp",
++        type=float,
++        default=DEFAULT_KP,
++        help="Gain applied to the complete FBFM velocity correction",
++    )
++    parser.add_argument(
++        "--state-weight",
++        type=float,
++        default=DEFAULT_STATE_WEIGHT,
++        help="Visual-state residual scale; defaults to 1.0 for state-only FBFM",
++    )
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--device", type=int, default=0)
++    parser.add_argument("--t5-cpu", action=argparse.BooleanOptionalAction, default=True)
++    parser.add_argument(
++        "--offload-model", action=argparse.BooleanOptionalAction, default=True
++    )
++    parser.add_argument(
++        "--convert-model-dtype",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++    )
++    parser.add_argument(
++        "--gradient-checkpointing",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Checkpoint DiT blocks during FBFM VJPs to reduce CUDA memory",
++    )
++    parser.add_argument(
++        "--deterministic",
++        action=argparse.BooleanOptionalAction,
++        default=True,
++        help="Use deterministic CUDA algorithms for paired paper comparisons",
++    )
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--audit", help="JSON audit path; defaults beside output")
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    if not args.ckpt_dir:
++        raise ValueError("provide --ckpt-dir or set WAN22_CKPT_DIR")
++    logging.basicConfig(
++        level=logging.INFO,
++        format="[%(asctime)s] %(levelname)s: %(message)s",
++    )
++    if args.deterministic:
++        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
++        torch.backends.cudnn.deterministic = True
++        torch.use_deterministic_algorithms(True)
++    config = WAN_CONFIGS["ti2v-5B"]
++    frame_num = args.frame_num if args.frame_num is not None else config.frame_num
++    sample_steps = (
++        args.sample_steps if args.sample_steps is not None else config.sample_steps
++    )
++    sample_shift = (
++        args.sample_shift if args.sample_shift is not None else config.sample_shift
++    )
++    guide_scale = (
++        args.guide_scale if args.guide_scale is not None else config.sample_guide_scale
++    )
++    mode = FeedbackMode.parse(args.mode)
++    sequence = load_frame_sequence(args.feedback_video) if args.feedback_video else []
++    if args.image:
++        anchor = Image.open(args.image).convert("RGB")
++    elif sequence:
++        anchor = sequence[0]
++    else:
++        raise ValueError("provide --image or --feedback-video")
++
++    future_frames = sequence[1:] if sequence else []
++    release_steps = parse_release_steps(args.feedback_release_steps)
++    if mode is FeedbackMode.FBFM and not release_steps:
++        release_steps = evenly_spaced_release_steps(args.feedback_slots, sample_steps)
++    if mode is FeedbackMode.FBFM and not sequence:
++        raise ValueError("FBFM mode requires --feedback-video")
++
++    pipeline = WanTI2VFBFM(
++        config=config,
++        checkpoint_dir=args.ckpt_dir,
++        device_id=args.device,
++        rank=0,
++        t5_cpu=args.t5_cpu,
++        init_on_cpu=True,
++        convert_model_dtype=args.convert_model_dtype,
++    )
++    result = pipeline.generate_with_feedback(
++        input_prompt=args.prompt,
++        image=anchor,
++        mode=mode,
++        feedback_frames=future_frames,
++        feedback_release_steps=release_steps,
++        max_area=args.max_area or MAX_AREA_CONFIGS[args.size],
++        frame_num=frame_num,
++        shift=sample_shift,
++        sampling_steps=sample_steps,
++        guide_scale=guide_scale,
++        n_prompt=args.negative_prompt,
++        seed=args.seed,
++        offload_model=args.offload_model,
++        beta=args.beta,
++        state_weight=args.state_weight,
++        kp=args.kp,
++        gradient_checkpointing=args.gradient_checkpointing,
++    )
++    if result.video is None:
++        raise RuntimeError("rank 0 did not receive a decoded video")
++
++    output_path = Path(args.output)
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    save_video(
++        result.video.unsqueeze(0),
++        save_file=str(output_path),
++        fps=config.sample_fps,
++    )
++    audit_path = Path(args.audit) if args.audit else output_path.with_suffix(".json")
++    audit_path.parent.mkdir(parents=True, exist_ok=True)
++    audit_path.write_text(
++        json.dumps(result.audit, indent=2, ensure_ascii=True),
++        encoding="utf-8",
++    )
++    LOGGER.info("Saved video to %s", output_path)
++    LOGGER.info("Saved FBFM audit to %s", audit_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/extract_realsense_color_db3.py b/scripts/extract_realsense_color_db3.py
+new file mode 100755
+index 0000000..97b594e
+--- /dev/null
++++ b/scripts/extract_realsense_color_db3.py
+@@ -0,0 +1,273 @@
++#!/usr/bin/env python3
++"""Extract and normalize a RealSense RGB stream from a ROS2 SQLite bag."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sqlite3
++import struct
++from pathlib import Path
++
++import imageio.v2 as imageio
++import numpy as np
++from PIL import Image, ImageDraw, ImageFont
++
++COLOR_TOPIC = "/device_0/sensor_1/Color_0/image/data"
++OUTPUT_FPS = 24
++OUTPUT_FRAMES = 168
++CONTEXT_FRAMES = 48
++REFERENCE_FRAMES = 121
++OUTPUT_WIDTH = 1280
++OUTPUT_HEIGHT = 704
++FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
++
++
++class CDRReader:
++    def __init__(self, data: bytes) -> None:
++        if data[:4] != b"\x00\x01\x00\x00":
++            raise ValueError(f"expected little-endian CDR, got {data[:4].hex()}")
++        self.data = data
++        self.position = 4
++
++    def align(self, size: int) -> None:
++        self.position = (self.position + size - 1) // size * size
++
++    def uint32(self) -> int:
++        self.align(4)
++        value = struct.unpack_from("<I", self.data, self.position)[0]
++        self.position += 4
++        return value
++
++    def int32(self) -> int:
++        self.align(4)
++        value = struct.unpack_from("<i", self.data, self.position)[0]
++        self.position += 4
++        return value
++
++    def uint8(self) -> int:
++        value = self.data[self.position]
++        self.position += 1
++        return value
++
++    def string(self) -> str:
++        length = self.uint32()
++        raw = self.data[self.position : self.position + length]
++        self.position += length
++        if not raw or raw[-1] != 0:
++            raise ValueError("CDR string is missing its null terminator")
++        return raw[:-1].decode("utf-8")
++
++    def byte_sequence(self) -> memoryview:
++        length = self.uint32()
++        value = memoryview(self.data)[self.position : self.position + length]
++        self.position += length
++        if len(value) != length:
++            raise ValueError("truncated CDR byte sequence")
++        return value
++
++
++def decode_rgb8_image(data: bytes) -> tuple[np.ndarray, dict[str, int | str]]:
++    reader = CDRReader(data)
++    stamp_sec = reader.int32()
++    stamp_nanosec = reader.uint32()
++    frame_id = reader.string()
++    height = reader.uint32()
++    width = reader.uint32()
++    encoding = reader.string()
++    is_bigendian = reader.uint8()
++    step = reader.uint32()
++    pixels = reader.byte_sequence()
++
++    if encoding.lower() != "rgb8":
++        raise ValueError(f"expected rgb8 image, got {encoding}")
++    if is_bigendian != 0:
++        raise ValueError("big-endian RGB images are not supported")
++    if width != OUTPUT_WIDTH or height != 720 or step != width * 3:
++        raise ValueError(f"unexpected image layout: {width}x{height}, step={step}")
++    expected_bytes = height * step
++    if len(pixels) != expected_bytes:
++        raise ValueError(f"expected {expected_bytes} image bytes, got {len(pixels)}")
++
++    image = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
++    image = image[8 : 8 + OUTPUT_HEIGHT].copy()
++    return image, {
++        "stamp_sec": stamp_sec,
++        "stamp_nanosec": stamp_nanosec,
++        "frame_id": frame_id,
++        "source_width": width,
++        "source_height": height,
++        "encoding": encoding,
++        "step": step,
++    }
++
++
++def video_writer(path: Path):
++    return imageio.get_writer(
++        path,
++        fps=OUTPUT_FPS,
++        codec="libx264",
++        pixelformat="yuv420p",
++        macro_block_size=None,
++        ffmpeg_params=["-crf", "18", "-movflags", "+faststart"],
++    )
++
++
++def nearest_message_indices(timestamps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    targets = timestamps[0] + np.rint(
++        np.arange(OUTPUT_FRAMES, dtype=np.float64) * 1_000_000_000 / OUTPUT_FPS
++    ).astype(np.int64)
++    if targets[-1] > timestamps[-1]:
++        raise ValueError("the bag does not contain seven seconds of color frames")
++
++    right = np.searchsorted(timestamps, targets, side="left")
++    right = np.clip(right, 0, len(timestamps) - 1)
++    left = np.maximum(right - 1, 0)
++    use_left = np.abs(targets - timestamps[left]) <= np.abs(timestamps[right] - targets)
++    selected = np.where(use_left, left, right)
++    return selected, targets
++
++
++def save_timeline(path: Path, frames: list[np.ndarray]) -> None:
++    indices = (0, 24, 48, 72, 96, 120, 144, 167)
++    cell_width, cell_height, header_height = 320, 176, 48
++    canvas = Image.new(
++        "RGB", (cell_width * len(indices), cell_height + header_height), (18, 18, 18)
++    )
++    draw = ImageDraw.Draw(canvas)
++    font = ImageFont.truetype(FONT_PATH, 22)
++    for column, frame_index in enumerate(indices):
++        draw.text(
++            (column * cell_width + 8, 10),
++            f"{frame_index / OUTPUT_FPS:.2f} s",
++            fill=(245, 245, 245),
++            font=font,
++        )
++        frame = Image.fromarray(frames[frame_index]).resize(
++            (cell_width, cell_height), Image.Resampling.LANCZOS
++        )
++        canvas.paste(frame, (column * cell_width, header_height))
++    canvas.save(path, quality=94, subsampling=0)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("bag", type=Path)
++    parser.add_argument("output_dir", type=Path)
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    bag = args.bag.resolve()
++    output_dir = args.output_dir.resolve()
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    connection = sqlite3.connect(f"file:{bag}?mode=ro", uri=True)
++    try:
++        topic_row = connection.execute(
++            "SELECT id, type, serialization_format FROM topics WHERE name = ?",
++            (COLOR_TOPIC,),
++        ).fetchone()
++        if topic_row is None:
++            raise ValueError(f"color topic not found: {COLOR_TOPIC}")
++        topic_id, message_type, serialization = topic_row
++        if message_type != "sensor_msgs/msg/Image" or serialization != "cdr":
++            raise ValueError(
++                f"unexpected color topic format: {message_type}, {serialization}"
++            )
++        rows = connection.execute(
++            "SELECT id, timestamp FROM messages WHERE topic_id = ? ORDER BY timestamp",
++            (topic_id,),
++        ).fetchall()
++        message_ids = np.array([row[0] for row in rows], dtype=np.int64)
++        timestamps = np.array([row[1] for row in rows], dtype=np.int64)
++        selected, targets = nearest_message_indices(timestamps)
++
++        full_path = output_dir / "normalized_first_7s_24fps_1280x704.mp4"
++        context_path = output_dir / "input_context_2s.mp4"
++        reference_path = output_dir / "reference_future_121f.mp4"
++        full_writer = video_writer(full_path)
++        context_writer = video_writer(context_path)
++        reference_writer = video_writer(reference_path)
++        normalized_frames: list[np.ndarray] = []
++        first_fields = None
++        try:
++            for output_index, source_index in enumerate(selected):
++                message_id = int(message_ids[source_index])
++                data = connection.execute(
++                    "SELECT data FROM messages WHERE id = ?", (message_id,)
++                ).fetchone()[0]
++                frame, fields = decode_rgb8_image(data)
++                if first_fields is None:
++                    first_fields = fields
++                normalized_frames.append(frame)
++                full_writer.append_data(frame)
++                if output_index < CONTEXT_FRAMES:
++                    context_writer.append_data(frame)
++                if output_index >= CONTEXT_FRAMES - 1:
++                    reference_writer.append_data(frame)
++        finally:
++            full_writer.close()
++            context_writer.close()
++            reference_writer.close()
++    finally:
++        connection.close()
++
++    if len(normalized_frames) != OUTPUT_FRAMES:
++        raise RuntimeError(f"expected {OUTPUT_FRAMES} normalized frames")
++    Image.fromarray(normalized_frames[CONTEXT_FRAMES - 1]).save(
++        output_dir / "anchor_frame_048.png"
++    )
++    save_timeline(output_dir / "source_first_7s_keyframes.jpg", normalized_frames)
++
++    sampling_errors = timestamps[selected] - targets
++    metadata = {
++        "source_bag": str(bag),
++        "color_topic": COLOR_TOPIC,
++        "source_message_count": len(timestamps),
++        "source_duration_seconds": float((timestamps[-1] - timestamps[0]) / 1e9),
++        "source_nominal_fps": 30,
++        "source_fields": first_fields,
++        "preprocessing": {
++            "duration_seconds": 7.0,
++            "output_fps": OUTPUT_FPS,
++            "output_frame_count": OUTPUT_FRAMES,
++            "vertical_crop_source_rows": [8, 711],
++            "output_resolution": [OUTPUT_WIDTH, OUTPUT_HEIGHT],
++            "timestamp_sampling_error_ms_max_abs": float(
++                np.max(np.abs(sampling_errors)) / 1e6
++            ),
++            "timestamp_sampling_error_ms_mean_abs": float(
++                np.mean(np.abs(sampling_errors)) / 1e6
++            ),
++            "reused_source_frame_count": int(len(selected) - len(np.unique(selected))),
++        },
++        "context": {
++            "normalized_frame_range_zero_based": [0, CONTEXT_FRAMES - 1],
++            "frame_count": CONTEXT_FRAMES,
++            "wan_anchor_frame_zero_based": CONTEXT_FRAMES - 1,
++        },
++        "prediction_reference": {
++            "normalized_frame_range_zero_based": [
++                CONTEXT_FRAMES - 1,
++                OUTPUT_FRAMES - 1,
++            ],
++            "frame_count_including_anchor": REFERENCE_FRAMES,
++            "future_frame_count": REFERENCE_FRAMES - 1,
++            "feedback_slots": (REFERENCE_FRAMES - 1) // 4,
++        },
++        "outputs": {
++            "normalized": str(full_path),
++            "context": str(context_path),
++            "reference": str(reference_path),
++            "anchor": str(output_dir / "anchor_frame_048.png"),
++        },
++    }
++    (output_dir / "preprocessing.json").write_text(
++        json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8"
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/prepare_ball_kp_slot_ablation.py b/scripts/prepare_ball_kp_slot_ablation.py
+new file mode 100755
+index 0000000..8ef2c8b
+--- /dev/null
++++ b/scripts/prepare_ball_kp_slot_ablation.py
+@@ -0,0 +1,325 @@
++#!/usr/bin/env python3
++"""Prepare visual and numeric material for the ball kp/slot ablation."""
++
++from __future__ import annotations
++
++import csv
++import json
++import math
++from pathlib import Path
++
++import cv2
++import imageio.v2 as imageio
++import numpy as np
++from PIL import Image, ImageDraw, ImageFont
++
++FPS = 24
++FRAME_COUNT = 121
++FRAME_SIZE = (1280, 704)
++KEYFRAME_INDICES = (0, 6, 12, 24, 48, 72, 96, 120)
++FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
++
++
++def load_video(path: Path, expected_frames: int = FRAME_COUNT) -> np.ndarray:
++    reader = imageio.get_reader(path)
++    try:
++        frames = np.stack([frame[..., :3] for frame in reader])
++        metadata = reader.get_meta_data()
++    finally:
++        reader.close()
++    if frames.shape != (expected_frames, FRAME_SIZE[1], FRAME_SIZE[0], 3):
++        raise ValueError(f"unexpected video shape for {path}: {frames.shape}")
++    if not math.isclose(float(metadata.get("fps", FPS)), FPS, abs_tol=0.01):
++        raise ValueError(f"unexpected frame rate for {path}: {metadata.get('fps')}")
++    return frames
++
++
++def write_video(path: Path, frames, *, fps: int = FPS) -> None:
++    writer = imageio.get_writer(
++        path,
++        fps=fps,
++        codec="libx264",
++        pixelformat="yuv420p",
++        macro_block_size=None,
++        ffmpeg_params=["-crf", "18", "-movflags", "+faststart"],
++    )
++    try:
++        for frame in frames:
++            writer.append_data(np.asarray(frame, dtype=np.uint8))
++    finally:
++        writer.close()
++
++
++def header(labels: list[str], cell_width: int, height: int = 48) -> np.ndarray:
++    canvas = Image.new("RGB", (cell_width * len(labels), height), (18, 18, 18))
++    draw = ImageDraw.Draw(canvas)
++    font = ImageFont.truetype(FONT_PATH, 21)
++    for index, label in enumerate(labels):
++        draw.text((index * cell_width + 12, 11), label, fill=(245, 245, 245), font=font)
++    return np.asarray(canvas)
++
++
++def comparison_frames(videos: dict[str, np.ndarray]):
++    labels = list(videos)
++    frame_count = videos[labels[0]].shape[0]
++    if any(video.shape[0] != frame_count for video in videos.values()):
++        raise ValueError("comparison videos must have the same frame count")
++    top = header(labels, 384)
++    for frame_index in range(frame_count):
++        row = np.hstack(
++            [
++                cv2.resize(
++                    videos[label][frame_index],
++                    (384, 212),
++                    interpolation=cv2.INTER_AREA,
++                )
++                for label in labels
++            ]
++        )
++        yield np.vstack([top, row])
++
++
++def save_keyframe_grid(path: Path, videos: dict[str, np.ndarray]) -> None:
++    cell_width, cell_height, header_height = 320, 176, 48
++    labels = list(videos)
++    canvas = Image.new(
++        "RGB",
++        (cell_width * len(KEYFRAME_INDICES), header_height + cell_height * len(labels)),
++        (18, 18, 18),
++    )
++    draw = ImageDraw.Draw(canvas)
++    time_font = ImageFont.truetype(FONT_PATH, 22)
++    label_font = ImageFont.truetype(FONT_PATH, 20)
++    for column, frame_index in enumerate(KEYFRAME_INDICES):
++        draw.text(
++            (column * cell_width + 8, 10),
++            f"{frame_index / FPS:.2f} s",
++            fill=(245, 245, 245),
++            font=time_font,
++        )
++    for row, (label, video) in enumerate(videos.items()):
++        y = header_height + row * cell_height
++        for column, frame_index in enumerate(KEYFRAME_INDICES):
++            frame = Image.fromarray(video[frame_index]).resize(
++                (cell_width, cell_height), Image.Resampling.LANCZOS
++            )
++            canvas.paste(frame, (column * cell_width, y))
++        draw.rectangle((4, y + 4, 250, y + 33), fill=(12, 12, 12))
++        draw.text((9, y + 6), label, fill=(255, 255, 255), font=label_font)
++    canvas.save(path, quality=94, subsampling=0)
++
++
++def table_mask() -> np.ndarray:
++    mask = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0]), dtype=np.uint8)
++    polygon = np.array(
++        [(0, 341), (774, 111), (1279, 358), (1279, 541), (263, 703), (0, 550)],
++        dtype=np.int32,
++    )
++    cv2.fillPoly(mask, [polygon], 1)
++    return mask.astype(bool)
++
++
++def frame_metrics(reference: np.ndarray, prediction: np.ndarray, mask: np.ndarray):
++    delta = reference.astype(np.float32) - prediction.astype(np.float32)
++    roi = delta[:, mask]
++    mae = np.mean(np.abs(roi), axis=(1, 2))
++    mse = np.mean(np.square(roi), axis=(1, 2))
++    psnr = 10 * np.log10((255.0**2) / np.maximum(mse, 1e-12))
++    return mae, psnr
++
++
++def orange_center(frame: np.ndarray) -> np.ndarray | None:
++    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
++    orange = cv2.inRange(hsv, np.array([0, 120, 50]), np.array([20, 255, 255]))
++    orange[:240] = 0
++    orange[:, :500] = 0
++    orange[:, 950:] = 0
++    count, _, stats, centers = cv2.connectedComponentsWithStats(orange)
++    candidates = [
++        index for index in range(1, count) if stats[index, cv2.CC_STAT_AREA] >= 500
++    ]
++    if not candidates:
++        return None
++    selected = max(candidates, key=lambda index: stats[index, cv2.CC_STAT_AREA])
++    return centers[selected]
++
++
++def trajectory_summary(
++    reference: np.ndarray, prediction: np.ndarray
++) -> dict[str, float | int]:
++    reference_centers = [orange_center(frame) for frame in reference[:76]]
++    predicted_centers = [orange_center(frame) for frame in prediction[:76]]
++    errors = [
++        float(np.linalg.norm(reference_center - predicted_center))
++        for reference_center, predicted_center in zip(
++            reference_centers, predicted_centers, strict=True
++        )
++        if reference_center is not None and predicted_center is not None
++    ]
++    return {
++        "detected_frames": len(errors),
++        "mean_center_error_px": float(np.mean(errors)) if errors else math.nan,
++        "median_center_error_px": float(np.median(errors)) if errors else math.nan,
++    }
++
++
++def audit_summary(path: Path) -> dict[str, float | int | list[float]]:
++    events = json.loads(path.read_text(encoding="utf-8"))
++    guided = [event for event in events if event.get("guided") is True]
++    effective_ratios = [
++        event["kp"]
++        * event["guidance_weight"]
++        * event["correction_norm"]
++        / event["base_velocity_norm"]
++        for event in guided
++    ]
++    guided_ratios = [
++        event["guided_velocity_norm"] / event["base_velocity_norm"] for event in guided
++    ]
++    return {
++        "guided_steps": len(guided),
++        "feedback_updates": sum(
++            event.get("event") == "feedback_update" for event in events
++        ),
++        "kp_values": sorted({event["kp"] for event in guided}),
++        "effective_correction_to_base_mean": float(np.mean(effective_ratios)),
++        "effective_correction_to_base_max": float(np.max(effective_ratios)),
++        "guided_to_base_velocity_mean": float(np.mean(guided_ratios)),
++        "guided_to_base_velocity_max": float(np.max(guided_ratios)),
++    }
++
++
++def main() -> None:
++    result_dir = Path(__file__).resolve().parents[1] / "results" / "ball_meet_ball"
++    paths = {
++        "REFERENCE": result_dir / "reference_future_121f.mp4",
++        "BASE (0)": result_dir / "direct_future.mp4",
++        "FBFM 10, kp=.05": result_dir / "fbfm_kp_0p05_10slots_future.mp4",
++        "FBFM 20, kp=.05": result_dir / "fbfm_kp_0p05_20slots_future.mp4",
++        "FBFM 30, kp=.05": result_dir / "fbfm_kp_0p05_30slots_future.mp4",
++    }
++    videos = {label: load_video(path) for label, path in paths.items()}
++
++    write_video(
++        result_dir / "reference_base_fbfm_kp_0p05_10_20_30_future.mp4",
++        comparison_frames(videos),
++    )
++    save_keyframe_grid(
++        result_dir / "reference_base_fbfm_kp_0p05_10_20_30_keyframes.jpg",
++        videos,
++    )
++
++    context = load_video(result_dir / "input_context_2s.mp4", expected_frames=48)
++    with_context = {
++        label: np.concatenate([context, video[1:]], axis=0)
++        for label, video in videos.items()
++    }
++    for slots in (10, 20, 30):
++        label = f"FBFM {slots}, kp=.05"
++        write_video(
++            result_dir / f"fbfm_kp_0p05_{slots}slots_with_context.mp4",
++            with_context[label],
++        )
++    write_video(
++        result_dir / "reference_base_fbfm_kp_0p05_10_20_30_with_context.mp4",
++        comparison_frames(with_context),
++    )
++
++    reference = videos["REFERENCE"]
++    mask = table_mask()
++    metrics = {}
++    frame_values = {}
++    for label, video in videos.items():
++        if label == "REFERENCE":
++            continue
++        mae, psnr = frame_metrics(reference, video, mask)
++        frame_values[label] = (mae, psnr)
++        metrics[label] = {
++            "overall_table_roi_mae": float(np.mean(mae)),
++            "overall_table_roi_psnr_db": float(np.mean(psnr)),
++            "segments_table_roi_mae": {
++                "0-40": float(np.mean(mae[:41])),
++                "41-80": float(np.mean(mae[41:81])),
++                "81-120": float(np.mean(mae[81:])),
++            },
++            "orange_ball_frames_0_to_75": trajectory_summary(reference, video),
++        }
++
++    kp_1_metrics = {}
++    kp_1_paths = {
++        "FBFM 10, kp=1": result_dir / "fbfm_state_weight_1_10slots_future.mp4",
++        "FBFM 20, kp=1": result_dir / "fbfm_state_weight_1_20slots_future.mp4",
++        "FBFM 30, kp=1": result_dir / "fbfm_state_weight_1_future.mp4",
++    }
++    for label, path in kp_1_paths.items():
++        video = load_video(path)
++        mae, psnr = frame_metrics(reference, video, mask)
++        kp_1_metrics[label] = {
++            "overall_table_roi_mae": float(np.mean(mae)),
++            "overall_table_roi_psnr_db": float(np.mean(psnr)),
++            "segments_table_roi_mae": {
++                "0-40": float(np.mean(mae[:41])),
++                "41-80": float(np.mean(mae[41:81])),
++                "81-120": float(np.mean(mae[81:])),
++            },
++            "orange_ball_frames_0_to_75": trajectory_summary(reference, video),
++        }
++
++    summary = {
++        "common": {
++            "fps": FPS,
++            "frame_count": FRAME_COUNT,
++            "resolution": list(FRAME_SIZE),
++            "seed": 0,
++            "sampling_steps": 50,
++            "sample_shift": 5.0,
++            "cfg_scale": 5.0,
++            "beta": 10.0,
++            "state_weight": 1.0,
++            "kp": 0.05,
++        },
++        "metrics": metrics,
++        "kp_1_metrics_same_evaluator": kp_1_metrics,
++        "audits": {
++            f"FBFM {slots}, kp=.05": audit_summary(
++                result_dir / f"fbfm_kp_0p05_{slots}slots_future.json"
++            )
++            for slots in (10, 20, 30)
++        },
++        "table_roi_polygon": [
++            [0, 341],
++            [774, 111],
++            [1279, 358],
++            [1279, 541],
++            [263, 703],
++            [0, 550],
++        ],
++        "orange_detector": {
++            "opencv_hsv_range": [[0, 120, 50], [20, 255, 255]],
++            "search_bounds": {"x": [500, 950], "y": [240, 704]},
++            "minimum_component_area_px": 500,
++        },
++    }
++    (result_dir / "kp_0p05_slot_ablation_summary.json").write_text(
++        json.dumps(summary, indent=2, ensure_ascii=True), encoding="utf-8"
++    )
++
++    csv_path = result_dir / "kp_0p05_slot_ablation_frame_metrics.csv"
++    with csv_path.open("w", newline="", encoding="utf-8") as handle:
++        fieldnames = ["frame_index", "time_s"]
++        for label in frame_values:
++            key = label.lower().replace(" ", "_").replace(",", "")
++            fieldnames.extend([f"{key}_table_roi_mae", f"{key}_table_roi_psnr_db"])
++        writer = csv.DictWriter(handle, fieldnames=fieldnames)
++        writer.writeheader()
++        for frame_index in range(FRAME_COUNT):
++            row = {"frame_index": frame_index, "time_s": frame_index / FPS}
++            for label, (mae, psnr) in frame_values.items():
++                key = label.lower().replace(" ", "_").replace(",", "")
++                row[f"{key}_table_roi_mae"] = float(mae[frame_index])
++                row[f"{key}_table_roi_psnr_db"] = float(psnr[frame_index])
++            writer.writerow(row)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/prepare_robot_arm_ball_stop_comparison.py b/scripts/prepare_robot_arm_ball_stop_comparison.py
+new file mode 100755
+index 0000000..4a0c25f
+--- /dev/null
++++ b/scripts/prepare_robot_arm_ball_stop_comparison.py
+@@ -0,0 +1,336 @@
++#!/usr/bin/env python3
++"""Prepare paper-ready base/FBFM comparison material for the robot task."""
++
++from __future__ import annotations
++
++import json
++import math
++from pathlib import Path
++
++import cv2
++import imageio.v2 as imageio
++import numpy as np
++from PIL import Image, ImageDraw, ImageFont
++
++FPS = 24
++FUTURE_FRAME_COUNT = 121
++CONTEXT_FRAME_COUNT = 48
++FRAME_SIZE = (1280, 704)
++KEYFRAME_INDICES = (0, 6, 12, 24, 48, 72, 96, 120)
++FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
++PROMPT = (
++    "Fixed high-angle RealSense video of a robotic arm positioned at the right "
++    "edge of a white laboratory table. An orange miniature basketball and a "
++    "black-and-white miniature soccer ball roll rapidly from left to right "
++    "across the table toward the robot. As the balls approach, the robotic "
++    "gripper moves inward and intercepts and stops the black-and-white soccer "
++    "ball near its fingers, while the orange ball continues past and exits the "
++    "scene. Realistic rigid-body physics, fixed camera, natural laboratory "
++    "lighting."
++)
++
++
++def load_video(path: Path, expected_frames: int) -> np.ndarray:
++    reader = imageio.get_reader(path)
++    try:
++        frames = np.stack([frame[..., :3] for frame in reader])
++        metadata = reader.get_meta_data()
++    finally:
++        reader.close()
++    expected_shape = (expected_frames, FRAME_SIZE[1], FRAME_SIZE[0], 3)
++    if frames.shape != expected_shape:
++        raise ValueError(f"unexpected video shape for {path}: {frames.shape}")
++    if not math.isclose(float(metadata.get("fps", FPS)), FPS, abs_tol=0.01):
++        raise ValueError(f"unexpected frame rate for {path}: {metadata.get('fps')}")
++    return frames
++
++
++def video_writer(path: Path):
++    return imageio.get_writer(
++        path,
++        fps=FPS,
++        codec="libx264",
++        pixelformat="yuv420p",
++        macro_block_size=None,
++        ffmpeg_params=["-crf", "18", "-movflags", "+faststart"],
++    )
++
++
++def write_video(path: Path, frames) -> None:
++    writer = video_writer(path)
++    try:
++        for frame in frames:
++            writer.append_data(np.asarray(frame, dtype=np.uint8))
++    finally:
++        writer.close()
++
++
++def title_bar(labels: list[str], cell_width: int, height: int = 48) -> np.ndarray:
++    canvas = Image.new("RGB", (cell_width * len(labels), height), (18, 18, 18))
++    draw = ImageDraw.Draw(canvas)
++    font = ImageFont.truetype(FONT_PATH, 21)
++    for column, label in enumerate(labels):
++        draw.text(
++            (column * cell_width + 12, 11),
++            label,
++            fill=(245, 245, 245),
++            font=font,
++        )
++    return np.asarray(canvas)
++
++
++def comparison_frames(videos: dict[str, np.ndarray]):
++    labels = list(videos)
++    frame_count = videos[labels[0]].shape[0]
++    if any(video.shape[0] != frame_count for video in videos.values()):
++        raise ValueError("comparison videos must contain the same number of frames")
++    cell_width, cell_height = 480, 264
++    header = title_bar(labels, cell_width)
++    for frame_index in range(frame_count):
++        row = np.hstack(
++            [
++                cv2.resize(
++                    videos[label][frame_index],
++                    (cell_width, cell_height),
++                    interpolation=cv2.INTER_AREA,
++                )
++                for label in labels
++            ]
++        )
++        yield np.vstack([header, row])
++
++
++def with_context_frames(context: np.ndarray, future: np.ndarray):
++    yield from context
++    yield from future[1:]
++
++
++def comparison_with_context_frames(
++    context: np.ndarray, videos: dict[str, np.ndarray]
++):
++    labels = list(videos)
++    cell_width, cell_height = 480, 264
++    header = title_bar(labels, cell_width)
++    for frame_index in range(CONTEXT_FRAME_COUNT + FUTURE_FRAME_COUNT - 1):
++        if frame_index < CONTEXT_FRAME_COUNT:
++            row_frames = [context[frame_index]] * len(labels)
++        else:
++            future_index = frame_index - CONTEXT_FRAME_COUNT + 1
++            row_frames = [videos[label][future_index] for label in labels]
++        row = np.hstack(
++            [
++                cv2.resize(
++                    frame,
++                    (cell_width, cell_height),
++                    interpolation=cv2.INTER_AREA,
++                )
++                for frame in row_frames
++            ]
++        )
++        yield np.vstack([header, row])
++
++
++def save_keyframes(result_dir: Path, videos: dict[str, np.ndarray]) -> None:
++    keyframe_dir = result_dir / "keyframes"
++    for label, video in videos.items():
++        label_dir = keyframe_dir / label
++        label_dir.mkdir(parents=True, exist_ok=True)
++        for frame_index in KEYFRAME_INDICES:
++            time_ms = round(frame_index * 1000 / FPS)
++            Image.fromarray(video[frame_index]).save(
++                label_dir / f"t_{time_ms:04d}ms_frame_{frame_index:03d}.png"
++            )
++
++
++def save_keyframe_grid(path: Path, videos: dict[str, np.ndarray]) -> None:
++    cell_width, cell_height, header_height = 320, 176, 48
++    canvas = Image.new(
++        "RGB",
++        (
++            cell_width * len(KEYFRAME_INDICES),
++            header_height + cell_height * len(videos),
++        ),
++        (18, 18, 18),
++    )
++    draw = ImageDraw.Draw(canvas)
++    time_font = ImageFont.truetype(FONT_PATH, 22)
++    label_font = ImageFont.truetype(FONT_PATH, 20)
++    for column, frame_index in enumerate(KEYFRAME_INDICES):
++        draw.text(
++            (column * cell_width + 8, 10),
++            f"{frame_index / FPS:.2f} s",
++            fill=(245, 245, 245),
++            font=time_font,
++        )
++    for row, (label, video) in enumerate(videos.items()):
++        y_position = header_height + row * cell_height
++        for column, frame_index in enumerate(KEYFRAME_INDICES):
++            frame = Image.fromarray(video[frame_index]).resize(
++                (cell_width, cell_height), Image.Resampling.LANCZOS
++            )
++            canvas.paste(frame, (column * cell_width, y_position))
++        draw.rectangle((4, y_position + 4, 250, y_position + 34), fill=(12, 12, 12))
++        draw.text(
++            (9, y_position + 6),
++            label,
++            fill=(255, 255, 255),
++            font=label_font,
++        )
++    canvas.save(path, quality=95, subsampling=0)
++
++
++def pixel_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
++    absolute_error_sum = 0.0
++    squared_error_sum = 0.0
++    value_count = 0
++    temporal_error_sum = 0.0
++    temporal_value_count = 0
++    for frame_index in range(FUTURE_FRAME_COUNT):
++        delta = reference[frame_index].astype(np.float32)
++        delta -= prediction[frame_index].astype(np.float32)
++        absolute_error_sum += float(np.abs(delta).sum(dtype=np.float64))
++        squared_error_sum += float(np.square(delta).sum(dtype=np.float64))
++        value_count += delta.size
++        if frame_index:
++            reference_motion = reference[frame_index].astype(np.float32)
++            reference_motion -= reference[frame_index - 1].astype(np.float32)
++            prediction_motion = prediction[frame_index].astype(np.float32)
++            prediction_motion -= prediction[frame_index - 1].astype(np.float32)
++            temporal_delta = reference_motion - prediction_motion
++            temporal_error_sum += float(
++                np.abs(temporal_delta).sum(dtype=np.float64)
++            )
++            temporal_value_count += temporal_delta.size
++    mae = absolute_error_sum / value_count
++    mse = squared_error_sum / value_count
++    return {
++        "full_frame_mae": mae,
++        "full_frame_psnr_db": 10 * math.log10(255.0**2 / max(mse, 1e-12)),
++        "temporal_gradient_mae": temporal_error_sum / temporal_value_count,
++    }
++
++
++def audit_summary(path: Path) -> dict:
++    events = json.loads(path.read_text(encoding="utf-8"))
++    begin = next(event for event in events if event["event"] == "generation_begin")
++    end = next(event for event in events if event["event"] == "generation_end")
++    updates = [event for event in events if event["event"] == "feedback_update"]
++    guidance = [event for event in events if event["event"] == "solver_guidance"]
++    guided = [event for event in guidance if event.get("guided") is True]
++    return {
++        "generation": begin,
++        "feedback_update_count": len(updates),
++        "feedback_slots": [event["slot"] for event in updates],
++        "feedback_release_steps": [event["release_step"] for event in updates],
++        "guided_solver_step_count": len(guided),
++        "unguided_solver_step_count": len(guidance) - len(guided),
++        "generation_end": end,
++    }
++
++
++def main() -> None:
++    result_dir = Path(__file__).resolve().parents[1] / "results" / "robot_arm_ball_stop"
++    paths = {
++        "reference": result_dir / "reference_future_121f.mp4",
++        "wan2.2_base": result_dir / "base_future.mp4",
++        "fbfm_ours": result_dir / "fbfm_ours_future.mp4",
++    }
++    videos = {
++        label: load_video(path, FUTURE_FRAME_COUNT) for label, path in paths.items()
++    }
++    display_videos = {
++        "Reference": videos["reference"],
++        "Wan2.2 Base": videos["wan2.2_base"],
++        "FBFM Ours": videos["fbfm_ours"],
++    }
++
++    write_video(
++        result_dir / "reference_base_fbfm_future.mp4",
++        comparison_frames(display_videos),
++    )
++    save_keyframe_grid(
++        result_dir / "reference_base_fbfm_keyframes.jpg",
++        display_videos,
++    )
++    save_keyframes(result_dir, videos)
++
++    context = load_video(result_dir / "input_context_2s.mp4", CONTEXT_FRAME_COUNT)
++    write_video(
++        result_dir / "base_with_context.mp4",
++        with_context_frames(context, videos["wan2.2_base"]),
++    )
++    write_video(
++        result_dir / "fbfm_ours_with_context.mp4",
++        with_context_frames(context, videos["fbfm_ours"]),
++    )
++    write_video(
++        result_dir / "reference_base_fbfm_with_context.mp4",
++        comparison_with_context_frames(context, display_videos),
++    )
++
++    summary = {
++        "experiment": "RealSense D435i robot-arm ball-stopping prediction",
++        "prompt": PROMPT,
++        "timing": {
++            "fps": FPS,
++            "context_frames": CONTEXT_FRAME_COUNT,
++            "context_duration_seconds": 2.0,
++            "prediction_frames_including_anchor": FUTURE_FRAME_COUNT,
++            "prediction_duration_seconds": 5.0,
++            "keyframe_indices": list(KEYFRAME_INDICES),
++            "keyframe_times_seconds": [index / FPS for index in KEYFRAME_INDICES],
++        },
++        "common_generation_config": {
++            "model": "Wan2.2-TI2V-5B",
++            "resolution": list(FRAME_SIZE),
++            "seed": 0,
++            "sampling_steps": 50,
++            "sample_shift": 5.0,
++            "cfg_scale": 5.0,
++        },
++        "fbfm_config": {
++            "feedback_slots": 30,
++            "observed_future_frames": 120,
++            "observations_per_slot": 4,
++            "state_weight": 1.0,
++            "kp": 1.0,
++            "beta": 10.0,
++        },
++        "pixel_metrics_against_reference": {
++            "wan2.2_base": pixel_metrics(
++                videos["reference"], videos["wan2.2_base"]
++            ),
++            "fbfm_ours": pixel_metrics(videos["reference"], videos["fbfm_ours"]),
++        },
++        "audits": {
++            "wan2.2_base": audit_summary(result_dir / "base_future.json"),
++            "fbfm_ours": audit_summary(result_dir / "fbfm_ours_future.json"),
++        },
++        "artifacts": {
++            "source_bag": str(result_dir.parents[1] / "examples" / "recording.db3"),
++            "normalized_first_7s": str(
++                result_dir / "normalized_first_7s_24fps_1280x704.mp4"
++            ),
++            "context": str(result_dir / "input_context_2s.mp4"),
++            "reference_future": str(paths["reference"]),
++            "base_future": str(paths["wan2.2_base"]),
++            "fbfm_future": str(paths["fbfm_ours"]),
++            "future_comparison": str(
++                result_dir / "reference_base_fbfm_future.mp4"
++            ),
++            "comparison_with_context": str(
++                result_dir / "reference_base_fbfm_with_context.mp4"
++            ),
++            "keyframe_grid": str(
++                result_dir / "reference_base_fbfm_keyframes.jpg"
++            ),
++            "individual_keyframes": str(result_dir / "keyframes"),
++        },
++    }
++    (result_dir / "experiment_summary.json").write_text(
++        json.dumps(summary, indent=2, ensure_ascii=True), encoding="utf-8"
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/run_ball_slot_ablation_kp_0p05.sh b/scripts/run_ball_slot_ablation_kp_0p05.sh
+new file mode 100755
+index 0000000..a303077
+--- /dev/null
++++ b/scripts/run_ball_slot_ablation_kp_0p05.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++python_bin="${WAN22_PYTHON:-python}"
++ckpt_dir="${WAN22_CKPT_DIR:?set WAN22_CKPT_DIR to the TI2V-5B checkpoint}"
++result_dir="${repo_dir}/results/ball_meet_ball"
++prompt="Static high-angle phone video of exactly two small rubber balls on a white office table. The orange miniature basketball rolls toward the stationary black-and-white miniature soccer ball and collides with it. The impact transfers momentum: the soccer ball rolls away, while the orange ball slows and rebounds slightly. The man beside the table remains still. Realistic physics, fixed camera, natural indoor lighting."
++
++variants=(10 20 30)
++release_schedules=(
++  "1,3,4,6,8,9,11,12,14,16"
++  "1,3,4,6,8,9,11,12,14,16,17,19,20,22,24,25,27,29,30,32"
++  "1,3,4,6,8,9,11,12,14,16,17,19,20,22,24,25,27,29,30,32,33,35,37,38,40,41,43,45,46,48"
++)
++
++cd "${repo_dir}"
++for index in "${!variants[@]}"; do
++  slots="${variants[$index]}"
++  output="${result_dir}/fbfm_kp_0p05_${slots}slots_future.mp4"
++  audit="${result_dir}/fbfm_kp_0p05_${slots}slots_future.json"
++  if [[ -s "${output}" && -s "${audit}" ]]; then
++    echo "Skipping completed ${slots}-slot run"
++    continue
++  fi
++
++  "${python_bin}" generate_fbfm.py \
++    --mode FBFM \
++    --ckpt-dir "${ckpt_dir}" \
++    --image "${result_dir}/anchor_frame_048.png" \
++    --feedback-video "${result_dir}/reference_future_121f.mp4" \
++    --feedback-release-steps "${release_schedules[$index]}" \
++    --prompt "${prompt}" \
++    --size "1280*704" \
++    --frame-num 121 \
++    --sample-steps 50 \
++    --sample-shift 5.0 \
++    --guide-scale 5.0 \
++    --beta 10.0 \
++    --state-weight 1.0 \
++    --kp 0.05 \
++    --seed 0 \
++    --output "${output}" \
++    --audit "${audit}"
++done
+diff --git a/scripts/validate_fbfm_vae.py b/scripts/validate_fbfm_vae.py
+new file mode 100644
+index 0000000..8ca4dce
+--- /dev/null
++++ b/scripts/validate_fbfm_vae.py
+@@ -0,0 +1,78 @@
++"""Check that streaming feedback VAE slots match native full-video encoding."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import torch
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
++if str(REPOSITORY_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPOSITORY_ROOT))
++
++from wan.fbfm.feedback import NativeWanStreamingEncoder
++from wan.modules.vae2_2 import Wan2_2_VAE
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--ckpt-dir", required=True)
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--height", type=int, default=64)
++    parser.add_argument("--width", type=int, default=64)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--atol", type=float, default=1e-5)
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    if args.height % 16 or args.width % 16:
++        raise ValueError("height and width must be divisible by 16")
++    checkpoint = Path(args.ckpt_dir) / "Wan2.2_VAE.pth"
++    if not checkpoint.is_file():
++        raise FileNotFoundError(checkpoint)
++
++    device = torch.device(args.device)
++    generator = torch.Generator(device=device).manual_seed(args.seed)
++    video = (
++        torch.rand(
++            3,
++            9,
++            args.height,
++            args.width,
++            generator=generator,
++            device=device,
++        )
++        .mul_(2)
++        .sub_(1)
++    )
++    vae = Wan2_2_VAE(vae_pth=str(checkpoint), device=device)
++
++    native = vae.encode([video])[0]
++    streaming = NativeWanStreamingEncoder(vae)
++    slots = [streaming.prime(video[:, :1])]
++    slots.append(streaming.encode(video[:, 1:5]))
++    slots.append(streaming.encode(video[:, 5:9]))
++    reconstructed = torch.cat(slots, dim=1)
++
++    maximum_error = float((native - reconstructed).abs().max().item())
++    result = {
++        "native_shape": list(native.shape),
++        "streaming_shape": list(reconstructed.shape),
++        "maximum_absolute_error": maximum_error,
++        "atol": args.atol,
++        "passed": maximum_error <= args.atol,
++    }
++    print(json.dumps(result, indent=2))
++    if not result["passed"]:
++        raise AssertionError(
++            f"streaming feedback VAE differs from native encoding by {maximum_error}"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_fbfm_state_feedback.py b/tests/test_fbfm_state_feedback.py
+new file mode 100644
+index 0000000..a1da84b
+--- /dev/null
++++ b/tests/test_fbfm_state_feedback.py
+@@ -0,0 +1,252 @@
++from __future__ import annotations
++
++import numpy as np
++import pytest
++import torch
++from PIL import Image
++from wan.fbfm.feedback import (
++    DEFAULT_KP,
++    DEFAULT_STATE_WEIGHT,
++    FeedbackEvent,
++    FeedbackMode,
++    StateFeedbackController,
++    endpoint_state_guidance,
++    endpoint_state_guidance_from_cfg_vjps,
++    evenly_spaced_release_steps,
++    masked_endpoint_error,
++)
++from wan.fbfm.pipeline import build_feedback_events
++from wan.modules import attention as attention_module
++from wan.modules.model import WanModel
++
++
++class FakeFeedbackEncoder:
++    observations_per_slot = 4
++
++    def __init__(self) -> None:
++        self.primed = False
++
++    def prime(self, anchor: torch.Tensor) -> torch.Tensor:
++        self.primed = True
++        return anchor
++
++    def encode(self, frames: torch.Tensor) -> torch.Tensor:
++        if not self.primed:
++            raise RuntimeError("not primed")
++        return frames.mean(dim=1, keepdim=True)
++
++
++def test_visual_only_default_state_weight_is_unity():
++    assert DEFAULT_STATE_WEIGHT == 1.0
++    assert DEFAULT_KP == 1.0
++
++
++def test_controller_releases_feedback_only_at_solver_boundary():
++    template = torch.zeros(1, 3, 1, 1)
++    controller = StateFeedbackController(
++        mode=FeedbackMode.FBFM,
++        encoder=FakeFeedbackEncoder(),
++        anchor=torch.zeros(1, 1, 1, 1),
++        latent_template=template,
++        events=[
++            FeedbackEvent(
++                release_step=2,
++                slot=1,
++                frames=torch.full((1, 4, 1, 1), 3.0),
++            )
++        ],
++    )
++
++    assert controller.advance(1) == 0
++    _, mask_before, version_before = controller.constraints.snapshot("FBFM")
++    assert torch.count_nonzero(mask_before).item() == 0
++    assert version_before == 0
++
++    assert controller.advance(2) == 1
++    target, mask_after, version_after = controller.constraints.snapshot("FBFM")
++    assert mask_after.flatten().tolist() == [0.0, 1.0, 0.0]
++    assert target[:, 1].item() == pytest.approx(3.0)
++    assert version_after == 1
++
++
++def test_direct_mode_keeps_state_mask_zero():
++    controller = StateFeedbackController(
++        mode="DIRECT",
++        encoder=FakeFeedbackEncoder(),
++        anchor=torch.zeros(1, 1, 1, 1),
++        latent_template=torch.zeros(1, 2, 1, 1),
++        events=[],
++    )
++    _, mask, version = controller.constraints.snapshot("DIRECT")
++    assert torch.count_nonzero(mask).item() == 0
++    assert version == 0
++
++
++def test_endpoint_guidance_moves_an_euler_update_toward_target():
++    sample = torch.tensor([[[[2.0]]]], requires_grad=True)
++    velocity = sample * 0
++    result = endpoint_state_guidance(
++        sample=sample,
++        velocity=velocity,
++        target=torch.zeros_like(sample),
++        mask=torch.ones(1, 1, 1, 1),
++        sigma=0.5,
++        beta=1.0,
++    )
++    next_sample = sample.detach() + result.velocity * (0.0 - 0.5)
++
++    assert result.diagnostics["guided"] is True
++    assert next_sample.abs().item() < sample.detach().abs().item()
++
++
++def test_kp_scales_complete_feedback_velocity_correction():
++    def guide(kp: float):
++        sample = torch.tensor([[[[2.0]]]], requires_grad=True)
++        return endpoint_state_guidance(
++            sample=sample,
++            velocity=sample * 0,
++            target=torch.zeros_like(sample),
++            mask=torch.ones(1, 1, 1, 1),
++            sigma=0.5,
++            beta=1.0,
++            kp=kp,
++        )
++
++    full = guide(1.0)
++    damped = guide(0.05)
++
++    torch.testing.assert_close(damped.velocity, full.velocity * 0.05)
++    assert damped.diagnostics["kp"] == pytest.approx(0.05)
++
++
++def test_split_cfg_vjps_match_combined_endpoint_guidance():
++    sample = torch.randn(2, 3, 2, 2, requires_grad=True)
++    target = torch.randn_like(sample)
++    mask = torch.tensor([0.0, 1.0, 1.0]).view(1, 3, 1, 1)
++    sigma = 0.6
++    guide_scale = 5.0
++
++    conditional = sample.sin() + sample.square()
++    unconditional = sample.cos() - 0.25 * sample
++    velocity = unconditional + guide_scale * (conditional - unconditional)
++    combined = endpoint_state_guidance(
++        sample=sample,
++        velocity=velocity,
++        target=target,
++        mask=mask,
++        sigma=sigma,
++        beta=3.0,
++        state_weight=0.2,
++        kp=0.05,
++    )
++
++    error = masked_endpoint_error(
++        sample=sample,
++        velocity=velocity,
++        target=target,
++        mask=mask,
++        sigma=sigma,
++        state_weight=0.2,
++    )
++    conditional = sample.sin() + sample.square()
++    unconditional = sample.cos() - 0.25 * sample
++    conditional_vjp = torch.autograd.grad(
++        conditional, sample, grad_outputs=error, retain_graph=True
++    )[0]
++    unconditional_vjp = torch.autograd.grad(unconditional, sample, grad_outputs=error)[
++        0
++    ]
++    split = endpoint_state_guidance_from_cfg_vjps(
++        velocity=velocity,
++        error=error,
++        mask=mask,
++        conditional_vjp=conditional_vjp,
++        unconditional_vjp=unconditional_vjp,
++        sigma=sigma,
++        guide_scale=guide_scale,
++        beta=3.0,
++        kp=0.05,
++    )
++
++    torch.testing.assert_close(split.velocity, combined.velocity)
++
++
++def test_feedback_groups_use_four_distinct_measured_frames():
++    frames = [
++        Image.fromarray(np.full((8, 8, 3), value, dtype=np.uint8))
++        for value in (10, 20, 30, 40, 50, 60, 70, 80)
++    ]
++    events = build_feedback_events(
++        future_frames=frames,
++        release_steps=[2, 4],
++        width=8,
++        height=8,
++    )
++
++    assert [event.slot for event in events] == [1, 2]
++    assert [event.release_step for event in events] == [2, 4]
++    assert all(event.frames.shape == (3, 4, 8, 8) for event in events)
++    first_means = events[0].frames.mean(dim=(0, 2, 3))
++    assert torch.all(first_means[1:] > first_means[:-1])
++
++
++def test_even_release_schedule_is_deterministic_and_internal():
++    assert evenly_spaced_release_steps(2, 12) == [4, 8]
++    with pytest.raises(ValueError, match="fewer than solver steps"):
++        evenly_spaced_release_steps(2, 2)
++
++
++def test_sdpa_fallback_preserves_dtype_and_supports_vjp(monkeypatch):
++    monkeypatch.setattr(attention_module, "FLASH_ATTN_2_AVAILABLE", False)
++    monkeypatch.setattr(attention_module, "FLASH_ATTN_3_AVAILABLE", False)
++    query = torch.randn(1, 3, 2, 4, requires_grad=True)
++    key = torch.randn(1, 3, 2, 4, requires_grad=True)
++    value = torch.randn(1, 3, 2, 4, requires_grad=True)
++
++    output = attention_module.attention(
++        query,
++        key,
++        value,
++        k_lens=torch.tensor([2]),
++        dtype=torch.float32,
++    )
++    output.sum().backward()
++
++    assert output.shape == query.shape
++    assert output.dtype == query.dtype
++    assert query.grad is not None
++
++
++def test_wan_block_checkpointing_preserves_input_vjp(monkeypatch):
++    monkeypatch.setattr(attention_module, "FLASH_ATTN_2_AVAILABLE", False)
++    monkeypatch.setattr(attention_module, "FLASH_ATTN_3_AVAILABLE", False)
++    model = WanModel(
++        model_type="ti2v",
++        patch_size=(1, 2, 2),
++        text_len=2,
++        in_dim=2,
++        dim=12,
++        ffn_dim=24,
++        freq_dim=8,
++        text_dim=8,
++        out_dim=2,
++        num_heads=2,
++        num_layers=2,
++    ).eval().requires_grad_(False)
++    context = [torch.randn(2, 8)]
++    timestep = torch.tensor([500.0])
++
++    def input_vjp(checkpointing: bool) -> tuple[torch.Tensor, torch.Tensor]:
++        sample = torch.randn(2, 1, 4, 4, requires_grad=True)
++        model.gradient_checkpointing = checkpointing
++        output = model([sample], timestep, context, seq_len=4)[0]
++        gradient = torch.autograd.grad(output.square().sum(), sample)[0]
++        return output.detach(), gradient
++
++    torch.manual_seed(0)
++    native_output, native_vjp = input_vjp(False)
++    torch.manual_seed(0)
++    checkpoint_output, checkpoint_vjp = input_vjp(True)
++
++    torch.testing.assert_close(checkpoint_output, native_output)
++    torch.testing.assert_close(checkpoint_vjp, native_vjp)
+diff --git a/wan/fbfm/__init__.py b/wan/fbfm/__init__.py
+new file mode 100644
+index 0000000..d70cf0a
+--- /dev/null
++++ b/wan/fbfm/__init__.py
+@@ -0,0 +1,26 @@
++"""State-only FBFM support for Wan2.2 video inference."""
++
++from .feedback import (
++    DEFAULT_STATE_WEIGHT,
++    FeedbackEvent,
++    FeedbackMode,
++    NativeWanStreamingEncoder,
++    StateFeedbackController,
++    StateFeedbackResult,
++    StateSlotConstraints,
++    endpoint_state_guidance,
++)
++from .pipeline import WanFBFMOutput, WanTI2VFBFM
++
++__all__ = [
++    "DEFAULT_STATE_WEIGHT",
++    "FeedbackEvent",
++    "FeedbackMode",
++    "NativeWanStreamingEncoder",
++    "StateFeedbackController",
++    "StateFeedbackResult",
++    "StateSlotConstraints",
++    "WanFBFMOutput",
++    "WanTI2VFBFM",
++    "endpoint_state_guidance",
++]
+diff --git a/wan/fbfm/feedback.py b/wan/fbfm/feedback.py
+new file mode 100644
+index 0000000..4794cc4
+--- /dev/null
++++ b/wan/fbfm/feedback.py
+@@ -0,0 +1,452 @@
++"""Slot-aligned visual state feedback for Wan2.2 flow matching."""
++
++from __future__ import annotations
++
++import heapq
++import math
++import threading
++from collections.abc import Sequence
++from dataclasses import dataclass
++from enum import Enum
++from typing import Any, Protocol
++
++import torch
++from torch import Tensor
++from wan.modules.vae2_2 import count_conv3d, patchify
++
++# This pipeline has only visual-state residuals. The 56/9600 coefficient used
++# by DreamZero balances state and action dimensions and does not apply here.
++DEFAULT_STATE_WEIGHT = 1.0
++DEFAULT_KP = 1.0
++
++
++class FeedbackMode(str, Enum):
++    """Paired inference modes that share one video denoising loop."""
++
++    DIRECT = "DIRECT"
++    FBFM = "FBFM"
++
++    @classmethod
++    def parse(cls, value: str | FeedbackMode) -> FeedbackMode:
++        if isinstance(value, cls):
++            return value
++        return cls(str(value).strip().upper())
++
++
++@dataclass(frozen=True)
++class FeedbackEvent:
++    """Four causal raw frames released for one future latent slot."""
++
++    release_step: int
++    slot: int
++    frames: Tensor
++
++    def __post_init__(self) -> None:
++        if self.release_step < 0:
++            raise ValueError("release_step must be non-negative")
++        if self.slot <= 0:
++            raise ValueError("feedback slots must follow the native I2V anchor")
++        if self.frames.ndim != 4:
++            raise ValueError("feedback frames must have shape (C,T,H,W)")
++
++
++class FeedbackEncoder(Protocol):
++    observations_per_slot: int
++
++    def prime(self, anchor: Tensor) -> Tensor: ...
++
++    def encode(self, frames: Tensor) -> Tensor: ...
++
++
++class NativeWanStreamingEncoder:
++    """Run the native Wan2.2 VAE causally with an independent feature cache.
++
++    The official VAE clears its cache around each complete-video encode. This
++    wrapper keeps a separate encoder cache, so solver-time feedback neither
++    resets nor reuses the native I2V conditioning cache.
++    """
++
++    observations_per_slot = 4
++
++    def __init__(self, vae: Any) -> None:
++        self.vae = vae
++        self.model = vae.model
++        self._lock = threading.RLock()
++        self.clear()
++
++    def clear(self) -> None:
++        with self._lock:
++            self._feature_cache = [None] * count_conv3d(self.model.encoder)
++            self._primed = False
++
++    def prime(self, anchor: Tensor) -> Tensor:
++        if anchor.ndim != 4 or anchor.shape[1] != 1:
++            raise ValueError("feedback anchor must have shape (C,1,H,W)")
++        with self._lock:
++            if self._primed:
++                raise RuntimeError("feedback encoder is already primed")
++            latent = self._encode_chunk(anchor)
++            self._primed = True
++            return latent
++
++    def encode(self, frames: Tensor) -> Tensor:
++        if frames.ndim != 4 or frames.shape[1] != self.observations_per_slot:
++            raise ValueError(
++                f"feedback chunk must have shape (C,{self.observations_per_slot},H,W)"
++            )
++        with self._lock:
++            if not self._primed:
++                raise RuntimeError("prime the feedback encoder before encoding frames")
++            latent = self._encode_chunk(frames)
++        if latent.shape[1] != 1:
++            raise RuntimeError(
++                "one feedback frame group must produce exactly one latent slot, "
++                f"got {tuple(latent.shape)}"
++            )
++        return latent
++
++    @torch.no_grad()
++    def _encode_chunk(self, video: Tensor) -> Tensor:
++        value = video.unsqueeze(0).to(
++            device=self.vae.device, dtype=self.model.encoder.conv1.weight.dtype
++        )
++        device_type = value.device.type
++        with torch.amp.autocast(device_type, enabled=False):
++            value = patchify(value, patch_size=2)
++            feature_index = [0]
++            encoded = self.model.encoder(
++                value,
++                feat_cache=self._feature_cache,
++                feat_idx=feature_index,
++            )
++            mean, _ = self.model.conv1(encoded).chunk(2, dim=1)
++            scale_mean, scale_inverse_std = self.vae.scale
++            mean = mean - scale_mean.view(1, self.model.z_dim, 1, 1, 1)
++            mean = mean * scale_inverse_std.view(1, self.model.z_dim, 1, 1, 1)
++        return mean.float().squeeze(0)
++
++
++class StateSlotConstraints:
++    """Thread-safe visual latent targets for one generation chunk."""
++
++    def __init__(self, template: Tensor) -> None:
++        if template.ndim != 4:
++            raise ValueError("latent template must have shape (C,F,H,W)")
++        self._lock = threading.RLock()
++        self._targets = torch.zeros_like(template)
++        self._mask = torch.zeros(
++            1,
++            template.shape[1],
++            1,
++            1,
++            device=template.device,
++            dtype=template.dtype,
++        )
++        self._version = 0
++        self._closed = False
++
++    @property
++    def version(self) -> int:
++        with self._lock:
++            return self._version
++
++    def close(self) -> None:
++        with self._lock:
++            self._closed = True
++
++    def update(self, slot: int, latent: Tensor) -> bool:
++        with self._lock:
++            if self._closed or not 0 <= slot < self._targets.shape[1]:
++                return False
++            if self._mask[:, slot].gt(0).any():
++                return False
++            target = latent.detach().to(
++                device=self._targets.device, dtype=self._targets.dtype
++            )
++            target = target.reshape_as(self._targets[:, slot : slot + 1])
++            self._targets[:, slot : slot + 1].copy_(target)
++            self._mask[:, slot] = 1
++            self._version += 1
++            return True
++
++    def snapshot(self, mode: FeedbackMode | str) -> tuple[Tensor, Tensor, int]:
++        with self._lock:
++            mask = self._mask.clone()
++            if FeedbackMode.parse(mode) is FeedbackMode.DIRECT:
++                mask.zero_()
++            return self._targets.clone(), mask, self._version
++
++
++@dataclass(frozen=True)
++class StateFeedbackResult:
++    velocity: Tensor
++    diagnostics: dict[str, float | int | bool]
++
++
++def guidance_weight(sigma: Tensor | float, beta: float) -> Tensor:
++    """LingBot/FBFM few-step guidance schedule in flow sigma coordinates."""
++    if beta <= 0:
++        raise ValueError("beta must be positive")
++    sigma_value = torch.as_tensor(sigma, dtype=torch.float32)
++    tau = 1 - sigma_value
++    r_squared = sigma_value.square() / (tau.square() + sigma_value.square())
++    raw = sigma_value / (tau * r_squared)
++    return torch.nan_to_num(raw, nan=0.0, posinf=beta, neginf=0.0).clamp(0, beta)
++
++
++def endpoint_state_guidance(
++    *,
++    sample: Tensor,
++    velocity: Tensor,
++    target: Tensor,
++    mask: Tensor,
++    sigma: Tensor | float,
++    beta: float = 10.0,
++    state_weight: float = 1.0,
++    kp: float = DEFAULT_KP,
++) -> StateFeedbackResult:
++    """Apply a visual-only endpoint VJP without any action-flow variables."""
++    if sample.shape != velocity.shape or sample.shape != target.shape:
++        raise ValueError("sample, velocity, and target shapes must match")
++    if mask.shape != (1, sample.shape[1], 1, 1):
++        raise ValueError("state mask must have shape (1,F,1,1)")
++    if not 0 < state_weight <= 1:
++        raise ValueError("state_weight must be in (0,1]")
++    if kp <= 0:
++        raise ValueError("kp must be positive")
++    if not sample.requires_grad:
++        raise ValueError("guided sample must require gradients")
++
++    mask_nonzero = int(torch.count_nonzero(mask).item())
++    if mask_nonzero == 0:
++        return StateFeedbackResult(
++            velocity.detach(),
++            {
++                "guided": False,
++                "mask_nonzero": 0,
++                "error_norm": 0.0,
++                "correction_norm": 0.0,
++                "guidance_weight": 0.0,
++            },
++        )
++
++    sigma_value = torch.as_tensor(sigma, device=sample.device, dtype=sample.dtype)
++    endpoint = sample - sigma_value * velocity
++    error = (target - endpoint) * mask * state_weight
++    correction = torch.autograd.grad(
++        endpoint,
++        sample,
++        grad_outputs=error.detach(),
++        retain_graph=False,
++        create_graph=False,
++    )[0]
++    weight = guidance_weight(sigma, beta).to(device=sample.device, dtype=sample.dtype)
++    guided_velocity = (velocity - kp * weight * correction).detach()
++    if not torch.isfinite(guided_velocity).all():
++        raise FloatingPointError("FBFM produced a non-finite video velocity")
++    return StateFeedbackResult(
++        guided_velocity,
++        {
++            "guided": True,
++            "mask_nonzero": mask_nonzero,
++            "error_norm": float(error.detach().float().norm().item()),
++            "correction_norm": float(correction.detach().float().norm().item()),
++            "guidance_weight": float(weight.detach().float().item()),
++            "kp": float(kp),
++            "base_velocity_norm": float(velocity.detach().float().norm().item()),
++            "guided_velocity_norm": float(guided_velocity.float().norm().item()),
++        },
++    )
++
++
++def masked_endpoint_error(
++    *,
++    sample: Tensor,
++    velocity: Tensor,
++    target: Tensor,
++    mask: Tensor,
++    sigma: Tensor | float,
++    state_weight: float = 1.0,
++) -> Tensor:
++    """Build the detached endpoint residual used as the VJP cotangent."""
++    if sample.shape != velocity.shape or sample.shape != target.shape:
++        raise ValueError("sample, velocity, and target shapes must match")
++    if mask.shape != (1, sample.shape[1], 1, 1):
++        raise ValueError("state mask must have shape (1,F,1,1)")
++    if not 0 < state_weight <= 1:
++        raise ValueError("state_weight must be in (0,1]")
++
++    sigma_value = torch.as_tensor(sigma, device=sample.device, dtype=sample.dtype)
++    endpoint = sample.detach() - sigma_value * velocity.detach()
++    return ((target - endpoint) * mask * state_weight).detach()
++
++
++def endpoint_state_guidance_from_cfg_vjps(
++    *,
++    velocity: Tensor,
++    error: Tensor,
++    mask: Tensor,
++    conditional_vjp: Tensor,
++    unconditional_vjp: Tensor,
++    sigma: Tensor | float,
++    guide_scale: float,
++    beta: float = 10.0,
++    kp: float = DEFAULT_KP,
++) -> StateFeedbackResult:
++    """Apply endpoint guidance from separately evaluated CFG branch VJPs.
++
++    Splitting the two VJPs is algebraically equivalent to differentiating the
++    combined CFG velocity, but only one DiT backward graph needs to be resident
++    at a time.
++    """
++    if not (
++        velocity.shape
++        == error.shape
++        == conditional_vjp.shape
++        == unconditional_vjp.shape
++    ):
++        raise ValueError("velocity, error, and CFG VJP shapes must match")
++    if mask.shape != (1, velocity.shape[1], 1, 1):
++        raise ValueError("state mask must have shape (1,F,1,1)")
++    if kp <= 0:
++        raise ValueError("kp must be positive")
++
++    sigma_value = torch.as_tensor(sigma, device=velocity.device, dtype=velocity.dtype)
++    cfg_vjp = guide_scale * conditional_vjp + (1.0 - guide_scale) * unconditional_vjp
++    correction = error - sigma_value * cfg_vjp
++    weight = guidance_weight(sigma, beta).to(
++        device=velocity.device, dtype=velocity.dtype
++    )
++    guided_velocity = (velocity.detach() - kp * weight * correction).detach()
++    if not torch.isfinite(guided_velocity).all():
++        raise FloatingPointError("FBFM produced a non-finite video velocity")
++    return StateFeedbackResult(
++        guided_velocity,
++        {
++            "guided": True,
++            "mask_nonzero": int(torch.count_nonzero(mask).item()),
++            "error_norm": float(error.float().norm().item()),
++            "correction_norm": float(correction.detach().float().norm().item()),
++            "guidance_weight": float(weight.detach().float().item()),
++            "kp": float(kp),
++            "base_velocity_norm": float(velocity.detach().float().norm().item()),
++            "guided_velocity_norm": float(guided_velocity.float().norm().item()),
++        },
++    )
++
++
++class StateFeedbackController:
++    """Release raw observations and refresh state constraints at solver boundaries."""
++
++    def __init__(
++        self,
++        *,
++        mode: FeedbackMode | str,
++        encoder: FeedbackEncoder,
++        anchor: Tensor,
++        latent_template: Tensor,
++        events: Sequence[FeedbackEvent],
++        beta: float = 10.0,
++        state_weight: float = DEFAULT_STATE_WEIGHT,
++        kp: float = DEFAULT_KP,
++    ) -> None:
++        self.mode = FeedbackMode.parse(mode)
++        self.encoder = encoder
++        self.constraints = StateSlotConstraints(latent_template)
++        self.beta = float(beta)
++        self.state_weight = float(state_weight)
++        if kp <= 0:
++            raise ValueError("kp must be positive")
++        self.kp = float(kp)
++        self.audit: list[dict[str, Any]] = []
++        self._queue: list[tuple[int, int, FeedbackEvent]] = []
++        seen_slots: set[int] = set()
++        for sequence, event in enumerate(events):
++            if event.slot in seen_slots:
++                raise ValueError(f"duplicate feedback slot {event.slot}")
++            if event.slot >= latent_template.shape[1]:
++                raise ValueError(
++                    f"feedback slot {event.slot} exceeds latent horizon "
++                    f"{latent_template.shape[1]}"
++                )
++            if event.frames.shape[1] != encoder.observations_per_slot:
++                raise ValueError(
++                    f"slot {event.slot} requires {encoder.observations_per_slot} frames"
++                )
++            seen_slots.add(event.slot)
++            heapq.heappush(self._queue, (event.release_step, sequence, event))
++        if self.mode is FeedbackMode.FBFM:
++            anchor_latent = self.encoder.prime(anchor)
++            self.audit.append(
++                {
++                    "event": "feedback_prime",
++                    "anchor_latent_shape": list(anchor_latent.shape),
++                }
++            )
++
++    def advance(self, solver_step: int) -> int:
++        """Encode every observation event visible at this solver boundary."""
++        if self.mode is FeedbackMode.DIRECT:
++            return 0
++        updated = 0
++        while self._queue and self._queue[0][0] <= solver_step:
++            _, _, event = heapq.heappop(self._queue)
++            latent = self.encoder.encode(event.frames)
++            accepted = self.constraints.update(event.slot, latent)
++            if not accepted:
++                raise RuntimeError(f"feedback slot {event.slot} was rejected")
++            updated += 1
++            self.audit.append(
++                {
++                    "event": "feedback_update",
++                    "solver_step": solver_step,
++                    "release_step": event.release_step,
++                    "slot": event.slot,
++                    "constraint_version": self.constraints.version,
++                }
++            )
++        return updated
++
++    def guide(
++        self,
++        *,
++        solver_step: int,
++        sample: Tensor,
++        velocity: Tensor,
++        sigma: Tensor | float,
++    ) -> StateFeedbackResult:
++        target, mask, version = self.constraints.snapshot(self.mode)
++        result = endpoint_state_guidance(
++            sample=sample,
++            velocity=velocity,
++            target=target,
++            mask=mask,
++            sigma=sigma,
++            beta=self.beta,
++            state_weight=self.state_weight,
++            kp=self.kp,
++        )
++        self.audit.append(
++            {
++                "event": "solver_guidance",
++                "solver_step": solver_step,
++                "sigma": float(torch.as_tensor(sigma).item()),
++                "constraint_version": version,
++                **result.diagnostics,
++            }
++        )
++        return result
++
++
++def evenly_spaced_release_steps(slot_count: int, solver_steps: int) -> list[int]:
++    """Build a deterministic pseudo-clock schedule strictly inside the solve."""
++    if slot_count < 0:
++        raise ValueError("slot_count must be non-negative")
++    if solver_steps <= 1 and slot_count:
++        raise ValueError("at least two solver steps are required for feedback")
++    if slot_count >= solver_steps:
++        raise ValueError("feedback slots must be fewer than solver steps")
++    return [
++        max(1, math.floor((index + 1) * solver_steps / (slot_count + 1)))
++        for index in range(slot_count)
++    ]
+diff --git a/wan/fbfm/pipeline.py b/wan/fbfm/pipeline.py
+new file mode 100644
+index 0000000..78bb72a
+--- /dev/null
++++ b/wan/fbfm/pipeline.py
+@@ -0,0 +1,433 @@
++"""Wan2.2 TI2V inference with LingBot-style visual state feedback."""
++
++from __future__ import annotations
++
++import gc
++import math
++import random
++import sys
++from collections.abc import Sequence
++from contextlib import contextmanager
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++import torch.distributed as dist
++import torchvision.transforms.functional as TF
++from PIL import Image
++from tqdm import tqdm
++from wan.textimage2video import WanTI2V
++from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
++from wan.utils.utils import best_output_size, masks_like
++
++from .feedback import (
++    DEFAULT_KP,
++    DEFAULT_STATE_WEIGHT,
++    FeedbackEvent,
++    FeedbackMode,
++    NativeWanStreamingEncoder,
++    StateFeedbackController,
++    endpoint_state_guidance_from_cfg_vjps,
++    masked_endpoint_error,
++)
++
++
++@dataclass(frozen=True)
++class WanFBFMOutput:
++    video: torch.Tensor | None
++    audit: list[dict[str, Any]]
++    seed: int
++    output_size: tuple[int, int]
++
++
++def resize_center_crop(image: Image.Image, width: int, height: int) -> Image.Image:
++    """Apply exactly the native Wan TI2V I2V spatial transform."""
++    source_width, source_height = image.size
++    scale = max(width / source_width, height / source_height)
++    resized = image.resize(
++        (round(source_width * scale), round(source_height * scale)),
++        Image.Resampling.LANCZOS,
++    )
++    left = (resized.width - width) // 2
++    top = (resized.height - height) // 2
++    return resized.crop((left, top, left + width, top + height))
++
++
++def image_to_video_tensor(
++    image: Image.Image, width: int, height: int, *, device: torch.device | None = None
++) -> torch.Tensor:
++    """Convert one RGB frame to normalized (C,1,H,W) Wan video layout."""
++    frame = resize_center_crop(image.convert("RGB"), width, height)
++    value = TF.to_tensor(frame).sub_(0.5).div_(0.5).unsqueeze(1)
++    return value.to(device) if device is not None else value
++
++
++def build_feedback_events(
++    *,
++    future_frames: Sequence[Image.Image],
++    release_steps: Sequence[int],
++    width: int,
++    height: int,
++    observations_per_slot: int = 4,
++) -> list[FeedbackEvent]:
++    """Map consecutive measured frames to future latent slots without padding."""
++    required = len(release_steps) * observations_per_slot
++    if len(future_frames) < required:
++        raise ValueError(
++            f"feedback schedule needs {required} future frames, got {len(future_frames)}"
++        )
++    events = []
++    for event_index, release_step in enumerate(release_steps):
++        start = event_index * observations_per_slot
++        chunk = torch.cat(
++            [
++                image_to_video_tensor(frame, width, height)
++                for frame in future_frames[start : start + observations_per_slot]
++            ],
++            dim=1,
++        )
++        events.append(
++            FeedbackEvent(
++                release_step=int(release_step),
++                slot=event_index + 1,
++                frames=chunk,
++            )
++        )
++    return events
++
++
++class WanTI2VFBFM(WanTI2V):
++    """State-only FBFM variant of the official Wan2.2 TI2V pipeline."""
++
++    def generate_with_feedback(
++        self,
++        *,
++        input_prompt: str,
++        image: Image.Image,
++        mode: FeedbackMode | str,
++        feedback_frames: Sequence[Image.Image] = (),
++        feedback_release_steps: Sequence[int] = (),
++        max_area: int = 704 * 1280,
++        frame_num: int = 121,
++        shift: float = 5.0,
++        sampling_steps: int = 50,
++        guide_scale: float = 5.0,
++        n_prompt: str = "",
++        seed: int = -1,
++        offload_model: bool = True,
++        beta: float = 10.0,
++        state_weight: float = DEFAULT_STATE_WEIGHT,
++        kp: float = DEFAULT_KP,
++        gradient_checkpointing: bool = True,
++    ) -> WanFBFMOutput:
++        """Generate one paired DIRECT/FBFM video prediction.
++
++        ``feedback_frames`` contains measured future frames after ``image``.
++        Every four consecutive frames form one causal Wan2.2 latent slot. The
++        corresponding entry in ``feedback_release_steps`` selects the solver
++        boundary at which that raw observation group becomes visible.
++        """
++        feedback_mode = FeedbackMode.parse(mode)
++        if frame_num <= 1 or (frame_num - 1) % self.vae_stride[0]:
++            raise ValueError(f"frame_num must be 4n+1 for this VAE, got {frame_num}")
++        if sampling_steps <= 1:
++            raise ValueError("sampling_steps must be greater than one")
++        if any(step < 0 or step >= sampling_steps for step in feedback_release_steps):
++            raise ValueError("feedback release steps must fall inside the solver loop")
++        if list(feedback_release_steps) != sorted(feedback_release_steps):
++            raise ValueError("feedback release steps must be nondecreasing")
++        if feedback_mode is FeedbackMode.FBFM and not feedback_release_steps:
++            raise ValueError("FBFM mode requires at least one feedback release step")
++
++        source_width, source_height = image.size
++        spatial_stride_width = self.patch_size[2] * self.vae_stride[2]
++        spatial_stride_height = self.patch_size[1] * self.vae_stride[1]
++        output_width, output_height = best_output_size(
++            source_width,
++            source_height,
++            spatial_stride_width,
++            spatial_stride_height,
++            max_area,
++        )
++        anchor = image_to_video_tensor(
++            image,
++            output_width,
++            output_height,
++            device=self.device,
++        )
++
++        latent_frame_count = (frame_num - 1) // self.vae_stride[0] + 1
++        sequence_length = (
++            latent_frame_count
++            * (output_height // self.vae_stride[1])
++            * (output_width // self.vae_stride[2])
++            // (self.patch_size[1] * self.patch_size[2])
++        )
++        sequence_length = math.ceil(sequence_length / self.sp_size) * self.sp_size
++
++        resolved_seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
++        generator = torch.Generator(device=self.device)
++        generator.manual_seed(resolved_seed)
++        noise = torch.randn(
++            self.vae.model.z_dim,
++            latent_frame_count,
++            output_height // self.vae_stride[1],
++            output_width // self.vae_stride[2],
++            dtype=torch.float32,
++            generator=generator,
++            device=self.device,
++        )
++
++        if n_prompt == "":
++            n_prompt = self.sample_neg_prompt
++        if not self.t5_cpu:
++            self.text_encoder.model.to(self.device)
++            context = self.text_encoder([input_prompt], self.device)
++            context_null = self.text_encoder([n_prompt], self.device)
++            if offload_model:
++                self.text_encoder.model.cpu()
++        else:
++            context = self.text_encoder([input_prompt], torch.device("cpu"))
++            context_null = self.text_encoder([n_prompt], torch.device("cpu"))
++            context = [value.to(self.device) for value in context]
++            context_null = [value.to(self.device) for value in context_null]
++
++        anchor_latent = self.vae.encode([anchor])
++        if anchor_latent is None:
++            raise RuntimeError("Wan VAE failed to encode the I2V anchor")
++        mask_primary, mask_noise = masks_like([noise], zero=True)
++        del mask_primary
++        latent = (1.0 - mask_noise[0]) * anchor_latent[0] + mask_noise[0] * noise
++
++        events = build_feedback_events(
++            future_frames=feedback_frames,
++            release_steps=feedback_release_steps,
++            width=output_width,
++            height=output_height,
++            observations_per_slot=NativeWanStreamingEncoder.observations_per_slot,
++        )
++        controller = StateFeedbackController(
++            mode=feedback_mode,
++            encoder=NativeWanStreamingEncoder(self.vae),
++            anchor=anchor,
++            latent_template=noise,
++            events=events,
++            beta=beta,
++            state_weight=state_weight,
++            kp=kp,
++        )
++        controller.audit.insert(
++            0,
++            {
++                "event": "generation_begin",
++                "mode": feedback_mode.value,
++                "seed": resolved_seed,
++                "frame_num": frame_num,
++                "latent_frame_count": latent_frame_count,
++                "output_width": output_width,
++                "output_height": output_height,
++                "sampling_steps": sampling_steps,
++                "feedback_release_steps": list(feedback_release_steps),
++                "beta": beta,
++                "state_weight": state_weight,
++                "kp": kp,
++                "gradient_checkpointing": gradient_checkpointing,
++                "deterministic_algorithms": (
++                    torch.are_deterministic_algorithms_enabled()
++                ),
++            },
++        )
++
++        @contextmanager
++        def noop_no_sync():
++            yield
++
++        no_sync = getattr(self.model, "no_sync", noop_no_sync)
++        scheduler = FlowUniPCMultistepScheduler(
++            num_train_timesteps=self.num_train_timesteps,
++            shift=1,
++            use_dynamic_shifting=False,
++        )
++        scheduler.set_timesteps(
++            sampling_steps,
++            device=self.device,
++            shift=shift,
++        )
++
++        conditional_args = {
++            "context": [context[0]],
++            "seq_len": sequence_length,
++        }
++        unconditional_args = {
++            "context": context_null,
++            "seq_len": sequence_length,
++        }
++
++        if offload_model or self.init_on_cpu:
++            self.model.to(self.device)
++            torch.cuda.empty_cache()
++        self.model.gradient_checkpointing = gradient_checkpointing
++        torch.cuda.reset_peak_memory_stats(self.device)
++
++        with torch.amp.autocast("cuda", dtype=self.param_dtype), no_sync():
++            for solver_step, timestep_value in enumerate(tqdm(scheduler.timesteps)):
++                feedback_updates = controller.advance(solver_step)
++                timestep = torch.stack([timestep_value]).to(self.device)
++                temporal_timestep = (mask_noise[0][0][:, ::2, ::2] * timestep).flatten()
++                temporal_timestep = torch.cat(
++                    [
++                        temporal_timestep,
++                        temporal_timestep.new_ones(
++                            sequence_length - temporal_timestep.size(0)
++                        )
++                        * timestep,
++                    ]
++                ).unsqueeze(0)
++
++                target, active_mask, constraint_version = (
++                    controller.constraints.snapshot(feedback_mode)
++                )
++                has_feedback = bool(torch.any(active_mask).item())
++                if has_feedback:
++                    sample = latent.detach().clone().requires_grad_(True)
++                    with torch.enable_grad():
++                        conditional_velocity = self.model(
++                            [sample], t=temporal_timestep, **conditional_args
++                        )[0]
++                    with torch.no_grad():
++                        unconditional_velocity = self.model(
++                            [sample], t=temporal_timestep, **unconditional_args
++                        )[0]
++                        native_velocity = unconditional_velocity + guide_scale * (
++                            conditional_velocity.detach() - unconditional_velocity
++                        )
++                    sigma = scheduler.sigmas[solver_step]
++                    error = masked_endpoint_error(
++                        sample=sample,
++                        velocity=native_velocity,
++                        target=target,
++                        mask=active_mask,
++                        sigma=sigma,
++                        state_weight=state_weight,
++                    )
++                    conditional_vjp = torch.autograd.grad(
++                        conditional_velocity,
++                        sample,
++                        grad_outputs=error,
++                        retain_graph=False,
++                        create_graph=False,
++                    )[0]
++                    del conditional_velocity
++                    with torch.enable_grad():
++                        unconditional_for_vjp = self.model(
++                            [sample], t=temporal_timestep, **unconditional_args
++                        )[0]
++                    unconditional_vjp = torch.autograd.grad(
++                        unconditional_for_vjp,
++                        sample,
++                        grad_outputs=error,
++                        retain_graph=False,
++                        create_graph=False,
++                    )[0]
++                    guidance = endpoint_state_guidance_from_cfg_vjps(
++                        velocity=native_velocity,
++                        error=error,
++                        mask=active_mask,
++                        conditional_vjp=conditional_vjp,
++                        unconditional_vjp=unconditional_vjp,
++                        sigma=sigma,
++                        guide_scale=guide_scale,
++                        beta=beta,
++                        kp=kp,
++                    )
++                    controller.audit.append(
++                        {
++                            "event": "solver_guidance",
++                            "solver_step": solver_step,
++                            "sigma": float(sigma),
++                            "constraint_version": constraint_version,
++                            "feedback_updates": feedback_updates,
++                            **guidance.diagnostics,
++                        }
++                    )
++                    velocity = guidance.velocity
++                    del (
++                        sample,
++                        unconditional_velocity,
++                        unconditional_for_vjp,
++                        native_velocity,
++                        error,
++                        conditional_vjp,
++                        unconditional_vjp,
++                    )
++                else:
++                    with torch.no_grad():
++                        conditional_velocity = self.model(
++                            [latent], t=temporal_timestep, **conditional_args
++                        )[0]
++                        unconditional_velocity = self.model(
++                            [latent], t=temporal_timestep, **unconditional_args
++                        )[0]
++                        velocity = unconditional_velocity + guide_scale * (
++                            conditional_velocity - unconditional_velocity
++                        )
++                    controller.audit.append(
++                        {
++                            "event": "solver_guidance",
++                            "solver_step": solver_step,
++                            "sigma": float(scheduler.sigmas[solver_step]),
++                            "constraint_version": constraint_version,
++                            "feedback_updates": feedback_updates,
++                            "guided": False,
++                            "mask_nonzero": 0,
++                        }
++                    )
++                    del conditional_velocity, unconditional_velocity
++
++                with torch.no_grad():
++                    next_latent = scheduler.step(
++                        velocity.unsqueeze(0),
++                        timestep_value,
++                        latent.unsqueeze(0),
++                        return_dict=False,
++                        generator=generator,
++                    )[0]
++                    latent = next_latent.squeeze(0).detach()
++                    latent = (1.0 - mask_noise[0]) * anchor_latent[0] + mask_noise[
++                        0
++                    ] * latent
++                del velocity, temporal_timestep
++
++        if not torch.isfinite(latent).all():
++            raise FloatingPointError("Wan2.2 produced a non-finite video latent")
++        peak_allocated = torch.cuda.max_memory_allocated(self.device)
++        peak_reserved = torch.cuda.max_memory_reserved(self.device)
++        controller.constraints.close()
++        if offload_model:
++            self.model.cpu()
++            torch.cuda.synchronize()
++            torch.cuda.empty_cache()
++
++        video = self.vae.decode([latent])[0] if self.rank == 0 else None
++        controller.audit.append(
++            {
++                "event": "generation_end",
++                "constraint_version": controller.constraints.version,
++                "peak_cuda_memory_allocated_bytes": peak_allocated,
++                "peak_cuda_memory_reserved_bytes": peak_reserved,
++            }
++        )
++
++        del noise, latent, scheduler
++        if offload_model:
++            gc.collect()
++            torch.cuda.synchronize()
++        if dist.is_initialized():
++            dist.barrier()
++
++        return WanFBFMOutput(
++            video=video,
++            audit=controller.audit,
++            seed=resolved_seed,
++            output_size=(output_width, output_height),
++        )
+diff --git a/wan/modules/attention.py b/wan/modules/attention.py
+index 4dbbe03..3fef090 100644
+--- a/wan/modules/attention.py
++++ b/wan/modules/attention.py
+@@ -16,8 +16,8 @@ except ModuleNotFoundError:
+ import warnings
+
+ __all__ = [
+-    'flash_attention',
+     'attention',
++    'flash_attention',
+ ]
+
+
+@@ -162,18 +162,44 @@ def attention(
+             version=fa_version,
+         )
+     else:
+-        if q_lens is not None or k_lens is not None:
+-            warnings.warn(
+-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+-            )
++        output_dtype = q.dtype
++        query_length, key_length = q.shape[1], k.shape[1]
+         attn_mask = None
++        needs_key_mask = k_lens is not None and not bool(
++            torch.all(k_lens == key_length).item()
++        )
++        if needs_key_mask:
++            key_indices = torch.arange(key_length, device=k.device)
++            valid_keys = key_indices.unsqueeze(0) < k_lens.to(k.device).unsqueeze(1)
++            attn_mask = valid_keys[:, None, None, :].expand(
++                -1, 1, query_length, -1
++            )
+
+         q = q.transpose(1, 2).to(dtype)
+         k = k.transpose(1, 2).to(dtype)
+         v = v.transpose(1, 2).to(dtype)
+
++        if q_scale is not None:
++            q = q * q_scale
++
+         out = torch.nn.functional.scaled_dot_product_attention(
+-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
++            q,
++            k,
++            v,
++            attn_mask=attn_mask,
++            is_causal=causal,
++            dropout_p=dropout_p,
++            scale=softmax_scale,
++        )
+
+         out = out.transpose(1, 2).contiguous()
+-        return out
++        needs_query_mask = q_lens is not None and not bool(
++            torch.all(q_lens == query_length).item()
++        )
++        if needs_query_mask:
++            query_indices = torch.arange(query_length, device=out.device)
++            valid_queries = query_indices.unsqueeze(0) < q_lens.to(
++                out.device
++            ).unsqueeze(1)
++            out = out * valid_queries[:, :, None, None]
++        return out.to(output_dtype)
+diff --git a/wan/modules/model.py b/wan/modules/model.py
+index 6982fa1..50b4200 100644
+--- a/wan/modules/model.py
++++ b/wan/modules/model.py
+@@ -6,9 +6,9 @@ import torch.nn as nn
+ from diffusers.configuration_utils import ConfigMixin, register_to_config
+ from diffusers.models.modeling_utils import ModelMixin
+
+-from .attention import flash_attention
++from .attention import attention, flash_attention
+
+-__all__ = ['WanModel']
++__all__ = ['WanModel', 'flash_attention']
+
+
+ def sinusoidal_embedding_1d(dim, position):
+@@ -142,12 +142,13 @@ class WanSelfAttention(nn.Module):
+
+         q, k, v = qkv_fn(x)
+
+-        x = flash_attention(
++        x = attention(
+             q=rope_apply(q, grid_sizes, freqs),
+             k=rope_apply(k, grid_sizes, freqs),
+             v=v,
+             k_lens=seq_lens,
+-            window_size=self.window_size)
++            window_size=self.window_size,
++            deterministic=torch.are_deterministic_algorithms_enabled())
+
+         # output
+         x = x.flatten(2)
+@@ -172,7 +173,12 @@ class WanCrossAttention(WanSelfAttention):
+         v = self.v(context).view(b, -1, n, d)
+
+         # compute attention
+-        x = flash_attention(q, k, v, k_lens=context_lens)
++        x = attention(
++            q,
++            k,
++            v,
++            k_lens=context_lens,
++            deterministic=torch.are_deterministic_algorithms_enabled())
+
+         # output
+         x = x.flatten(2)
+@@ -390,6 +396,7 @@ class WanModel(ModelMixin, ConfigMixin):
+             WanAttentionBlock(dim, ffn_dim, num_heads, window_size, qk_norm,
+                               cross_attn_norm, eps) for _ in range(num_layers)
+         ])
++        self.gradient_checkpointing = False
+
+         # head
+         self.head = Head(dim, out_dim, patch_size, eps)
+@@ -487,7 +494,15 @@ class WanModel(ModelMixin, ConfigMixin):
+             context_lens=context_lens)
+
+         for block in self.blocks:
+-            x = block(x, **kwargs)
++            if self.gradient_checkpointing and torch.is_grad_enabled():
++                x = torch.utils.checkpoint.checkpoint(
++                    block,
++                    x,
++                    **kwargs,
++                    use_reentrant=False,
++                    preserve_rng_state=False)
++            else:
++                x = block(x, **kwargs)
+
+         # head
+         x = self.head(x, e)

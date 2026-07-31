@@ -13,3 +13,8 @@ va_shared_cfg.save_root = './train_out'
 va_shared_cfg.patch_size = (1, 2, 2)
 
 va_shared_cfg.enable_offload = True
+
+# Unified inference-time constraint framework. Individual deployment configs
+# may opt into RTC/FBFM and provide their rollout-specific H/d/s values.
+va_shared_cfg.constraint_mode = "NONE"
+va_shared_cfg.rtc_attention_schedule = "EXP"

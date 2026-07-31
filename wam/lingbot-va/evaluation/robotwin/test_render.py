@@ -46,12 +46,8 @@ class Sapien_TEST(gym.Env):
     def __init__(self):
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
-        try:
-            self.setup_scene()
-            print("\033[32m" + "Render Well" + "\033[0m")
-        except:
-            print("\033[31m" + "Render Error" + "\033[0m")
-            exit()
+        self.setup_scene()
+        print("\033[32m" + "Render Well" + "\033[0m")
 
     def setup_scene(self, **kwargs):
         """
@@ -67,10 +63,17 @@ class Sapien_TEST(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        render_backend = os.environ.get("ROBOTWIN_RENDER_BACKEND", "default").lower()
+        if render_backend == "rt":
+            sapien.render.set_camera_shader_dir("rt")
+            sapien.render.set_ray_tracing_samples_per_pixel(32)
+            sapien.render.set_ray_tracing_path_depth(8)
+            sapien.render.set_ray_tracing_denoiser("oidn")
+        elif render_backend != "default":
+            raise ValueError(
+                "ROBOTWIN_RENDER_BACKEND must be 'default' or 'rt', got "
+                f"{render_backend!r}"
+            )
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

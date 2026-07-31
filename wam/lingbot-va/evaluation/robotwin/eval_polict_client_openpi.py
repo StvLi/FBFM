@@ -1,20 +1,52 @@
 import sys
 import os
+import random
 import subprocess
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/share/project/chenghy/package/RoboTwin")
-if str(robowin_root) not in sys.path:
-    sys.path.insert(0, str(robowin_root))
+def _resolve_robotwin_root() -> Path:
+    configured_root = os.environ.get("ROBOTWIN_ROOT")
+    if configured_root:
+        root = Path(configured_root).expanduser().resolve()
+    else:
+        lingbot_root = Path(__file__).resolve().parents[2]
+        if lingbot_root.parent.name != "wam":
+            raise RuntimeError(
+                "ROBOTWIN_ROOT is required outside the canonical FBFM monorepo layout"
+            )
+        repo_root = lingbot_root.parent.parent
+        expected_lingbot_root = (repo_root / "wam" / "lingbot-va").resolve()
+        if lingbot_root != expected_lingbot_root:
+            raise RuntimeError(
+                "ROBOTWIN_ROOT is required outside the canonical FBFM monorepo layout"
+            )
+        root = (repo_root / "external" / "RoboTwin").resolve()
+
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"RoboTwin checkout not found: {root}. Set ROBOTWIN_ROOT or run "
+            "scripts/bootstrap/fetch_upstreams.sh --route lingbot."
+        )
+    missing = [name for name in ("envs", "task_config") if not (root / name).is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            f"RoboTwin checkout is incomplete at {root}; missing: {', '.join(missing)}"
+        )
+    return root
+
+
+robotwin_root = _resolve_robotwin_root()
+if str(robotwin_root) not in sys.path:
+    sys.path.insert(0, str(robotwin_root))
 
 # Save original working directory before changing it
 original_cwd = Path.cwd()
 
 import os
-os.chdir(robowin_root)
+os.chdir(robotwin_root)
 
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
@@ -30,12 +62,14 @@ import importlib
 import argparse
 import pdb
 from evaluation.robotwin.geometry import euler2quat
+from evaluation.robotwin.pseudo_async import PseudoAsyncHistory, solver_step_grant
 import numpy as np
 
 from description.utils.generate_episode_instructions import *
 import traceback
 
 import imageio
+import imageio_ffmpeg
 import numpy as np
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
@@ -280,7 +314,7 @@ def eval_function_decorator(policy_name, model_name):
         raise e
 
 def get_camera_config(camera_type):
-    camera_config_path = os.path.join(robowin_root, "task_config/_camera_config.yml")
+    camera_config_path = os.path.join(robotwin_root, "task_config/_camera_config.yml")
 
     assert os.path.isfile(camera_config_path), "task config file is missing"
 
@@ -513,14 +547,23 @@ def eval_policy(task_name,
         print('before setup_demo')
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        random_state = random.getstate()
+        random.seed(now_seed)
+        try:
+            results = generate_episode_descriptions(
+                args["task_name"], episode_info_list, test_num
+            )
+        finally:
+            random.setstate(random_state)
+        instruction = np.random.default_rng(now_seed).choice(
+            results[0][instruction_type]
+        )
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
                 [
-                    "ffmpeg",
+                    imageio_ffmpeg.get_ffmpeg_exe(),
                     "-y",
                     "-loglevel",
                     "error",
@@ -551,9 +594,15 @@ def eval_policy(task_name,
         succ = False
 
         prompt = TASK_ENV.get_instruction()
-        ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
+        ret = model.infer(
+            dict(
+                reset=True,
+                prompt=prompt,
+                seed=now_seed,
+                save_visualization=save_visualization,
+            )
+        )
         
-        first = True
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
@@ -566,66 +615,166 @@ def eval_policy(task_name,
         inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
-        first_obs = None
-        while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
-            if first:
-                observation = TASK_ENV.get_obs()
-                first_obs = format_obs(observation, prompt)
+        first_obs = initial_formatted_obs
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
-            action = ret['action']
+        # Deterministic pseudo-asynchronous rollout. Wall-clock latency is not
+        # part of this mathematical-method experiment: each simulation step
+        # releases a fixed portion of the video-flow solver trajectory.
+        # This is a fixed action-overlap boundary, not a measured delay.
+        HARD_OVERLAP_STEPS = int(os.environ.get("LINGBOT_VA_RTC_DELAY", "16"))
+        EXECUTION_HORIZON = int(
+            os.environ.get("LINGBOT_VA_RTC_EXECUTION_HORIZON", "16")
+        )
+        PSEUDO_VIDEO_SOLVER_STEPS = int(
+            os.environ.get("LINGBOT_VA_PSEUDO_VIDEO_SOLVER_STEPS", "26")
+        )
+        if PSEUDO_VIDEO_SOLVER_STEPS <= 0:
+            raise ValueError("pseudo video solver steps must be positive")
+        pseudo_clock_index = 0
+
+        ret = model.infer(dict(
+            obs=first_obs,
+            prompt=prompt,
+            save_visualization=save_visualization,
+            video_guidance_scale=video_guidance_scale,
+            action_guidance_scale=action_guidance_scale,
+            immediate_return=True,
+        ))
+        action = ret['action']
+        # The first real-history commit contains the initial latent and Lingbot's
+        # conditioned action frame. Each later commit contains exactly the suffix
+        # executed during the preceding solver run. Dynamic feedback is therefore
+        # never duplicated in the real KV history of the same active chunk.
+        feedback_obs_per_state = int(
+            os.environ.get("LINGBOT_VA_FEEDBACK_OBS_PER_STATE", "4")
+        )
+        if feedback_obs_per_state <= 0:
+            raise ValueError("feedback observations_per_state must be positive")
+        if action.shape[2] % feedback_obs_per_state != 0:
+            raise ValueError(
+                "Lingbot actions_per_frame must be divisible by feedback "
+                "observations_per_state"
+            )
+        observation_interval = action.shape[2] // feedback_obs_per_state
+        history = PseudoAsyncHistory(action)
+        while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
+            chunk_size = action.shape[1] * action.shape[2]
+            if not 0 < EXECUTION_HORIZON <= chunk_size:
+                raise ValueError(
+                    "execution horizon must be in "
+                    f"[1, {chunk_size}], got {EXECUTION_HORIZON}"
+                )
+            if EXECUTION_HORIZON % action.shape[2] != 0:
+                raise ValueError(
+                    "execution horizon must align to complete Lingbot action frames"
+                )
+            if not 0 <= HARD_OVERLAP_STEPS <= chunk_size - EXECUTION_HORIZON:
+                raise ValueError(
+                    "hard overlap must be in "
+                    f"[0, {chunk_size - EXECUTION_HORIZON}], "
+                    f"got {HARD_OVERLAP_STEPS}"
+                )
+            # The background request is transport only. Solver progress is
+            # controlled exclusively by pseudo-clock grants below.
+            history_obs, history_action = history.take()
+            pseudo_clock_index += 1
+            solver_clock_id = f"{st_seed}:{now_id}:{pseudo_clock_index}"
+            model.start_infer(dict(
+                obs=history_obs,
+                compute_kv_cache=True,
+                generate_after_kv_cache=True,
+                imagine=False,
+                save_visualization=save_visualization,
+                state=history_action,
+                immediate_return=True,
+                rtc_inference_delay=HARD_OVERLAP_STEPS,
+                rtc_execution_horizon=EXECUTION_HORIZON,
+                feedback_window_start_action_step=TASK_ENV.take_action_cnt,
+                pseudo_async_clock=True,
+                solver_clock_id=solver_clock_id,
+                pseudo_video_solver_steps=PSEUDO_VIDEO_SOLVER_STEPS,
+            ))
+
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
-            key_frame_list = []
 
-            assert action.shape[2] % 4 == 0
-            action_per_frame = 4
+            execute_from = chunk_size - EXECUTION_HORIZON
+            execution_obs = []
+            for executed_step, flat_action_id in enumerate(
+                range(execute_from, chunk_size), start=1
+            ):
+                i, j = divmod(flat_action_id, action.shape[2])
+                raw_action_step = action[:, i, j].flatten()
+                full_action_history.append(raw_action_step)
 
-            start_idx = 1 if first else 0
-            # 动作执行循环
-            for i in range(start_idx, action.shape[1]): # 这个循环是遍历各个chunk
-                for j in range(action.shape[2]):        # 这个循环是遍历一个chunk的每一action
-                    raw_action_step = action[:, i, j].flatten() 
-                    full_action_history.append(raw_action_step)
-
-                    ee_action = action[:, i, j]
-                    if action.shape[0] == 14:
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                            ee_action[6:10],
-                            euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                            ee_action[13:14]
-                        ])
-                    elif action.shape[0] == 16:
-                        ee_action =  add_init_pose(ee_action, inint_eef_pose)
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
-                            ee_action[7:11],
-                            ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
-                            ee_action[15:16]
-                        ])
-                    else:
-                        raise NotImplementedError
-                    TASK_ENV.take_action(ee_action, action_type='ee')
+                ee_action = action[:, i, j]
+                if action.shape[0] == 14:
+                    ee_action = np.concatenate([
+                        ee_action[:3],
+                        euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                        ee_action[6:10],
+                        euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                        ee_action[13:14]
+                    ])
+                elif action.shape[0] == 16:
+                    ee_action = add_init_pose(ee_action, inint_eef_pose)
+                    ee_action = np.concatenate([
+                        ee_action[:3],
+                        ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                        ee_action[7:11],
+                        ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                        ee_action[15:16]
+                    ])
+                else:
+                    raise NotImplementedError
+                TASK_ENV.take_action(ee_action, action_type='ee')
                    
-                    if (j+1) % action_per_frame == 0:
-                        # 对obs的处理 获取obs - 发送server - （server: VAE编码）
-                        obs = format_obs(TASK_ENV.get_obs(), prompt)
-                        full_obs_list.append(obs)
-                        key_frame_list.append(obs)
-                        if len(full_obs_list) >= action_per_frame+1:  
-                                # 将最新4帧观测发送到server 进行FBFM 
-                                # 这一逻辑仅进行反馈 不考虑正常推理obs
-                                model.infer(dict(obs=full_obs_list[-action_per_frame:], feedback=True))
+                if (j+1) % observation_interval == 0:
+                    # 对obs的处理 获取obs - 发送server - （server: VAE编码）
+                    obs = format_obs(TASK_ENV.get_obs(), prompt)
+                    full_obs_list.append(obs)
+                    execution_obs.append(obs)
+                    if len(full_obs_list) >= feedback_obs_per_state:
+                        # Send one causal VAE window to the active FBFM chunk.
+                        model.infer(dict(
+                            obs=full_obs_list[-feedback_obs_per_state:],
+                            feedback=True,
+                            observation_action_step=TASK_ENV.take_action_cnt,
+                        ))
 
-                    
-            first = False
+                grant = solver_step_grant(
+                    executed_step,
+                    total_simulation_steps=EXECUTION_HORIZON,
+                    total_solver_steps=PSEUDO_VIDEO_SOLVER_STEPS,
+                )
+                if grant:
+                    clock_result = model.infer(dict(
+                        solver_step_grant=grant,
+                        solver_clock_id=solver_clock_id,
+                    ))
+                    if not clock_result.get("solver_clock_accepted", False):
+                        raise RuntimeError(
+                            f"pseudo solver clock rejected grant: {clock_result}"
+                        )
 
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
-  
+            # The pseudo clock has consumed the complete video-flow budget.
+            # Action flow then completes before the deterministic chunk handoff.
+            ret = model.receive_infer()
+            executed_action_frames = EXECUTION_HORIZON // action.shape[2]
+            expected_observations = executed_action_frames * feedback_obs_per_state
+            if len(execution_obs) != expected_observations:
+                raise RuntimeError(
+                    "executed history is not aligned to Lingbot latent frames: "
+                    f"observations={len(execution_obs)} expected={expected_observations}"
+                )
+            history.stage_execution(
+                execution_obs,
+                action,
+                execution_horizon=EXECUTION_HORIZON,
+            )
+            action = ret['action']
+
             if TASK_ENV.eval_success:
                 succ = True
                 break
@@ -716,4 +865,3 @@ if __name__ == "__main__":
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
-

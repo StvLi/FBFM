@@ -1,3 +1,9 @@
+> **FBFM route:** this directory is the LingBot-VA x FBFM x RoboTwin
+> implementation. The sibling DreamZero x LIBERO route lives at
+> [`../dreamzero-libero`](../dreamzero-libero/README.md). FBFM-specific runtime,
+> validation, and launch instructions are maintained in the RoboTwin evaluation
+> section below and in [`docs/fbfm_runtime_modes.md`](docs/fbfm_runtime_modes.md).
+
 <h1 align="center">LingBot-VA: Causal World Modeling for Robot Control</h1>
 
 <p align="center">
@@ -92,6 +98,200 @@ python inference.py
 This processes the example data from `examples/0/` and saves visualizations to `result/`. -->
 
 ### Evaluation on RoboTwin-2.0
+
+#### NONE / RTC / FBFM formal evaluation on this workspace
+
+The three modes use one implementation and one orchestration path.  They differ
+only in the masks exposed to the flow-matching solver:
+
+| launcher | state mask | action mask |
+|---|---:|---:|
+| `script/run_robotwin_none.sh` | all zero | all zero |
+| `script/run_robotwin_rtc.sh` | all zero | RTC previous-action mask |
+| `script/run_robotwin_fbfm.sh` | live observed slots | the same RTC mask |
+
+An action at one control step is a complete 14D or 16D vector, not a scalar.
+`H`, `d`, and `s` count control steps.  The time mask has layout
+`(B,1,F,N,1)` and broadcasts over every component of the model action target
+`(B,D,F,N,1)`.
+
+The launchers require `ss` from `iproute2` and `flock`/`setsid` from
+`util-linux`, in addition to Git, Bash 4+, the NVIDIA driver/CUDA stack, and the
+Python environments below.
+
+The canonical submission keeps the policy server and RoboTwin client in two
+isolated Python 3.10 environments. From the FBFM monorepo root, fetch the pinned
+sources, build the two environments, and verify the installation with:
+
+```bash
+export FBFM_ROOT="$(git rev-parse --show-toplevel)"
+export FBFM_EXTERNAL_ROOT="${FBFM_EXTERNAL_ROOT:-$FBFM_ROOT/external}"
+export FBFM_ENV_ROOT="${FBFM_ENV_ROOT:-$FBFM_ROOT/.venvs}"
+
+bash scripts/bootstrap/fetch_upstreams.sh --route lingbot
+bash scripts/bootstrap/create_envs.sh --route lingbot
+"$FBFM_ENV_ROOT/fbfm-robotwin/bin/python" \
+  scripts/bootstrap/fetch_robotwin_assets.py \
+  --robotwin-root "$FBFM_EXTERNAL_ROOT/RoboTwin"
+bash scripts/bootstrap/verify.sh --route lingbot --strict --assets
+
+# Bounded CPU/import checks; this does not run a simulator episode.
+bash scripts/smoke.sh lingbot
+```
+
+This produces the pinned `external/RoboTwin`, `external/pytorch3d`, and
+`external/curobo` sources plus `.venvs/fbfm-lingbot-va` and
+`.venvs/fbfm-robotwin` by default. The separate asset command downloads the
+fixed RoboTwin Hugging Face snapshot, verifies all three archive SHA256 values,
+extracts about 16 GB, and regenerates embodiment paths. Checkpoints and
+RoboTwin assets are not redistributed by this repository; keep them outside
+Git and set `LINGBOT_VA_MODEL` explicitly.
+
+The policy environment uses Python 3.10.16, PyTorch 2.9.0+cu129,
+torchvision 0.24.0+cu129, diffusers 0.36.0, transformers 4.55.2,
+flash-attn 2.8.3.post1, and NumPy 1.26.4. The independent RoboTwin client
+environment uses SAPIEN 3.0.0b1, MPlib 0.2.1, pinned PyTorch3D
+`32a33e2`, and pinned CuRobo `0db44e5`. The bootstrap applies and verifies the
+two compatibility edits made by RoboTwin's upstream installer. The checkpoint
+directory must contain
+`transformer/`, `vae/`, `text_encoder/`, and `tokenizer/`; for inference,
+`transformer/config.json` must use `"attn_mode": "torch"` or
+`"attn_mode": "flashattn"`, not `"flex"`.
+
+No environment activation is required because the launchers invoke both Python
+executables explicitly.
+
+From the LingBot-VA repository root, launch one mode as follows.  The optional
+positional argument is the number of RoboTwin episodes and defaults to 1:
+
+```bash
+export ROBOTWIN_ROOT="$FBFM_EXTERNAL_ROOT/RoboTwin"
+export LINGBOT_SERVER_PYTHON="$FBFM_ENV_ROOT/fbfm-lingbot-va/bin/python"
+export ROBOTWIN_CLIENT_PYTHON="$FBFM_ENV_ROOT/fbfm-robotwin/bin/python"
+export LINGBOT_VA_MODEL=/path/to/lingbot-va-posttrain-robotwin
+cd "$FBFM_ROOT/wam/lingbot-va"
+
+# LingBot-VA baseline: both constraint masks are zero
+bash script/run_robotwin_none.sh 1
+
+# RTC: state mask is zero; previous complete action vectors are constrained
+bash script/run_robotwin_rtc.sh 1
+
+# FBFM: RTC action constraint plus live solver-step state feedback
+bash script/run_robotwin_fbfm.sh 1
+```
+
+#### Paper task manifest and resumable multi-task launch
+
+The AAAI submission evaluates the exact 42-task list in
+[`config/robotwin_paper_tasks_42.txt`](config/robotwin_paper_tasks_42.txt).
+[`config/robotwin_excluded_long_tasks_8.tsv`](config/robotwin_excluded_long_tasks_8.tsv)
+records the eight excluded tasks and their upstream maximum-step budgets. Do not
+silently substitute RoboTwin's built-in 50-task list when reproducing the paper.
+
+With the single-run variables still exported, launch the FBFM task set from
+this directory with:
+
+```bash
+export LINGBOT_VA_TASKS_FILE="$PWD/config/robotwin_paper_tasks_42.txt"
+export LINGBOT_VA_ALL_TASKS_ROOT="$PWD/robotwin_outputs/fbfm_paper_42_$(date +%Y%m%d_%H%M%S)"
+export ROBOTWIN_EPISODES_PER_TASK=20
+export LINGBOT_VA_ALL_TASK_SHARDS=1  # raise to at most 3 only when VRAM permits
+
+bash script/run_robotwin_all_tasks_fbfm.sh
+```
+
+The launcher is resumable. It validates completed `res.json` files, runs only
+missing tasks, and atomically refreshes `aggregate.json`, `trials.csv`,
+`task_summary.csv`, and `LIVE_STATUS.md`. Set
+`LINGBOT_VA_ADJUST_BOTTLE_AGGREGATE` only to reuse a separately verified
+`adjust_bottle` aggregate; the portable default reruns that task.
+
+For a custom `NONE`, `RTC`, `FBFM`, or diagnostic `FBFM-static` subset, set
+`LINGBOT_VA_CONSTRAINT_VARIANT`, `LINGBOT_VA_TASK_SET_ROOT`, and
+`LINGBOT_VA_TASKS_FILE`, then run `script/run_robotwin_task_set.sh`. The
+convenience `script/run_base_none_12x20.sh` uses the checked-in 12-task baseline
+manifest and accepts the same environment overrides. The experiment-list
+launcher and its aggregator/monitor are retained for the exact heterogeneous
+continuation manifest in
+[`config/robotwin_fbfm_completion_7cells_27ep.tsv`](config/robotwin_fbfm_completion_7cells_27ep.tsv);
+they are provenance helpers, not a replacement for the 42-task headline run.
+
+On the 97,887 MiB RTX PRO 6000, the validated 20-trial FBFM run can be split
+across three isolated servers/simulators with:
+
+```bash
+bash script/run_robotwin_fbfm_20_parallel.sh
+```
+
+This launcher uses approximately 83 GiB at peak and is not suitable for a
+smaller GPU without reducing the number of concurrent shards. It requires all
+20 episode videos and the three `res.json` totals before writing
+`aggregate.json`.
+
+The launchers run the policy server and RoboTwin client together, validate that
+`res.json` was produced, and always stop their own server on exit. Defaults are
+the single GPU 0 for both policy and RoboTwin/CuRobo, WebSocket port 29156, and
+torch master port 29161. The RTX PRO 6000 has enough memory for both processes;
+RoboTwin uses the NVIDIA Vulkan raster backend with ray tracing disabled.
+Override the device and port allocation before the command when necessary:
+
+```bash
+export LINGBOT_SERVER_GPU=0
+export ROBOTWIN_CLIENT_GPU=0
+export LINGBOT_VA_PORT=29156
+export LINGBOT_VA_MASTER_PORT=29161
+export LINGBOT_VA_ENABLE_OFFLOAD=1
+bash script/run_robotwin_fbfm.sh 1
+```
+
+RTC parameters are shared by RTC and FBFM.  With action horizon `H=32`, the
+default `d=16,s=16` has a hard prefix and no soft interval.  This example uses
+a non-degenerate EXP soft interval `[d,H-s)=[4,20)`:
+
+```bash
+export LINGBOT_VA_RTC_DELAY=4
+export LINGBOT_VA_RTC_EXECUTION_HORIZON=12
+export LINGBOT_VA_RTC_ATTENTION_SCHEDULE=EXP  # or LINEAR
+bash script/run_robotwin_rtc.sh 1
+```
+
+RoboTwin uses a deterministic pseudo-asynchronous schedule: 16 simulation steps
+release exactly 26 video-flow evaluations by default. No measured wall-clock
+delay changes `d` or the solver schedule. Override the solver budget with
+`LINGBOT_VA_PSEUDO_VIDEO_SOLVER_STEPS` only when the configured number of video
+inference steps also changes. FBFM live feedback is enabled by its launcher. For the
+diagnostic FBFM-static ablation only, use
+`bash script/run_constraint_ablation.sh FBFM-static 1`.
+
+The scripts use headless NVIDIA Vulkan rasterization rather than SAPIEN ray
+tracing. They set `ROBOTWIN_RENDER_BACKEND=default`,
+`SAPIEN_DISABLE_RAY_TRACING=1`, and the NVIDIA Vulkan ICD; neither Xorg nor
+`DISPLAY` is needed. Outputs and complete logs are written under
+`robotwin_outputs/adjust_bottle_<mode>_<timestamp>/`.
+
+The unified fetch already applies the included raster compatibility patch. The
+following is only the manual alternative for a pristine pinned RoboTwin
+checkout; do not apply it a second time after the bootstrap:
+
+```bash
+git apply /path/to/FBFM/wam/lingbot-va/patches/robotwin_raster_backend.patch
+```
+
+The patch preserves RoboTwin's upstream `rt` default and only selects the raster
+path when `ROBOTWIN_RENDER_BACKEND=default` is explicitly set by these launchers.
+
+Detailed timing semantics, deterministic replay, tests, and troubleshooting are
+documented in [`docs/fbfm_runtime_modes.md`](docs/fbfm_runtime_modes.md).
+
+#### Upstream LingBot-VA reference (legacy; not the FBFM reproduction entry point)
+
+> The remainder of this README is retained from the upstream LingBot-VA
+> project for provenance. Its launch scripts describe the upstream synchronous
+> evaluation/training workflows and may still contain original cluster-specific
+> defaults. They do not reproduce the AAAI FBFM protocol. For FBFM, use the
+> canonical environment, launchers, 42-task manifest, and bounded smoke commands
+> above (or the repository-root `README.md`).
 
 **Preparing the Environment**
 

@@ -1,0 +1,9 @@
+task	max_steps	reason
+put_bottles_dustbin	1700	max_steps >= 900
+open_microwave	1500	max_steps >= 900
+blocks_ranking_rgb	1200	max_steps >= 900
+blocks_ranking_size	1200	max_steps >= 900
+stack_blocks_three	1200	max_steps >= 900
+stack_bowls_three	1200	max_steps >= 900
+hanging_mug	900	max_steps >= 900
+stack_bowls_two	900	max_steps >= 900

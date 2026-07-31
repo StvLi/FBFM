@@ -1,0 +1,8 @@
+job_id	condition	config	task	start_seed	test_num	channel
+random_handover_block_s40000_n5	random	demo_randomized	handover_block	40000	5	0
+clean_handover_block_s50000_n3	clean	demo_clean	handover_block	50000	3	1
+clean_place_bread_basket_s40000_n4	clean	demo_clean	place_bread_basket	40000	4	1
+random_put_object_cabinet_s40000_n4	random	demo_randomized	put_object_cabinet	40000	4	2
+random_stack_blocks_two_s40000_n4	random	demo_randomized	stack_blocks_two	40000	4	0
+clean_put_object_cabinet_s40000_n4	clean	demo_clean	put_object_cabinet	40000	4	2
+clean_place_object_basket_s30000_n3	clean	demo_clean	place_object_basket	30000	3	1

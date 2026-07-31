@@ -2,7 +2,11 @@
 import gc
 
 import torch
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+try:
+    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+except ImportError:
+    fully_shard = None
+    MixedPrecisionPolicy = None
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -18,6 +22,11 @@ def apply_ac(model):
 def shard_model(model,
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32):
+    if fully_shard is None or MixedPrecisionPolicy is None:
+        # Fallback for environments that only ship the older FSDP API.
+        # Single-GPU eval can safely run without parameter sharding.
+        return model
+
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
