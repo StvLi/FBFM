@@ -4,12 +4,14 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+import dreamzero_fbfm.runtime as runtime_module
 from dreamzero_fbfm.constraints import ActionNormalizer
 from dreamzero_fbfm.runtime import (
     DreamZeroFBFMRuntime,
     DreamZeroFeedbackEncoder,
     FeedbackObservation,
 )
+from dreamzero_fbfm.settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 
 
 class FakeHead:
@@ -18,6 +20,7 @@ class FakeHead:
         self.num_frame_per_block = 2
         self.num_inference_steps = 16
         self.cfg_scale = 5.0
+        self.supports_external_step_guidance = True
         self.model = SimpleNamespace(action_dim=32)
         self.scheduler = SimpleNamespace(num_train_timesteps=1000)
         self.dit_step_mask = [
@@ -57,11 +60,11 @@ def _feedback(offset: int) -> FeedbackObservation:
     )
 
 
-def test_feedback_encoder_prepends_causal_anchor():
+def test_feedback_encoder_uses_training_aligned_stride_three_history():
     encoder = object.__new__(DreamZeroFeedbackEncoder)
     encoder.observations_per_latent = 4
-    encoder.actions_per_latent = 8
-    encoder.observation_interval = 2
+    encoder.actions_per_latent = 12
+    encoder.observation_interval = 3
     encoder.latent_slots = 2
     encoder.reset()
     encoder._transform_frame = lambda item: torch.full((1, 1, 1), item.action_offset)
@@ -74,31 +77,27 @@ def test_feedback_encoder_prepends_causal_anchor():
     encoder._encode = encode
     encoder.set_anchor(_feedback(0))
     outputs = []
-    for offset in range(1, 9):
+    for offset in range(1, 13):
         outputs.extend(encoder.add(_feedback(offset)))
 
-    assert len(outputs) == 8
-    assert [output.slot for output in outputs] == [0] * 8
-    assert [output.complete for output in outputs] == [False] * 7 + [True]
+    assert [output.action_offset for output in outputs] == [3, 6, 9, 12]
+    assert [output.slot for output in outputs] == [0] * 4
+    assert [output.complete for output in outputs] == [False] * 3 + [True]
     expected_windows = [
-        [0, 1, 1, 1, 1],
-        [0, 2, 2, 2, 2],
-        [0, 2, 3, 3, 3],
-        [0, 2, 4, 4, 4],
-        [0, 2, 4, 5, 5],
-        [0, 2, 4, 6, 6],
-        [0, 2, 4, 6, 7],
-        [0, 2, 4, 6, 8],
+        [0, 0, 0, 0, 3],
+        [0, 0, 0, 3, 6],
+        [0, 0, 3, 6, 9],
+        [0, 3, 6, 9, 12],
     ]
     assert [window.reshape(-1).tolist() for window in windows] == expected_windows
-    assert outputs[-1].source_offsets == (0, 2, 4, 6, 8)
+    assert outputs[-1].source_offsets == (0, 3, 6, 9, 12)
 
 
 def test_feedback_encoder_refreshes_second_latent_slot():
     encoder = object.__new__(DreamZeroFeedbackEncoder)
     encoder.observations_per_latent = 4
-    encoder.actions_per_latent = 8
-    encoder.observation_interval = 2
+    encoder.actions_per_latent = 12
+    encoder.observation_interval = 3
     encoder.latent_slots = 2
     encoder.reset()
     encoder._transform_frame = lambda item: torch.full((1, 1, 1), item.action_offset)
@@ -106,15 +105,15 @@ def test_feedback_encoder_refreshes_second_latent_slot():
     encoder.set_anchor(_feedback(0))
 
     outputs = []
-    for offset in range(1, 17):
+    for offset in range(1, 25):
         outputs.extend(encoder.add(_feedback(offset)))
 
-    assert [output.slot for output in outputs] == [0] * 8 + [1] * 8
-    assert outputs[8].source_offsets == (8, 9, 9, 9, 9)
-    assert outputs[-1].source_offsets == (8, 10, 12, 14, 16)
+    assert [output.slot for output in outputs] == [0] * 4 + [1] * 4
+    assert outputs[4].source_offsets == (12, 12, 12, 12, 15)
+    assert outputs[-1].source_offsets == (12, 15, 18, 21, 24)
 
 
-def test_runtime_applies_one_slot_revision_per_feedback(tmp_path):
+def test_runtime_updates_state_only_on_training_aligned_feedback(tmp_path):
     policy = FakePolicy()
     normalizer = ActionNormalizer(
         torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
@@ -146,27 +145,78 @@ def test_runtime_applies_one_slot_revision_per_feedback(tmp_path):
             kv_cache_metadata={"update_kv_cache": False},
         )
         assert runtime._constraints is not None
-        assert runtime._constraints.version == offset
+        assert runtime._constraints.version == offset // 3
 
     records = [
         json.loads(line)
         for line in audit_path.read_text(encoding="utf-8").splitlines()
     ]
     solver_records = [record for record in records if record["event"] == "solver_step"]
-    assert [record["context_version"] for record in solver_records] == list(range(1, 9))
-    assert [record["feedback_action_offsets"] for record in solver_records] == [
-        [offset] for offset in range(1, 9)
+    assert [record["context_version"] for record in solver_records] == [
+        0, 0, 1, 1, 1, 2, 2, 2
     ]
-    assert [record["feedback_state_slots"] for record in solver_records] == [[0]] * 8
-    assert [record["state_target_updates"] for record in solver_records] == [1] * 8
+    assert [record["feedback_action_offsets"] for record in solver_records] == [
+        [], [], [3], [], [], [6], [], []
+    ]
+    assert [record["feedback_state_slots"] for record in solver_records] == [
+        [], [], [0], [], [], [0], [], []
+    ]
+    assert [record["state_target_updates"] for record in solver_records] == [
+        0, 0, 1, 0, 0, 1, 0, 0
+    ]
 
 
-def test_runtime_hook_guides_action_and_detaches_solver_graph():
+def test_runtime_default_uses_l1_mass_balanced_state_mask(monkeypatch):
+    assert DEFAULT_STATE_WEIGHT == 56 / 9600
     policy = FakePolicy()
     normalizer = ActionNormalizer(
         torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
     )
-    runtime = DreamZeroFBFMRuntime(policy, normalizer, mode="RTC")
+    runtime = DreamZeroFBFMRuntime(policy, normalizer, mode="FBFM")
+    assert runtime.state_weight == DEFAULT_STATE_WEIGHT
+    assert runtime.state_feedback_kp == DEFAULT_STATE_FEEDBACK_KP == 0.04869675251658631
+    runtime.begin_chunk(np.zeros((8, 7), dtype=np.float32), pseudo_async=False)
+
+    encoder = runtime.feedback_encoder
+    encoder._transform_frame = lambda item: torch.full(
+        (1, 1, 2, 1, 1), float(item.action_offset)
+    )
+    encoder._encode = lambda images: images[:, -1]
+    encoder.set_anchor(_feedback(0))
+    for offset in range(1, 4):
+        runtime.submit_feedback(_feedback(offset))
+
+    captured = {}
+    original_guidance = runtime_module.joint_fbfm_guidance
+
+    def capture_guidance(**kwargs):
+        captured["video_mask"] = kwargs["video_mask"].detach().clone()
+        captured["state_feedback_kp"] = kwargs["state_feedback_kp"]
+        return original_guidance(**kwargs)
+
+    monkeypatch.setattr(runtime_module, "joint_fbfm_guidance", capture_guidance)
+    policy.action_head._run_diffusion_steps(
+        noisy_input=torch.randn(1, 2, 2, 1, 1),
+        action=torch.randn(1, 16, 32),
+        timestep=torch.full((1, 2), 600),
+        timestep_action=torch.full((1, 16), 600),
+        kv_cache_metadata={"update_kv_cache": False},
+    )
+
+    expected = torch.tensor([[[[[DEFAULT_STATE_WEIGHT]], [[0.0]]]]])
+    torch.testing.assert_close(captured["video_mask"], expected, rtol=0, atol=0)
+    assert captured["state_feedback_kp"] == DEFAULT_STATE_FEEDBACK_KP
+
+
+def test_runtime_guides_current_step_without_polluting_native_cache(tmp_path):
+    policy = FakePolicy()
+    normalizer = ActionNormalizer(
+        torch.full((7,), -1.0), torch.full((7,), 1.0), model_dim=32
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    runtime = DreamZeroFBFMRuntime(
+        policy, normalizer, mode="RTC", audit_path=str(audit_path)
+    )
     runtime.begin_chunk(np.full((8, 7), 0.5, dtype=np.float32), pseudo_async=False)
     video = torch.randn(1, 2, 2, 1, 1)
     action = torch.randn(1, 16, 32)
@@ -175,16 +225,55 @@ def test_runtime_hook_guides_action_and_detaches_solver_graph():
         action=action,
         kv_cache_metadata={"update_kv_cache": True},
     )
-    guided = policy.action_head._run_diffusion_steps(
+    cached = policy.action_head._run_diffusion_steps(
         noisy_input=video,
         action=action,
         timestep=torch.full((1, 2), 600),
         timestep_action=torch.full((1, 16), 600),
         kv_cache_metadata={"update_kv_cache": False},
     )
-    assert not torch.equal(guided[0][1], baseline[0][1])
-    assert not guided[0][0].requires_grad
-    assert not guided[0][1].requires_grad
+    for cached_branch, baseline_branch in zip(cached, baseline):
+        torch.testing.assert_close(cached_branch[0], baseline_branch[0])
+        torch.testing.assert_close(cached_branch[1], baseline_branch[1])
+
+    base_video = cached[1][0] + policy.action_head.cfg_scale * (
+        cached[0][0] - cached[1][0]
+    )
+    base_action = cached[0][1]
+    guided_video, guided_action = policy.action_head.external_step_guidance(
+        scheduler_index=0,
+        model_evaluated=True,
+        video_sample=video,
+        action_sample=action,
+        video_velocity=base_video,
+        action_velocity=base_action,
+        timestep_action=torch.full((1, 16), 600),
+    )
+    assert not torch.equal(guided_action, base_action)
+    assert not guided_video.requires_grad
+    assert not guided_action.requires_grad
+
+    skipped_video, skipped_action = policy.action_head.external_step_guidance(
+        scheduler_index=3,
+        model_evaluated=False,
+        video_sample=video + 0.1,
+        action_sample=action - 0.2,
+        video_velocity=base_video,
+        action_velocity=base_action,
+        timestep_action=torch.full((1, 16), 400),
+    )
+    assert not torch.equal(skipped_action, guided_action)
+    assert not skipped_video.requires_grad
+    assert not skipped_action.requires_grad
+    records = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    scheduler_records = [
+        record for record in records if record["event"] == "scheduler_guidance_step"
+    ]
+    assert [record["model_evaluated"] for record in scheduler_records] == [True, False]
+    assert scheduler_records[1]["jacobian_reused"] is True
     assert policy.action_head.dit_step_mask == [
         True, True, True, False, False, False, True, False,
         False, False, True, False, False, True, True, True,

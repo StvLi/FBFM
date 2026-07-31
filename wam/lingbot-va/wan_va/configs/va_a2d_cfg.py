@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
 import torch
 from easydict import EasyDict
 
@@ -9,7 +10,7 @@ va_a2d_cfg = EasyDict(__name__='Config: VA a2d')
 va_a2d_cfg.update(va_shared_cfg)
 va_shared_cfg.infer_mode = 'server'
 
-va_a2d_cfg.wan22_pretrained_model_name_or_path = "/share/project/caomingyu/WAM_baseline/model/checkpoints/lingbot-va"
+va_a2d_cfg.wan22_pretrained_model_name_or_path = os.environ.get("A2D_MODEL_PATH", "pre_models")
 
 va_a2d_cfg.attn_window = 30
 va_a2d_cfg.frame_chunk_size = 4

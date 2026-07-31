@@ -1,5 +1,9 @@
 # LingBot-VA + FBFM RoboTwin 链路验证记录
 
+> 这是 2026-07-24 的历史验证记录。下文绝对路径只记录当时机器，不是
+> 可移植复现命令；当前环境配置、bounded smoke 和 RoboTwin 拉起方式以
+> [`../README.md`](../README.md) 和仓库根 `README.md` 为准。
+
 日期：2026-07-24
 
 ## 目标与判据
@@ -25,7 +29,7 @@ observation/action 只写入 KV 一次；NONE 保持上游数值路径；RTC 的
 ## 固定实验坐标
 
 - task：`adjust_bottle`，配置 `demo_clean`，seed `0`
-- checkpoint：`/home/oem/tmp_ws/checkpoints/lingbot-va-posttrain-robotwin`
+- checkpoint：`/path/to/lingbot-va-posttrain-robotwin`
 - action horizon：`H=32`，固定 hard boundary `d=16`，execution horizon `s=16`
 - video flow：25 个数值步 + 1 个 cache-only evaluation
 - action flow：50 个数值步 + 1 个 cache-only evaluation

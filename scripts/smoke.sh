@@ -105,13 +105,11 @@ run_lingbot() {
 run_dreamzero() {
   local py; py="$(python_for dreamzero)"
   [[ -d "$REPO_ROOT/wam/dreamzero-libero/tests" ]] || { echo "smoke: DreamZero route is absent; skipping" >&2; return 0; }
-  # The root-module contract test intentionally has two deployment-layout
-  # assertions that only apply to the standalone A6000 checkout.  Route tests
-  # are all CPU-only and do not import the model checkpoint.
+  # Route tests are CPU-only and include strict local-component preflight;
+  # they do not import or download the model checkpoint.
   PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
     PYTHONPATH="$REPO_ROOT/wam/dreamzero-libero/src:$REPO_ROOT/wam/dreamzero-libero:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$py" -m pytest -p no:cacheprovider -q \
-      --ignore="$REPO_ROOT/wam/dreamzero-libero/tests/test_root_fbfm_modules.py" \
       "$REPO_ROOT/wam/dreamzero-libero/tests"
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate the resumable 50-task RoboTwin FBFM benchmark."""
+"""Aggregate a resumable RoboTwin LingBot-VA benchmark run."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def atomic_write(path: Path, value: str) -> None:
 
 
 def wilson(successes: int, total: int) -> list[float] | None:
-    if total == 0:
+    if total <= 0 or successes < 0 or successes > total:
         return None
     z = 1.959963984540054
     p = successes / total
@@ -94,6 +94,7 @@ def video_episodes(video_root: Path, seed_start: int) -> list[dict]:
         if match:
             episodes.append(
                 {
+                    "episode_index": int(match.group(1)),
                     "seed": seed_start + int(match.group(1)),
                     "success": match.group(2) == "True",
                     "video": str(video.resolve()),
@@ -107,18 +108,35 @@ def local_task_record(root: Path, task: str, requested: int) -> dict:
     result_paths = list(task_root.glob(f"client/stseed-*/metrics/{task}/res.json"))
     episodes = []
     result = None
+    result_error = None
     if len(result_paths) == 1:
-        result = json.loads(result_paths[0].read_text(encoding="utf-8"))
-        seed_text = result_paths[0].parts[-4]
-        seed_start = int(seed_text.removeprefix("stseed-"))
-        video_root = result_paths[0].parents[2] / "visualization" / task
-        episodes = video_episodes(video_root, seed_start)
+        try:
+            result = json.loads(result_paths[0].read_text(encoding="utf-8"))
+            seed_text = result_paths[0].parts[-4]
+            seed_start = int(seed_text.removeprefix("stseed-"))
+            video_root = result_paths[0].parents[2] / "visualization" / task
+            episodes = video_episodes(video_root, seed_start)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+            result_error = str(error)
+            result = None
+    elif len(result_paths) > 1:
+        result_error = f"multiple result files: {result_paths}"
 
-    completed = int(result["total_num"]) if result else 0
-    successes = int(result["succ_num"]) if result else 0
-    status = "complete" if completed == requested and len(episodes) == requested else "pending"
-    if completed or episodes:
-        status = "partial" if status != "complete" else status
+    try:
+        completed = int(result.get("total_num", 0)) if result else 0
+        successes = int(result.get("succ_num", 0)) if result else 0
+    except (TypeError, ValueError) as error:
+        result_error = str(error)
+        completed = 0
+        successes = 0
+    count_consistent = (
+        completed == requested
+        and successes == sum(int(item["success"]) for item in episodes)
+        and [item["episode_index"] for item in episodes] == list(range(requested))
+    )
+    status = "complete" if count_consistent else "pending"
+    if completed or episodes or result_error:
+        status = "complete" if count_consistent else "partial"
     if (task_root / ".running").exists() and status != "complete":
         status = "running"
     if (task_root / ".failed").exists() and status != "complete":
@@ -127,6 +145,8 @@ def local_task_record(root: Path, task: str, requested: int) -> dict:
         "task": task,
         "status": status,
         "source": str(task_root),
+        "result_error": result_error,
+        "count_consistent": count_consistent,
         "episodes_requested": requested,
         "episodes_completed": completed,
         "successes": successes,
@@ -142,10 +162,18 @@ def imported_adjust_record(path: Path, requested: int) -> dict:
     completed = int(value["total_num"])
     successes = int(value["succ_num"])
     episodes = value["episodes"]
+    consistent = (
+        completed == requested
+        and len(episodes) == requested
+        and successes == sum(int(bool(episode["success"])) for episode in episodes)
+        and len({int(episode["seed"]) for episode in episodes}) == requested
+    )
     return {
         "task": "adjust_bottle",
-        "status": "complete" if completed == requested and len(episodes) == requested else "partial",
+        "status": "complete" if consistent else "partial",
         "source": str(path.resolve()),
+        "result_error": None,
+        "count_consistent": consistent,
         "episodes_requested": requested,
         "episodes_completed": completed,
         "successes": successes,
@@ -156,17 +184,19 @@ def imported_adjust_record(path: Path, requested: int) -> dict:
     }
 
 
-def write_csvs(root: Path, tasks: list[dict]) -> None:
+def write_csvs(
+    root: Path, tasks: list[dict], *, mode: str, experiment_date: str
+) -> None:
     with_rows = []
     for task in tasks:
         for episode in task["episodes"]:
             with_rows.append(
                 [
-                    "2026-07-24",
+                    experiment_date,
                     "Lingbot-VA",
                     "RoboTwin",
                     task["task"],
-                    "FBFM",
+                    mode,
                     episode["seed"],
                     str(bool(episode["success"])).lower(),
                     task["status"],
@@ -219,7 +249,7 @@ def render_markdown(aggregate: dict) -> str:
         return "-" if value is None else f"{100 * value:.1f}%"
 
     lines = [
-        "# Lingbot-VA + FBFM RoboTwin live results",
+        f"# LingBot-VA + {aggregate['mode']} RoboTwin live results",
         "",
         f"Updated: `{aggregate['updated_at']}`",
         "",
@@ -252,7 +282,7 @@ def render_markdown(aggregate: dict) -> str:
     lines.extend(
         [
             "",
-            "Only complete 20-episode task rows are final estimates. Running or partial rows",
+            f"Only complete {aggregate['episodes_per_task']}-episode task rows are final estimates. Running or partial rows",
             "are operational progress and must not be used in paper comparisons.",
             "",
         ]
@@ -266,11 +296,43 @@ def main() -> None:
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument("--import-adjust", type=Path)
     parser.add_argument("--paper-dir", type=Path)
+    parser.add_argument("--mode", default="FBFM")
+    parser.add_argument("--paper-prefix")
+    parser.add_argument(
+        "--experiment-date",
+        default=datetime.now().astimezone().date().isoformat(),
+    )
+    parser.add_argument(
+        "--tasks-file",
+        type=Path,
+        help="Optional newline-delimited task list; defaults to the full benchmark.",
+    )
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
+    mode = args.mode.strip().upper()
+    if mode not in {"NONE", "RTC", "FBFM", "FBFM-STATIC"}:
+        raise ValueError(f"unsupported constraint mode: {mode}")
+    paper_prefix = args.paper_prefix or f"robotwin_{mode.lower().replace('-', '_')}"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", paper_prefix):
+        raise ValueError(f"paper prefix must be a safe file-name component: {paper_prefix!r}")
+
+    tasks = TASKS
+    if args.tasks_file:
+        tasks = tuple(
+            line.strip()
+            for line in args.tasks_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if not tasks:
+            raise ValueError("tasks file contains no tasks")
+        unknown = sorted(set(tasks) - set(TASKS))
+        if unknown:
+            raise ValueError(f"unknown RoboTwin tasks: {unknown}")
+        if len(tasks) != len(set(tasks)):
+            raise ValueError("tasks file contains duplicates")
 
     records = []
-    for task in TASKS:
+    for task in tasks:
         if task == "adjust_bottle" and args.import_adjust and args.import_adjust.exists():
             record = imported_adjust_record(args.import_adjust, args.episodes_per_task)
         else:
@@ -280,16 +342,16 @@ def main() -> None:
     completed = sum(item["episodes_completed"] for item in records)
     successes = sum(item["successes"] for item in records)
     complete_tasks = sum(item["status"] == "complete" for item in records)
-    status = "complete" if complete_tasks == len(TASKS) else "running"
+    status = "complete" if complete_tasks == len(tasks) else "running"
     aggregate = {
         "benchmark": "RoboTwin",
-        "mode": "FBFM",
+        "mode": mode,
         "status": status,
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "tasks_requested": len(TASKS),
+        "tasks_requested": len(tasks),
         "tasks_complete": complete_tasks,
         "episodes_per_task": args.episodes_per_task,
-        "episodes_requested": len(TASKS) * args.episodes_per_task,
+        "episodes_requested": len(tasks) * args.episodes_per_task,
         "episodes_completed": completed,
         "successes": successes,
         "failures": completed - successes,
@@ -303,21 +365,26 @@ def main() -> None:
         "tasks": records,
     }
     atomic_write(args.root / "aggregate.json", json.dumps(aggregate, indent=2) + "\n")
-    write_csvs(args.root, records)
+    write_csvs(
+        args.root,
+        records,
+        mode=mode,
+        experiment_date=args.experiment_date,
+    )
     live_markdown = render_markdown(aggregate)
     atomic_write(args.root / "LIVE_STATUS.md", live_markdown)
     if args.paper_dir:
         args.paper_dir.mkdir(parents=True, exist_ok=True)
         atomic_write(
-            args.paper_dir / "robotwin_fbfm_all_tasks.csv",
+            args.paper_dir / f"{paper_prefix}_all_tasks.csv",
             (args.root / "trials.csv").read_text(encoding="utf-8"),
         )
         atomic_write(
-            args.paper_dir / "robotwin_fbfm_task_summary.csv",
+            args.paper_dir / f"{paper_prefix}_task_summary.csv",
             (args.root / "task_summary.csv").read_text(encoding="utf-8"),
         )
         atomic_write(
-            args.paper_dir / "robotwin_fbfm_live_status.md",
+            args.paper_dir / f"{paper_prefix}_live_status.md",
             live_markdown,
         )
     print(json.dumps({key: aggregate[key] for key in (

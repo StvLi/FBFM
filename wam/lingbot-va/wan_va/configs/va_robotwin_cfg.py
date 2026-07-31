@@ -10,7 +10,7 @@ va_robotwin_cfg.update(va_shared_cfg)
 
 va_robotwin_cfg.wan22_pretrained_model_name_or_path = os.environ.get(
     "LINGBOT_VA_MODEL",
-    "/share/project/Ruimeng/FBFM/wam/lingbot-va/pre_models",
+    "pre_models",
 )
 
 va_robotwin_cfg.attn_window = 72

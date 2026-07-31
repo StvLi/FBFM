@@ -7,17 +7,46 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path(
-    os.environ.get("ROBOTWIN_ROOT", "/mnt/dataset/projs/projects/RoboTwin")
-)
-if str(robowin_root) not in sys.path:
-    sys.path.insert(0, str(robowin_root))
+def _resolve_robotwin_root() -> Path:
+    configured_root = os.environ.get("ROBOTWIN_ROOT")
+    if configured_root:
+        root = Path(configured_root).expanduser().resolve()
+    else:
+        lingbot_root = Path(__file__).resolve().parents[2]
+        if lingbot_root.parent.name != "wam":
+            raise RuntimeError(
+                "ROBOTWIN_ROOT is required outside the canonical FBFM monorepo layout"
+            )
+        repo_root = lingbot_root.parent.parent
+        expected_lingbot_root = (repo_root / "wam" / "lingbot-va").resolve()
+        if lingbot_root != expected_lingbot_root:
+            raise RuntimeError(
+                "ROBOTWIN_ROOT is required outside the canonical FBFM monorepo layout"
+            )
+        root = (repo_root / "external" / "RoboTwin").resolve()
+
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"RoboTwin checkout not found: {root}. Set ROBOTWIN_ROOT or run "
+            "scripts/bootstrap/fetch_upstreams.sh --route lingbot."
+        )
+    missing = [name for name in ("envs", "task_config") if not (root / name).is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            f"RoboTwin checkout is incomplete at {root}; missing: {', '.join(missing)}"
+        )
+    return root
+
+
+robotwin_root = _resolve_robotwin_root()
+if str(robotwin_root) not in sys.path:
+    sys.path.insert(0, str(robotwin_root))
 
 # Save original working directory before changing it
 original_cwd = Path.cwd()
 
 import os
-os.chdir(robowin_root)
+os.chdir(robotwin_root)
 
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
@@ -285,7 +314,7 @@ def eval_function_decorator(policy_name, model_name):
         raise e
 
 def get_camera_config(camera_type):
-    camera_config_path = os.path.join(robowin_root, "task_config/_camera_config.yml")
+    camera_config_path = os.path.join(robotwin_root, "task_config/_camera_config.yml")
 
     assert os.path.isfile(camera_config_path), "task config file is missing"
 

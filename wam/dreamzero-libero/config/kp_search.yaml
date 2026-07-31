@@ -1,0 +1,66 @@
+parameter: state_feedback_kp
+state_alignment_weight: 0.005833333333333334
+search_space:
+  lower: 0.001
+  upper: 100.0
+  scale: logarithmic
+  midpoint: geometric
+
+initial_points:
+  - value: 0.001
+    status: pending
+  - value: 1.0
+    status: complete_existing
+    evidence: fbfm_paper:origin/exp/dmzr_fbfm_weight_result
+  - value: 100.0
+    status: pending
+
+screening_protocol:
+  suites: [libero_spatial, libero_object]
+  task_ids:
+    libero_spatial: [1, 9]
+    libero_object: [0, 6]
+  official_init_ids: [0, 1, 2, 3, 4]
+  tasks_per_point: 4
+  trials_per_task: 5
+  episodes_per_point: 20
+  max_steps: 480
+  environment_seed: 0
+  model_seed_rule: fixed
+  solver_release_policy: uniform
+  rollout_protocol: pseudo_async_overlap
+
+refinement:
+  rule: bisect_selected_log_interval
+  formula: next_kp=sqrt(lower_kp*upper_kp)
+  reuse_completed_points: true
+  fresh_output_directory_per_point: true
+
+expanded_validation:
+  selected_points:
+    - 0.03162277660168379
+    - 0.04869675251658631
+    - 0.07498942093324558
+  selection_rule: top_three_completed_screening_success_rates
+  suites: [libero_spatial, libero_object, libero_goal, libero_10, libero_90]
+  task_ids:
+    libero_spatial: [1, 9]
+    libero_object: [0, 6]
+    libero_goal: [0, 6]
+    libero_10: [0, 6]
+    libero_90: [0, 6]
+  official_init_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  tasks_per_point: 10
+  trials_per_task: 10
+  episodes_per_point: 100
+  reused_tasks:
+    libero_spatial: [1, 9]
+    libero_object: [0, 6]
+  reused_init_ids: [0, 1, 2, 3, 4]
+  reused_episodes_per_point: 20
+  new_episodes_per_point: 80
+  max_steps: 480
+  environment_seed: 0
+  model_seed_rule: fixed
+  solver_release_policy: uniform
+  rollout_protocol: pseudo_async_overlap

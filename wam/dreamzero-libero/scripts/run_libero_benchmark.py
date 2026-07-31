@@ -19,8 +19,10 @@ from dreamzero_fbfm.experiment_ledger import (
     task_directory,
     write_tables,
 )
+from dreamzero_fbfm.settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 
-DEFAULT_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90")
+AVAILABLE_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90")
+DEFAULT_SUITES = AVAILABLE_SUITES[:4]
 DEFAULT_MAX_STEPS = {
     "libero_spatial": 480,
     "libero_object": 480,
@@ -30,10 +32,46 @@ DEFAULT_MAX_STEPS = {
 }
 
 
-def discover_tasks(suite_names: list[str]) -> list[TaskSpec]:
+def parse_task_selectors(values: list[str]) -> list[tuple[str, int]]:
+    selectors: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for value in values:
+        try:
+            suite, task_id_text = value.rsplit(":", 1)
+            task_id = int(task_id_text)
+        except (ValueError, TypeError) as error:
+            raise ValueError(
+                f"invalid task selector {value!r}; expected SUITE:TASK_ID"
+            ) from error
+        selector = (suite, task_id)
+        if suite not in AVAILABLE_SUITES or task_id < 0:
+            raise ValueError(f"invalid task selector: {value!r}")
+        if selector in seen:
+            raise ValueError(f"duplicate task selector: {value!r}")
+        selectors.append(selector)
+        seen.add(selector)
+    return selectors
+
+
+def discover_tasks(
+    suite_names: list[str], selectors: list[tuple[str, int]] | None = None
+) -> list[TaskSpec]:
     from libero.libero import benchmark
 
     registry = benchmark.get_benchmark_dict()
+    if selectors is not None:
+        suites = {suite_name: registry[suite_name]() for suite_name in suite_names}
+        specs: list[TaskSpec] = []
+        for suite_name, task_id in selectors:
+            suite = suites[suite_name]
+            if task_id >= int(suite.n_tasks):
+                raise ValueError(
+                    f"task selector out of range: {suite_name}:{task_id}"
+                )
+            task = suite.get_task(task_id)
+            specs.append(TaskSpec(suite_name, task_id, task.language))
+        return specs
+
     specs: list[TaskSpec] = []
     for suite_name in suite_names:
         suite = registry[suite_name]()
@@ -47,9 +85,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-workspace", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--suite", action="append", choices=DEFAULT_SUITES)
+    parser.add_argument("--suite", action="append", choices=AVAILABLE_SUITES)
+    parser.add_argument(
+        "--task",
+        action="append",
+        metavar="SUITE:TASK_ID",
+        help="Run only this task; repeat for a fixed screening subset",
+    )
     parser.add_argument("--mode", choices=("NONE", "RTC", "FBFM"), default="FBFM")
-    parser.add_argument("--state-weight", type=float, default=56 / 9600)
+    parser.add_argument("--state-weight", type=float, default=DEFAULT_STATE_WEIGHT)
+    parser.add_argument(
+        "--state-feedback-kp", type=float, default=DEFAULT_STATE_FEEDBACK_KP
+    )
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument(
         "--max-steps",
@@ -73,18 +120,29 @@ def main() -> None:
     if args.trials <= 0:
         raise ValueError("trials must be positive")
 
-    suites = args.suite or list(DEFAULT_SUITES)
+    selectors = parse_task_selectors(args.task) if args.task else None
+    if selectors is not None and args.suite:
+        parser.error("--task cannot be combined with --suite")
+    suites = (
+        list(dict.fromkeys(suite for suite, _ in selectors))
+        if selectors is not None
+        else (args.suite or list(DEFAULT_SUITES))
+    )
     max_steps_by_suite = {
         suite: args.max_steps if args.max_steps is not None else DEFAULT_MAX_STEPS[suite]
         for suite in suites
     }
-    specs = discover_tasks(suites)
+    specs = discover_tasks(suites, selectors)
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
     manifest = {
         "benchmark": "LIBERO",
         "mode": args.mode,
         "suites": suites,
+        "task_ids_by_suite": {
+            suite: [spec.task_id for spec in specs if spec.suite == suite]
+            for suite in suites
+        },
         "tasks": len(specs),
         "trials_per_task": args.trials,
         "expected_episodes": len(specs) * args.trials,
@@ -94,16 +152,19 @@ def main() -> None:
         "model_seed_rule": args.model_seed_rule,
         "solver_release_policy": args.solver_release_policy,
         "feedback_observation_stride": 1,
-        "feedback_encoding": "causal_rolling_hold",
+        "feedback_encoding": "causal_rolling_past",
         "state_weight": args.state_weight,
+        "state_feedback_kp": args.state_feedback_kp,
+        "effective_state_weight": args.state_weight * args.state_feedback_kp,
         "code_commit": args.code_commit,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         compared = (
-            "mode", "suites", "trials_per_task", "max_steps_by_suite",
-            "model_seed_rule", "solver_release_policy", "state_weight", "code_commit",
+            "mode", "suites", "task_ids_by_suite", "trials_per_task", "max_steps_by_suite",
+            "model_seed_rule", "solver_release_policy", "state_weight",
+            "state_feedback_kp", "code_commit",
         )
         if any(existing.get(key) != manifest[key] for key in compared):
             raise ValueError("existing benchmark manifest does not match requested protocol")
@@ -130,6 +191,7 @@ def main() -> None:
             "--base-workspace", str(args.base_workspace),
             "--mode", args.mode,
             "--state-weight", str(args.state_weight),
+            "--state-feedback-kp", str(args.state_feedback_kp),
             "--suite", spec.suite,
             "--task-id", str(spec.task_id),
             "--trial-start", str(len(completed)),

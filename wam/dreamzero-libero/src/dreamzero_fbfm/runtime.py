@@ -1,4 +1,4 @@
-"""Runtime hook that inserts joint FBFM at DreamZero DiT evaluations."""
+"""Runtime hook that applies joint FBFM at every DreamZero UniPC update."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from torch import Tensor
 
 from .audit import JsonlAudit
 from .constraints import ActionNormalizer, ChunkConstraints, ConstraintMode
-from .guidance import joint_fbfm_guidance
+from .guidance import EndpointLinearization, GuidanceResult, joint_fbfm_guidance
 from .pseudo_clock import SolverClock
+from .settings import DEFAULT_STATE_FEEDBACK_KP, DEFAULT_STATE_WEIGHT
 
 
 class InferenceCancelled(RuntimeError):
@@ -41,30 +42,48 @@ class EncodedFeedback:
     complete: bool
 
 
+@dataclass(frozen=True)
+class PendingStepGuidance:
+    dit_step: int
+    result: GuidanceResult | None
+    sigma: float | None
+    context_version: int
+    feedback_drained: int
+    feedback_updates: tuple[EncodedFeedback, ...]
+    diagnostics: dict[str, float | int | bool]
+
+
 class DreamZeroFeedbackEncoder:
-    """Refresh native DreamZero latents after every executed action.
+    """Refresh DreamZero latents on the checkpoint's training-time video grid.
 
     DreamZero's causal VAE emits one future latent for four input video frames.
-    During an incomplete four-frame block, the latest real observation is held
-    forward into the not-yet-observed sample positions. This gives a causal
-    provisional target after every action and becomes exactly the native
-    anchor-plus-four-frame encoding when the block is complete.
+    LIBERO SFT samples those frames three environment steps apart. Every real
+    observation is accepted in order, but a hard latent target is refreshed only
+    when the next stride-3 sample arrives. Missing history at the left boundary
+    is filled with the measured launch anchor; no current observation is copied
+    into an unobserved future position.
     """
 
-    def __init__(self, policy: Any, *, observations_per_latent: int = 4) -> None:
-        if observations_per_latent <= 0:
-            raise ValueError("observations_per_latent must be positive")
+    def __init__(
+        self,
+        policy: Any,
+        *,
+        observations_per_latent: int = 4,
+        observation_interval: int = 3,
+    ) -> None:
+        if observations_per_latent <= 0 or observation_interval <= 0:
+            raise ValueError("feedback sampling dimensions must be positive")
         self.policy = policy
         self.head = policy.action_head
         self.observations_per_latent = observations_per_latent
+        self.observation_interval = observation_interval
+        self.actions_per_latent = observation_interval * observations_per_latent
         latent_slots = int(self.head.num_frame_per_block)
         action_horizon = int(self.head.action_horizon)
-        if latent_slots <= 0 or action_horizon % latent_slots:
-            raise ValueError("DreamZero action horizon must divide into video-latent slots")
-        self.actions_per_latent = action_horizon // latent_slots
-        if self.actions_per_latent % observations_per_latent:
-            raise ValueError("actions per latent must divide into VAE observation samples")
-        self.observation_interval = self.actions_per_latent // observations_per_latent
+        if latent_slots <= 0:
+            raise ValueError("DreamZero must expose at least one video-latent slot")
+        if action_horizon > latent_slots * self.actions_per_latent:
+            raise ValueError("DreamZero action horizon exceeds its feedback video horizon")
         self.latent_slots = latent_slots
         self.reset()
 
@@ -95,6 +114,7 @@ class DreamZeroFeedbackEncoder:
 
         slot = (feedback.action_offset - 1) // self.actions_per_latent
         if slot >= self.latent_slots:
+            self._last_offset = feedback.action_offset
             return []
         if slot != self._active_slot:
             if self._last_frame is None:
@@ -108,24 +128,28 @@ class DreamZeroFeedbackEncoder:
         frame = self._transform_frame(feedback)
         self._last_frame = frame
         self._last_offset = feedback.action_offset
-        position = (feedback.action_offset - 1) % self.actions_per_latent + 1
-        if position % self.observation_interval == 0:
-            self._sampled_frames.append(frame)
-            self._sampled_offsets.append(feedback.action_offset)
+        position = feedback.action_offset - self._slot_anchor_offset
+        if position % self.observation_interval:
+            return []
 
+        self._sampled_frames.append(frame)
+        self._sampled_offsets.append(feedback.action_offset)
         missing = self.observations_per_latent - len(self._sampled_frames)
         if missing < 0:
             raise RuntimeError("feedback encoder collected too many samples for one latent")
-        future_frames = [*self._sampled_frames, *([frame] * missing)]
-        future_offsets = [*self._sampled_offsets, *([feedback.action_offset] * missing)]
-        images = torch.cat([self._slot_anchor, *future_frames], dim=1)
+        source_frames = [self._slot_anchor] * (missing + 1) + self._sampled_frames
+        source_offsets = (
+            (self._slot_anchor_offset,) * (missing + 1)
+            + tuple(self._sampled_offsets)
+        )
+        images = torch.cat(source_frames, dim=1)
         return [
             EncodedFeedback(
                 slot=slot,
                 latent=self._encode(images),
                 action_offset=feedback.action_offset,
-                source_offsets=(self._slot_anchor_offset, *future_offsets),
-                complete=position == self.actions_per_latent,
+                source_offsets=source_offsets,
+                complete=missing == 0,
             )
         ]
 
@@ -190,8 +214,10 @@ class DreamZeroFBFMRuntime:
         delay: int = 8,
         execution_horizon: int = 8,
         solver_evaluations: int | None = None,
-        state_weight: float = 56 / 9600,
+        state_weight: float = DEFAULT_STATE_WEIGHT,
+        state_feedback_kp: float = DEFAULT_STATE_FEEDBACK_KP,
         beta: float = 10.0,
+        diagnostic_vjp: bool = False,
         audit_path: str | None = None,
     ) -> None:
         if delay != execution_horizon:
@@ -222,8 +248,12 @@ class DreamZeroFBFMRuntime:
         self.native_dit_mask = native_mask
         if not 0.0 < state_weight <= 1.0:
             raise ValueError("state_weight must be in (0, 1]")
+        if not np.isfinite(state_feedback_kp) or state_feedback_kp <= 0.0:
+            raise ValueError("state_feedback_kp must be finite and positive")
         self.state_weight = float(state_weight)
+        self.state_feedback_kp = float(state_feedback_kp)
         self.beta = beta
+        self.diagnostic_vjp = bool(diagnostic_vjp)
         self.audit = JsonlAudit(audit_path)
         self.clock = SolverClock()
         self.feedback_encoder = DreamZeroFeedbackEncoder(policy)
@@ -232,12 +262,23 @@ class DreamZeroFBFMRuntime:
         self._action_targets: Tensor | None = None
         self._action_mask: Tensor | None = None
         self._step = 0
+        self._linearization: EndpointLinearization | None = None
+        self._pending_guidance: PendingStepGuidance | None = None
+        self._latest_dit_step = -1
         self._lock = threading.RLock()
+        if not getattr(self.head, "supports_external_step_guidance", False):
+            raise RuntimeError(
+                "DreamZero is missing the external per-UniPC guidance callback patch"
+            )
         self._install_hook()
+        self.head.external_step_guidance = self._scheduler_guidance
+        self.head.external_step_complete = self._scheduler_step_complete
 
     def _solver_sigma(self, kwargs: dict[str, Any]) -> float:
         """Read the action sigma used by the active native scheduler step."""
-        timestep = kwargs.get("timestep_action")
+        return self._sigma_from_timestep(kwargs.get("timestep_action"))
+
+    def _sigma_from_timestep(self, timestep: Any) -> float:
         if not isinstance(timestep, Tensor) or timestep.numel() == 0:
             raise ValueError("DreamZero solver call is missing timestep_action")
         flat = timestep.detach().float().reshape(-1)
@@ -262,6 +303,9 @@ class DreamZeroFBFMRuntime:
             if first_parameter is not None and first_parameter.is_cuda:
                 torch.cuda.reset_peak_memory_stats(first_parameter.device)
             self._step = 0
+            self._linearization = None
+            self._pending_guidance = None
+            self._latest_dit_step = -1
             self._constraints = None
             self.feedback_encoder.reset()
             if pseudo_async:
@@ -291,6 +335,9 @@ class DreamZeroFBFMRuntime:
                 mode=self.mode.value,
                 pseudo_async=pseudo_async,
                 state_weight=self.state_weight,
+                state_feedback_kp=self.state_feedback_kp,
+                effective_state_weight=self.state_weight * self.state_feedback_kp,
+                diagnostic_vjp=self.diagnostic_vjp,
                 action_mask_nonzero=int(torch.count_nonzero(mask).item()),
             )
 
@@ -334,6 +381,143 @@ class DreamZeroFBFMRuntime:
                     updates.append(update)
         return drained, updates
 
+    def _unguided_diagnostics(self) -> dict[str, float | int | bool]:
+        return {
+            "guided": False,
+            "state_mask_nonzero": 0,
+            "action_mask_nonzero": 0,
+            "state_error_norm": 0.0,
+            "aligned_state_error_norm": 0.0,
+            "action_error_norm": 0.0,
+            "video_correction_norm": 0.0,
+            "action_correction_norm": 0.0,
+            "guidance_weight": 0.0,
+            "state_feedback_kp": self.state_feedback_kp,
+            "jacobian_reused": False,
+        }
+
+    def _constraint_snapshot(
+        self, constraints: ChunkConstraints
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        int,
+        int,
+        list[EncodedFeedback],
+    ]:
+        drained, feedback_updates = self._drain_feedback(constraints)
+        state_target, state_mask, action_target, action_mask, version = (
+            constraints.snapshot()
+        )
+        state_mask.mul_(self.state_weight)
+        return (
+            state_target,
+            state_mask,
+            action_target,
+            action_mask,
+            version,
+            drained,
+            feedback_updates,
+        )
+
+    def _scheduler_guidance(
+        self,
+        *,
+        scheduler_index: int,
+        model_evaluated: bool,
+        video_sample: Tensor,
+        action_sample: Tensor,
+        video_velocity: Tensor,
+        action_velocity: Tensor,
+        timestep_action: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if not 0 <= scheduler_index < self.scheduler_steps:
+            raise ValueError(f"invalid UniPC scheduler index {scheduler_index}")
+        if model_evaluated:
+            pending = self._pending_guidance
+            if pending is None or pending.dit_step != self._latest_dit_step:
+                raise RuntimeError("DiT guidance was not staged for its UniPC update")
+            self._pending_guidance = None
+        else:
+            constraints = self._ensure_constraints(video_sample, action_sample)
+            (
+                state_target,
+                state_mask,
+                action_target,
+                action_mask,
+                version,
+                drained,
+                feedback_updates,
+            ) = self._constraint_snapshot(constraints)
+            has_guidance = bool(
+                torch.any(state_mask).item() or torch.any(action_mask).item()
+            )
+            sigma = self._sigma_from_timestep(timestep_action) if has_guidance else None
+            if has_guidance:
+                if self._linearization is None:
+                    raise RuntimeError("skipped UniPC guidance has no cached DiT Jacobian")
+                with torch.enable_grad():
+                    result = joint_fbfm_guidance(
+                        video_sample=video_sample,
+                        action_sample=action_sample,
+                        video_velocity=video_velocity,
+                        action_velocity=action_velocity,
+                        video_target=state_target,
+                        video_mask=state_mask,
+                        action_target=action_target,
+                        action_mask=action_mask,
+                        sigma=sigma,
+                        beta=self.beta,
+                        state_feedback_kp=self.state_feedback_kp,
+                        decompose_vjp=self.diagnostic_vjp,
+                        linearization=self._linearization,
+                    )
+                diagnostics = result.diagnostics
+            else:
+                result = None
+                diagnostics = self._unguided_diagnostics()
+            pending = PendingStepGuidance(
+                dit_step=self._latest_dit_step,
+                result=result,
+                sigma=sigma,
+                context_version=version,
+                feedback_drained=drained,
+                feedback_updates=tuple(feedback_updates),
+                diagnostics=diagnostics,
+            )
+
+        updates = pending.feedback_updates
+        self.audit.write(
+            "scheduler_guidance_step",
+            mode=self.mode.value,
+            scheduler_index=scheduler_index,
+            dit_step=pending.dit_step,
+            model_evaluated=model_evaluated,
+            sigma=pending.sigma,
+            context_version=pending.context_version,
+            feedback_drained=pending.feedback_drained,
+            state_target_updates=len(updates),
+            feedback_action_offsets=[update.action_offset for update in updates],
+            feedback_state_slots=[update.slot for update in updates],
+            feedback_source_offsets=[list(update.source_offsets) for update in updates],
+            feedback_blocks_complete=[update.complete for update in updates],
+            **pending.diagnostics,
+        )
+        if pending.result is None:
+            return video_velocity.detach(), action_velocity.detach()
+        return pending.result.video_velocity, pending.result.action_velocity
+
+    def _scheduler_step_complete(self, *, scheduler_index: int) -> None:
+        next_index = scheduler_index + 1
+        block_complete = (
+            next_index == self.scheduler_steps
+            or self.native_dit_mask[next_index]
+        )
+        if block_complete:
+            self.clock.complete()
+
     def _install_hook(self) -> None:
         original: Callable[..., Any] = self.head._run_diffusion_steps
 
@@ -353,12 +537,19 @@ class DreamZeroFBFMRuntime:
             video = kwargs["noisy_input"].detach().clone().requires_grad_(True)
             action = kwargs["action"].detach().clone().requires_grad_(True)
             constraints = self._ensure_constraints(video, action)
-            drained, feedback_updates = self._drain_feedback(constraints)
-            state_target, state_mask, action_target, action_mask, version = constraints.snapshot()
-            state_mask.mul_(self.state_weight)
+            (
+                state_target,
+                state_mask,
+                action_target,
+                action_mask,
+                version,
+                drained,
+                feedback_updates,
+            ) = self._constraint_snapshot(constraints)
             has_guidance = bool(torch.any(state_mask).item() or torch.any(action_mask).item())
             call_kwargs = dict(kwargs, noisy_input=video, action=action)
             sigma = self._solver_sigma(kwargs) if has_guidance else None
+            self._linearization = None
 
             if has_guidance:
                 with torch.enable_grad():
@@ -379,27 +570,35 @@ class DreamZeroFBFMRuntime:
                         action_mask=action_mask,
                         sigma=sigma,
                         beta=self.beta,
+                        state_feedback_kp=self.state_feedback_kp,
+                        decompose_vjp=self.diagnostic_vjp,
+                        cache_linearization=True,
                     )
-                # The upstream caller applies CFG after this hook. Equal video
-                # branches make that operation an identity for the guided field.
+                self._linearization = result.linearization
+                # DreamZero must cache its native predictions. The optional
+                # scheduler callback applies the staged guided field only to the
+                # current UniPC update and reuses this Jacobian at skipped DiTs.
                 predictions = [
-                    (result.video_velocity, result.action_velocity),
-                    (result.video_velocity, unconditional_action.detach()),
+                    (conditional_video.detach(), conditional_action.detach()),
+                    (unconditional_video.detach(), unconditional_action.detach()),
                 ]
                 diagnostics = result.diagnostics
             else:
                 with torch.no_grad():
                     predictions = original(**kwargs)
-                diagnostics = {
-                    "guided": False,
-                    "state_mask_nonzero": 0,
-                    "action_mask_nonzero": 0,
-                    "state_error_norm": 0.0,
-                    "action_error_norm": 0.0,
-                    "video_correction_norm": 0.0,
-                    "action_correction_norm": 0.0,
-                    "guidance_weight": 0.0,
-                }
+                result = None
+                diagnostics = self._unguided_diagnostics()
+
+            self._latest_dit_step = self._step
+            self._pending_guidance = PendingStepGuidance(
+                dit_step=self._step,
+                result=result,
+                sigma=sigma,
+                context_version=version,
+                feedback_drained=drained,
+                feedback_updates=tuple(feedback_updates),
+                diagnostics=diagnostics,
+            )
 
             self.audit.write(
                 "solver_step",
@@ -428,7 +627,6 @@ class DreamZeroFBFMRuntime:
                 **diagnostics,
             )
             self._step += 1
-            self.clock.complete()
             return predictions
 
         self.head._run_diffusion_steps = hooked_run_diffusion_steps

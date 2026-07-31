@@ -41,8 +41,14 @@ bash scripts/bootstrap/fetch_upstreams.sh --route all
 # Build five isolated Python environments for the three routes.
 bash scripts/bootstrap/create_envs.sh --route all
 
-# Source/revision/license/patch checks; no model or episode is launched.
-bash scripts/bootstrap/verify.sh --strict
+# Download the pinned RoboTwin simulator assets (about 15 GB compressed,
+# about 16 GB extracted). This is separate from model checkpoints.
+"$FBFM_ENV_ROOT/fbfm-robotwin/bin/python" \
+  scripts/bootstrap/fetch_robotwin_assets.py \
+  --robotwin-root "$FBFM_EXTERNAL_ROOT/RoboTwin"
+
+# Source/revision/license/patch/asset checks; no model or episode is launched.
+bash scripts/bootstrap/verify.sh --strict --assets
 
 # Bounded CPU/import tests; no complete simulator episode is run.
 bash scripts/smoke.sh all
@@ -50,19 +56,25 @@ bash scripts/smoke.sh all
 
 `fetch_upstreams.sh` never downloads checkpoints or datasets. It safely and
 idempotently applies the RoboTwin raster, DreamZero scheduler-callback, and
-Wan2.2 FBFM patches only after checking the pinned commits. It refuses a dirty
-checkout that contains any other local change. Use `--dry-run` to inspect the
-plan and `--offline` to use already available Git objects.
+Wan2.2 FBFM patches only after checking the pinned commits. It also fetches the
+exact PyTorch3D and CuRobo sources used by the RoboTwin environment. Every
+unpatched checkout must be clean, and a patched checkout may differ from its
+pinned commit only by the reviewed patch. Use `--dry-run` to inspect the plan
+and `--offline` to use already available Git objects.
 
 Environment creation can also be inspected without changing the machine:
 
 ```bash
 bash scripts/bootstrap/create_envs.sh --route all --dry-run
+python3 scripts/bootstrap/fetch_robotwin_assets.py --dry-run
 ```
 
 Use `FBFM_EXTERNAL_ROOT` and `FBFM_ENV_ROOT` to keep sources and environments
 outside this checkout. Checkpoints, environments, third-party source trees,
-simulator outputs, and generated videos are deliberately excluded from Git.
+ordinary simulator/run outputs, and generated videos are deliberately excluded
+from Git. The only experiment-result media added by this integration are three
+reviewed Wan2.2 MP4 files; their paths and SHA256 checksums are recorded in the
+[`wam/wan2.2` artifact manifest](wam/wan2.2/artifacts/README.md).
 
 ## Immutable upstream sources
 
@@ -73,14 +85,26 @@ source of record.
 | --- | --- | --- | --- |
 | LingBot-VA | `https://github.com/robbyant/lingbot-va.git` | `7c6ffa9bfc4b83582cafc860fab4c82cc7deeeeb` | Apache-2.0 |
 | RoboTwin | `https://github.com/RoboTwin-Platform/RoboTwin.git` | `2eeec322d95799f537cbfe5f291a8220d965ccb8` | MIT |
+| PyTorch3D | `https://github.com/facebookresearch/pytorch3d.git` | `32a33e24428d07171ef54e359d902205eab95b9b` | BSD-3-Clause |
+| CuRobo | `https://github.com/NVlabs/curobo.git` | `0db44e5916492ad814baf2764b88cc156d22e525` | NVIDIA Source Code License |
 | DreamZero | `https://github.com/dreamzero0/dreamzero.git` | `ab790c198fbce33503358efbbd4187ce9a89adf3` | Apache-2.0 |
 | LIBERO | `https://github.com/RLinf/LIBERO.git` | `0c5e40cc4ae63e09c14e7df6f74481e9ee8585f7` | MIT |
 | RLinf | `https://github.com/RLinf/RLinf.git` | `26179807d701950cf2933554bfb9bb596e662b68` | Apache-2.0 |
 | Wan2.2 | `https://github.com/Wan-Video/Wan2.2.git` | `42bf4cfaa384bc21833865abc2f9e6c0e67233dc` | Apache-2.0 |
 
 The FBFM repository is Apache-2.0. Upstream code, model weights, datasets, and
-simulator assets remain subject to their own licenses and terms. Do not
+simulator assets remain subject to their own licenses and terms. In particular,
+CuRobo's upstream license limits use to non-commercial research/evaluation; it
+is fetched into `external/` and is not relicensed or archived here. Do not
 redistribute a checkpoint merely because its loader is included here.
+
+RoboTwin assets are fixed to Hugging Face dataset `TianxingChen/RoboTwin2.0`
+revision `9dc9299c163db059931898a9f0852098a61155a1`. The downloader verifies all
+three archive SHA256 values from
+[`third_party/manifest.yaml`](third_party/manifest.yaml), safely extracts them,
+regenerates absolute embodiment paths, and writes an ignored provenance marker.
+Allow roughly 31 GB of temporary free space while compressed and extracted
+copies coexist; the verified zips are removed after a successful extraction.
 
 ## Repository and environment layout
 
@@ -122,6 +146,27 @@ interpreter is available. `--skip-install` only creates the environments;
 interpreters can be used directly by setting the route-specific variables
 listed by `bash scripts/smoke.sh --help`.
 
+The RoboTwin build follows the pinned upstream requirements, builds PyTorch3D
+and CuRobo from the immutable source revisions above, and then applies the two
+audited SAPIEN 3.0.0b1/MPLib 0.2.1 compatibility edits with an exact,
+idempotent checker. `FBFM_ROBOTWIN_MAX_JOBS` controls CUDA-extension build
+parallelism. RoboTwin itself has no Python packaging metadata and is run from
+its checkout, so the bootstrap does not pretend to editable-install it.
+
+Wan is installed in three phases: the audited CUDA 12.9 PyTorch wheels, pinned
+runtime packages, then optional FlashAttention with `--no-build-isolation`.
+On a host without a matching CUDA compiler, use the tested SDPA fallback:
+
+```bash
+FBFM_WAN_INSTALL_FLASH_ATTN=0 \
+  bash scripts/bootstrap/create_envs.sh --route wan
+```
+
+Exact Wan environment files and the audited full freeze are under
+[`wam/wan2.2/environment`](wam/wan2.2/environment/). All installers fail on a
+missing requirements file or package source; `--dry-run` still prints the full
+expected command plan before those external checkouts exist.
+
 ## Model artifacts
 
 Weights are not downloaded by the bootstrap and must stay outside Git.
@@ -131,19 +176,31 @@ Weights are not downloaded by the bootstrap and must stay outside Git.
 | LingBot | RoboTwin post-training checkpoint | `robbyant/lingbot-va-posttrain-robotwin` |
 | DreamZero | policy checkpoint | `RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000` |
 | DreamZero | tokenizer | `umt5-xxl` |
+| DreamZero | diffusion, T5 encoder, and VAE bundle | `Wan-AI/Wan2.2-TI2V-5B` |
+| DreamZero | CLIP image encoder | `models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth` |
 | Wan2.2 | TI2V checkpoint | `Wan-AI/Wan2.2-TI2V-5B` |
 
-Set explicit paths and ask the verifier to check them:
+Set explicit paths. With `--checkpoints`, the verifier checks every route
+artifact, including the exact DreamZero component files:
 
 ```bash
 export LINGBOT_VA_MODEL=/path/to/lingbot-va-posttrain-robotwin
 export DREAMZERO_CHECKPOINT=/path/to/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000
 export DREAMZERO_TOKENIZER=/path/to/umt5-xxl
-export WAN22_CKPT_DIR=/path/to/Wan2.2-TI2V-5B
+export DREAMZERO_WAN_CHECKPOINT=/path/to/Wan2.2-TI2V-5B
+export DREAMZERO_IMAGE_ENCODER=/path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+export WAN22_CKPT_DIR="$DREAMZERO_WAN_CHECKPOINT"
 export WAN_CHECKPOINT="$WAN22_CKPT_DIR"
 
 bash scripts/bootstrap/verify.sh --strict --checkpoints
 ```
+
+Before importing RLinf or constructing the policy, the DreamZero server
+requires `models_t5_umt5-xxl-enc-bf16.pth` and `Wan2.2_VAE.pth` inside
+`$DREAMZERO_WAN_CHECKPOINT`, plus the exact
+`$DREAMZERO_IMAGE_ENCODER` file. It overrides both the top-level and nested
+checkpoint-config paths with these local paths and fails immediately if any
+component is absent; it never falls back to an implicit model download.
 
 For LingBot inference, the checkpoint's `transformer/config.json` must use
 `"attn_mode": "torch"` or `"flashattn"`; the training-only `"flex"` mode is
@@ -155,7 +212,9 @@ These commands validate integration contracts without waiting for a benchmark
 episode or reporting a success rate:
 
 ```bash
-bash scripts/bootstrap/verify.sh --strict
+bash scripts/bootstrap/verify.sh --strict --assets
+"$FBFM_ENV_ROOT/fbfm-robotwin/bin/python" \
+  scripts/bootstrap/apply_robotwin_compat.py --check
 bash scripts/smoke.sh shared
 bash scripts/smoke.sh lingbot
 bash scripts/smoke.sh dreamzero
@@ -163,8 +222,10 @@ bash scripts/smoke.sh wan
 ```
 
 The route smoke tests use `PYTHONDONTWRITEBYTECODE=1`, disable third-party
-pytest plugin autoloading, and avoid the full checkpoint. To use pre-existing
-environments outside `.venvs`, for example:
+pytest plugin autoloading, and avoid the full checkpoint. In this release the
+route suites contain 39 LingBot tests, 41 DreamZero tests (including strict
+local-component preflight), and 10 Wan tests plus its CLI import check. To use
+pre-existing environments outside `.venvs`, for example:
 
 ```bash
 FBFM_LINGBOT_PYTHON=/path/to/lingbot/bin/python bash scripts/smoke.sh lingbot
@@ -184,6 +245,28 @@ and pseudo-clock. Only the exposed constraints change.
 | `NONE` | no | no |
 | `RTC` | yes | no |
 | `FBFM` | yes | yes |
+
+The paper task set is defined by fixed, checked-in manifests rather than
+runtime task discovery. Evaluate the 42 tasks in
+[`robotwin_paper_tasks_42.txt`](wam/lingbot-va/config/robotwin_paper_tasks_42.txt);
+the eight intentionally excluded long-horizon tasks and their reasons are
+recorded in
+[`robotwin_excluded_long_tasks_8.tsv`](wam/lingbot-va/config/robotwin_excluded_long_tasks_8.tsv).
+Treat these lists as authoritative for paper reproduction even if the upstream
+RoboTwin catalog changes.
+
+Before a simulator launch, the three asset groups and generated embodiment
+paths must pass the pinned preflight. If the Quick start was not run, prepare
+this route explicitly:
+
+```bash
+bash scripts/bootstrap/fetch_upstreams.sh --route lingbot
+bash scripts/bootstrap/create_envs.sh --route lingbot
+"$FBFM_ENV_ROOT/fbfm-robotwin/bin/python" \
+  scripts/bootstrap/fetch_robotwin_assets.py \
+  --robotwin-root "$FBFM_EXTERNAL_ROOT/RoboTwin"
+bash scripts/bootstrap/verify.sh --route lingbot --strict --assets
+```
 
 Configure the two processes and run a one-episode launch:
 
@@ -246,6 +329,8 @@ Start the model server in shell A:
 export DREAMZERO_BASE_WORKSPACE="$FBFM_EXTERNAL_ROOT"
 export DREAMZERO_CHECKPOINT=/path/to/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000
 export DREAMZERO_TOKENIZER=/path/to/umt5-xxl
+export DREAMZERO_WAN_CHECKPOINT=/path/to/Wan2.2-TI2V-5B
+export DREAMZERO_IMAGE_ENCODER=/path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
 
 ROOT="$FBFM_ROOT"
 ROUTE="$ROOT/wam/dreamzero-libero"
@@ -259,6 +344,8 @@ mkdir -p "$ROUTE/results/smoke_fbfm"
   --base-workspace "$BASE" \
   --checkpoint "$DREAMZERO_CHECKPOINT" \
   --tokenizer "$DREAMZERO_TOKENIZER" \
+  --wan-checkpoint "$DREAMZERO_WAN_CHECKPOINT" \
+  --image-encoder "$DREAMZERO_IMAGE_ENCODER" \
   --mode FBFM \
   --state-weight "$STATE_WEIGHT" \
   --state-feedback-kp "$STATE_KP" \
@@ -330,14 +417,25 @@ overlay, patch, tests, documentation, and sanitized audit summaries, not a
 second copy of upstream.
 
 ```bash
+bash scripts/bootstrap/fetch_upstreams.sh --route wan
+bash scripts/bootstrap/create_envs.sh --route wan
+
 export WAN_ROOT="$FBFM_EXTERNAL_ROOT/Wan2.2"
 export WAN_PY="$FBFM_ENV_ROOT/fbfm-wan2.2/bin/python"
 export WAN22_CKPT_DIR=/path/to/Wan2.2-TI2V-5B
 
+# Download only after accepting the model publisher's terms.
+"$FBFM_ENV_ROOT/fbfm-wan2.2/bin/hf" download \
+  Wan-AI/Wan2.2-TI2V-5B \
+  --revision 921dbaf3f1674a56f47e83fb80a34bac8a8f203e \
+  --local-dir "$WAN22_CKPT_DIR"
+
+WAN_CHECKPOINT="$WAN22_CKPT_DIR" \
+  bash scripts/bootstrap/verify.sh --route wan --strict --checkpoints
+
 cd "$WAN_ROOT"
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  "$WAN_PY" -m pytest -p no:cacheprovider -q \
-  tests/test_fbfm_state_feedback.py
+  "$WAN_PY" -m pytest -p no:cacheprovider -q tests/test_fbfm_state_feedback.py
 "$WAN_PY" generate_fbfm.py --help
 ```
 
@@ -384,9 +482,10 @@ nine frames.
   --audit "$FBFM_ROOT/wam/wan2.2/results/manual/fbfm.json"
 ```
 
-For a small-area GPU launch test, use a 9-frame horizon, two solver steps, CPU
-T5, model offload, and gradient checkpointing. These reduced settings are only
-an integration test and are not paper results:
+For bounded end-to-end GPU launch tests, use a 5-frame horizon, two solver
+steps, CPU T5, model offload, and a small spatial area. Run both paths; these
+reduced settings validate initialization, checkpoint loading, feedback
+guidance, and MP4/audit writing, but they are not paper results:
 
 ```bash
 "$WAN_PY" generate_fbfm.py \
@@ -394,10 +493,23 @@ an integration test and are not paper results:
   --ckpt-dir "$WAN22_CKPT_DIR" \
   --image "$WAN_ROOT/examples/i2v_input.JPG" \
   --prompt "A short integration test." \
-  --max-area 65536 --frame-num 9 --sample-steps 2 \
+  --max-area 16384 --frame-num 5 --sample-steps 2 \
   --t5-cpu --offload-model --convert-model-dtype \
-  --gradient-checkpointing \
   --output "$FBFM_ROOT/wam/wan2.2/results/manual/direct_tiny.mp4"
+
+"$WAN_PY" generate_fbfm.py \
+  --mode FBFM \
+  --ckpt-dir "$WAN22_CKPT_DIR" \
+  --image "$WAN_ROOT/examples/i2v_input.JPG" \
+  --feedback-video \
+    "$FBFM_ROOT/wam/wan2.2/artifacts/robot_arm_ball_stop/reference_future_121f.mp4" \
+  --feedback-release-steps 1 \
+  --prompt "A short integration test." \
+  --max-area 16384 --frame-num 5 --sample-steps 2 \
+  --state-weight 1.0 --kp 1.0 --beta 10 \
+  --t5-cpu --offload-model --convert-model-dtype --gradient-checkpointing \
+  --output "$FBFM_ROOT/wam/wan2.2/results/manual/fbfm_tiny.mp4" \
+  --audit "$FBFM_ROOT/wam/wan2.2/results/manual/fbfm_tiny.json"
 ```
 
 ### Recorded real-video result and privacy boundary
@@ -441,12 +553,13 @@ files and checkpoint directories.
 
 Packaging uses `git archive`, so only committed files on the `submission`
 branch are included. The script refuses a dirty worktree and scans the archive
-for raw bags, checkpoints, external source, Python caches, and bytecode.
+for raw DB3/BAG/MCAP recordings, common checkpoint/weight extensions, external
+source, local environments, Python caches, and bytecode.
 
 ```bash
 git switch submission
 git status --short                 # must print nothing
-bash scripts/bootstrap/verify.sh --strict
+bash scripts/bootstrap/verify.sh --strict --assets
 bash scripts/smoke.sh all
 bash scripts/package_submission.sh /path/to/FBFM-submission.tar.gz
 ```

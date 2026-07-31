@@ -8,8 +8,7 @@ va_a2d_train_cfg = EasyDict(__name__='Config: VA a2d train')
 va_a2d_train_cfg.update(va_a2d_cfg)
 
 # 你的真机数据集根目录
-# va_a2d_train_cfg.dataset_path = '/share/project/caomingyu/WAM_baseline/data/real_all_lite'
-va_a2d_train_cfg.dataset_path = '/share/project/caomingyu/WAM_baseline/data/real_shortest_task_lite'
+va_a2d_train_cfg.dataset_path = os.environ.get("A2D_DATASET_PATH", "data/real_shortest_task_lite")
 va_a2d_train_cfg.empty_emb_path = os.path.join(va_a2d_train_cfg.dataset_path, 'empty_emb.pt')
 
 va_a2d_train_cfg.enable_wandb = False

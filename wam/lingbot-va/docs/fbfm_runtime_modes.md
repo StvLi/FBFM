@@ -1,5 +1,9 @@
 # LingBot-VA 中 NONE / RTC / FBFM 的统一运行语义
 
+> 本文用于说明运行语义并保留原始实验审计坐标；其中的绝对路径和历史
+> commit 仅是 provenance，不是当前复现入口。环境构建与启动命令以
+> [`../README.md`](../README.md) 和仓库根 `README.md` 为准。
+
 本文对应代码基线 `3604b457a24485cddf326a997e48955b7ca6b548` 上的修复，目标是落实
 Theory-to-Implementation Handover 中的两点：恢复 previous-action constraint；让执行期真实
 state feedback 影响**当前正在运行的** flow-matching chunk，而不是只在推理开始时取一次快照。
@@ -152,4 +156,4 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
   dynamics 关系，并展示真正实时化依赖系统级流水线。
 
 因此，FBFM 不是替换 RTC：它等于“完整 RTC action constraint + chunk 内实时 state constraint”。
-论文和理论交接材料位于 `/home/oem/tmp_ws/aaai_paper`。
+论文和理论交接材料位于历史 paper checkout（未随公开仓库分发）。

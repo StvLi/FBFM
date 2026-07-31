@@ -7,7 +7,6 @@ max_steps_by_suite:
   libero_object: 480
   libero_goal: 480
   libero_10: 480
-  libero_90: 480
 horizon_policy: uniform_480_for_cross_suite_comparison
 seed: 0
 
@@ -21,7 +20,18 @@ protocol:
   solver_grants_per_environment_step: [1, 1, 1, 1, 1, 1, 1, 1]
   model_seed_rule: fixed
   feedback_observation_stride: 1
+  feedback_vae_sample_interval: 3
   feedback_observations_per_latent: 4
-  feedback_encoding: causal_rolling_hold
+  feedback_encoding: causal_rolling_past
   state_weight: 0.005833333333333334
+  state_feedback_kp: 0.04869675251658631
+  effective_state_weight: 0.0002840643896800868
   max_guidance_weight: 10.0
+
+kp_search:
+  range: [0.001, 100.0]
+  initial_points: [0.001, 1.0, 100.0]
+  scale: logarithmic
+  midpoint: geometric
+  screening_suites: [libero_spatial, libero_object]
+  trials_per_task: 5

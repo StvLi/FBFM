@@ -3,11 +3,41 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 lingbot=$(cd -- "$script_dir/.." && pwd)
+workspace=$(cd -- "$lingbot/../.." && pwd)
 run_root=${LINGBOT_VA_ALL_TASKS_ROOT:-$lingbot/robotwin_outputs/fbfm_all_tasks_20}
 episodes_per_task=${ROBOTWIN_EPISODES_PER_TASK:-20}
 shard_count=${LINGBOT_VA_ALL_TASK_SHARDS:-3}
-import_adjust=${LINGBOT_VA_ADJUST_BOTTLE_AGGREGATE:-$lingbot/robotwin_outputs/fbfm_20_20260724_102818/aggregate.json}
-paper_dir=${FBFM_PAPER_EXPERIMENT_DIR:-/home/oem/tmp_ws/aaai_paper/experiments}
+env_root=${FBFM_ENV_ROOT:-$workspace/.venvs}
+client_python=${ROBOTWIN_CLIENT_PYTHON:-$env_root/fbfm-robotwin/bin/python}
+import_adjust=${LINGBOT_VA_ADJUST_BOTTLE_AGGREGATE:-}
+paper_dir=${FBFM_PAPER_EXPERIMENT_DIR:-$run_root/paper_exports}
+tasks_file=${LINGBOT_VA_TASKS_FILE:-}
+
+if [[ $client_python == */* ]]; then
+  [[ -x $client_python ]] || {
+    echo "RoboTwin client Python is not executable: $client_python" >&2
+    echo "Set ROBOTWIN_CLIENT_PYTHON or run scripts/bootstrap/create_envs.sh --route lingbot." >&2
+    exit 2
+  }
+  client_python=$(cd -- "$(dirname -- "$client_python")" && pwd)/$(basename -- "$client_python")
+else
+  requested_client_python=$client_python
+  client_python=$(command -v "$requested_client_python") || {
+    echo "RoboTwin client Python is not on PATH: $requested_client_python" >&2
+    echo "Set ROBOTWIN_CLIENT_PYTHON or run scripts/bootstrap/create_envs.sh --route lingbot." >&2
+    exit 2
+  }
+fi
+export ROBOTWIN_CLIENT_PYTHON="$client_python"
+
+[[ $episodes_per_task =~ ^[1-9][0-9]*$ ]] || {
+  echo "ROBOTWIN_EPISODES_PER_TASK must be a positive integer: $episodes_per_task" >&2
+  exit 2
+}
+[[ $shard_count =~ ^[1-9][0-9]*$ ]] || {
+  echo "LINGBOT_VA_ALL_TASK_SHARDS must be a positive integer: $shard_count" >&2
+  exit 2
+}
 
 tasks=(
   adjust_bottle beat_block_hammer blocks_ranking_rgb blocks_ranking_size
@@ -23,12 +53,59 @@ tasks=(
   stack_bowls_two stamp_seal turn_switch
 )
 
+if [[ -n $tasks_file ]]; then
+  [[ -s $tasks_file ]] || { echo "task file is missing or empty: $tasks_file" >&2; exit 2; }
+  mapfile -t tasks < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "$tasks_file")
+fi
+
+valid_result() {
+  local task_root=$1 task=$2
+  "$client_python" - "$task_root" "$task" "$episodes_per_task" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+root, task, requested = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+result_path = root / "client" / "stseed-10000" / "metrics" / task / "res.json"
+video_root = root / "client" / "stseed-10000" / "visualization" / task
+if not result_path.is_file() or not video_root.is_dir():
+    raise SystemExit(1)
+try:
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    raise SystemExit(1)
+indices = []
+successes = 0
+for path in video_root.glob("*.mp4"):
+    match = re.match(r"^(\d+)_.*_(True|False)\.mp4$", path.name)
+    if match:
+        indices.append(int(match.group(1)))
+        successes += match.group(2) == "True"
+valid = (
+    int(result.get("total_num", -1)) == requested
+    and int(result.get("succ_num", -1)) == successes
+    and sorted(indices) == list(range(requested))
+)
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 aggregate() {
+  local aggregate_args=(
+    --episodes-per-task "$episodes_per_task"
+    --paper-dir "$paper_dir"
+  )
+  if [[ -n $import_adjust ]]; then
+    aggregate_args+=(--import-adjust "$import_adjust")
+  fi
+  if [[ -n $tasks_file ]]; then
+    aggregate_args+=(--tasks-file "$tasks_file")
+  fi
   flock "$run_root/.aggregate.lock" \
-    /home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python \
+    "$client_python" \
       "$script_dir/aggregate_robotwin_all_tasks.py" "$run_root" \
-      --episodes-per-task "$episodes_per_task" --import-adjust "$import_adjust" \
-      --paper-dir "$paper_dir"
+      "${aggregate_args[@]}"
 }
 
 if [[ ${1:-} == --worker ]]; then
@@ -36,14 +113,11 @@ if [[ ${1:-} == --worker ]]; then
   mkdir -p "$run_root/tasks" "$run_root/logs"
   for ((index=shard; index<${#tasks[@]}; index+=shard_count)); do
     task=${tasks[$index]}
-    if [[ $task == adjust_bottle && -s $import_adjust ]]; then
+    if [[ $task == adjust_bottle && -n $import_adjust && -s $import_adjust ]]; then
       continue
     fi
     task_root=$run_root/tasks/$task
-    result=$task_root/client/stseed-10000/metrics/$task/res.json
-    if [[ -s $result ]] && /home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python -c \
-      'import json,sys; d=json.load(open(sys.argv[1])); raise SystemExit(0 if int(d["total_num"]) == int(sys.argv[2]) else 1)' \
-      "$result" "$episodes_per_task"; then
+    if valid_result "$task_root" "$task"; then
       aggregate >> "$run_root/logs/aggregation.log" 2>&1
       continue
     fi
@@ -105,4 +179,9 @@ for pid in "${pids[@]}"; do
 done
 trap - INT TERM
 aggregate | tee -a "$run_root/logs/aggregation.log"
+if ! "$client_python" -c \
+  'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); raise SystemExit(0 if value["status"] == "complete" else 1)' \
+  "$run_root/aggregate.json"; then
+  status=1
+fi
 exit "$status"

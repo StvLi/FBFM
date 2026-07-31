@@ -1,0 +1,70 @@
+# Immutable source pins used by the public FBFM submission.
+# The bootstrap script clones these repositories into $FBFM_EXTERNAL_ROOT;
+# model weights, simulator assets and Python environments remain external.
+schema: 1
+repositories:
+  lingbot-va:
+    url: https://github.com/robbyant/lingbot-va.git
+    revision: 7c6ffa9bfc4b83582cafc860fab4c82cc7deeeeb
+    license: Apache-2.0
+    route: lingbot
+    purpose: LingBot-VA model/runtime dependency
+  robotwin:
+    url: https://github.com/RoboTwin-Platform/RoboTwin.git
+    revision: 2eeec322d95799f537cbfe5f291a8220d965ccb8
+    license: MIT
+    route: sim
+    purpose: RoboTwin 2.0 simulator and evaluation client
+  pytorch3d:
+    url: https://github.com/facebookresearch/pytorch3d.git
+    revision: 32a33e24428d07171ef54e359d902205eab95b9b
+    license: BSD-3-Clause
+    route: sim
+    purpose: RoboTwin point-cloud sampling CUDA extension
+  curobo:
+    url: https://github.com/NVlabs/curobo.git
+    revision: 0db44e5916492ad814baf2764b88cc156d22e525
+    license: NVIDIA-Source-Code-License
+    route: sim
+    purpose: RoboTwin GPU motion planner; upstream terms restrict use to research/evaluation
+  dreamzero:
+    url: https://github.com/dreamzero0/dreamzero.git
+    revision: ab790c198fbce33503358efbbd4187ce9a89adf3
+    license: Apache-2.0
+    route: dreamzero
+    purpose: DreamZero model/runtime dependency
+  libero:
+    url: https://github.com/RLinf/LIBERO.git
+    revision: 0c5e40cc4ae63e09c14e7df6f74481e9ee8585f7
+    license: MIT
+    route: sim
+    purpose: LIBERO simulator and task definitions
+  rlinf:
+    url: https://github.com/RLinf/RLinf.git
+    revision: 26179807d701950cf2933554bfb9bb596e662b68
+    license: Apache-2.0
+    route: dreamzero
+    purpose: DreamZero checkpoint/config/runtime dependency
+  wan2.2:
+    url: https://github.com/Wan-Video/Wan2.2.git
+    revision: 42bf4cfaa384bc21833865abc2f9e6c0e67233dc
+    license: Apache-2.0
+    route: wan
+    purpose: Wan2.2 TI2V upstream; FBFM changes are in patches/wan2.2_fbfm.patch
+
+artifacts:
+  robotwin_assets:
+    repository: TianxingChen/RoboTwin2.0
+    revision: 9dc9299c163db059931898a9f0852098a61155a1
+    archives:
+      background_texture.zip: 54ede0fb5b783e0faa2bc98720d3affd6ca3bb9280b225b48c1aafaf31473070
+      embodiments.zip: 6b87d7d55e106d8ff25917e0538eb1e177fc549280e8a742a8cec3cb9f953fc6
+      objects.zip: 6aa56b3cf1e1064f7c809308144da36b00815f8b137fef2d7e4de856f8becf27
+  checkpoints:
+    lingbot: lingbot-va-posttrain-robotwin
+    dreamzero: RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Step26000
+    wan: Wan2.2-TI2V-5B
+  tokenizer: umt5-xxl
+  note: >-
+    Artifact names are references only. Download them from the original model
+    publishers and verify their licenses/terms before redistribution.

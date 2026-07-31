@@ -42,8 +42,14 @@ Environment variables:
                          3.8, 3.10 respectively)
   FBFM_PIP_EXTRA_ARGS    extra arguments (word-split) passed to pip
   FBFM_INSTALL_UPSTREAM  set to 0 (same as --skip-upstream)
+  FBFM_ROBOTWIN_MAX_JOBS PyTorch3D/CuRobo build parallelism (default: 4)
   FBFM_WAN_SOURCE_ROOT   patched Wan2.2 checkout (defaults to route vendor,
                          then external/Wan2.2)
+  FBFM_WAN_TORCH_REQUIREMENTS
+                         requirements file or "existing" (default: audited cu129)
+  FBFM_WAN_INSTALL_FLASH_ATTN
+                         set to 0 to use the PyTorch SDPA fallback (default: 1)
+  FBFM_WAN_MAX_JOBS      FlashAttention build parallelism (default: 4)
 
 Conda environments are prefix-based, so no shell activation is required by
 the launchers.  For a prepared machine with existing environments, set
@@ -222,19 +228,23 @@ pip_run() {
 
 pip_file() {
   local python="$1" file="$2"; shift 2
-  if [[ -f "$file" ]]; then
+  if ((DRY_RUN)); then
+    pip_run "$python" install -r "$file" "$@"
+  elif [[ -f "$file" ]]; then
     pip_run "$python" install -r "$file" "$@"
   else
-    log "warning: dependency file not found; skipping $file"
+    die "dependency file not found: $file"
   fi
 }
 
 pip_editable() {
   local python="$1" source="$2"; shift 2
-  if [[ -f "$source/pyproject.toml" || -f "$source/setup.py" ]]; then
+  if ((DRY_RUN)); then
+    pip_run "$python" install -e "$source" "$@"
+  elif [[ -f "$source/pyproject.toml" || -f "$source/setup.py" ]]; then
     pip_run "$python" install -e "$source" "$@"
   else
-    log "warning: package source not found; skipping $source"
+    die "Python package metadata not found: $source"
   fi
 }
 
@@ -255,8 +265,21 @@ install_for() {
       # this package would shadow the FBFM bridge on sys.path.
       ;;
     robotwin)
-      pip_file "$python" "$EXTERNAL_ROOT/RoboTwin/script/requirements.txt"
-      pip_editable "$python" "$EXTERNAL_ROOT/RoboTwin" --no-deps
+      if ((SKIP_UPSTREAM == 0)); then
+        pip_file "$python" "$EXTERNAL_ROOT/RoboTwin/script/requirements.txt"
+        # RoboTwin is executed from its checkout and has no setup.py. Its two
+        # compiled planner dependencies are fetched at immutable revisions by
+        # fetch_upstreams.sh and built only after the pinned torch install.
+        run env "MAX_JOBS=${FBFM_ROBOTWIN_MAX_JOBS:-4}" \
+          "$python" -m pip install --no-build-isolation -e \
+          "$EXTERNAL_ROOT/pytorch3d" "${EXTRA_ARGS[@]}"
+        run env "MAX_JOBS=${FBFM_ROBOTWIN_MAX_JOBS:-4}" \
+          "$python" -m pip install --no-build-isolation -e \
+          "$EXTERNAL_ROOT/curobo" "${EXTRA_ARGS[@]}"
+        run "$python" "$REPO_ROOT/scripts/bootstrap/apply_robotwin_compat.py"
+        run "$python" -c \
+          'import importlib.util as u; assert all(u.find_spec(x) for x in ("pytorch3d", "curobo", "sapien", "mplib")); print("RoboTwin runtime imports OK")'
+      fi
       ;;
     dreamzero)
       pip_run "$python" install pytest
@@ -267,19 +290,41 @@ install_for() {
       pip_editable "$python" "$REPO_ROOT/wam/dreamzero-libero" --no-deps
       ;;
     libero)
-      pip_file "$python" "$EXTERNAL_ROOT/LIBERO/requirements.txt"
-      pip_editable "$python" "$EXTERNAL_ROOT/LIBERO" --no-deps
+      if ((SKIP_UPSTREAM == 0)); then
+        pip_file "$python" "$EXTERNAL_ROOT/LIBERO/requirements.txt"
+        pip_editable "$python" "$EXTERNAL_ROOT/LIBERO" --no-deps
+      fi
       ;;
     wan)
-      pip_run "$python" install pytest
+      wan_environment="$REPO_ROOT/wam/wan2.2/environment"
       wan_source="${FBFM_WAN_SOURCE_ROOT:-}"
       if [[ -z "$wan_source" && -f "$REPO_ROOT/wam/wan2.2/vendor/Wan2.2/pyproject.toml" ]]; then
         wan_source="$REPO_ROOT/wam/wan2.2/vendor/Wan2.2"
       elif [[ -z "$wan_source" ]]; then
         wan_source="$EXTERNAL_ROOT/Wan2.2"
       fi
-      pip_file "$python" "$wan_source/requirements.txt"
-      pip_editable "$python" "$wan_source" --no-deps
+
+      # Install in phases. FlashAttention's build imports torch, so the
+      # upstream all-in-one requirements.txt is not reproducible in a fresh env.
+      wan_torch_requirements="${FBFM_WAN_TORCH_REQUIREMENTS:-$wan_environment/requirements-torch-cu129.txt}"
+      if [[ "$wan_torch_requirements" == existing ]]; then
+        run "$python" -c 'import torch, torchvision, torchaudio; print(torch.__version__)'
+      else
+        pip_file "$python" "$wan_torch_requirements"
+      fi
+      pip_file "$python" "$wan_environment/requirements-runtime.txt"
+
+      if [[ "${FBFM_WAN_INSTALL_FLASH_ATTN:-1}" == 0 ]]; then
+        log "wan: skipping optional FlashAttention; PyTorch SDPA remains available"
+      else
+        run env "MAX_JOBS=${FBFM_WAN_MAX_JOBS:-4}" \
+          "$python" -m pip install --no-build-isolation \
+          -r "$wan_environment/requirements-flash-attn.txt" "${EXTRA_ARGS[@]}"
+      fi
+
+      if ((SKIP_UPSTREAM == 0)); then
+        pip_editable "$python" "$wan_source" --no-deps
+      fi
       ;;
   esac
 }

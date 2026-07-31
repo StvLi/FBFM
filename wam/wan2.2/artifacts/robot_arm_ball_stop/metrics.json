@@ -1,0 +1,33 @@
+{
+  "experiment": "RealSense D435i robot-arm ball-stopping visual prediction",
+  "data_status": "pre-recorded input; raw recording is not redistributed",
+  "model": "Wan2.2-TI2V-5B",
+  "resolution": [1280, 704],
+  "fps": 24,
+  "context_frames": 48,
+  "prediction_frames_including_anchor": 121,
+  "seed": 0,
+  "sampling_steps": 50,
+  "sample_shift": 5.0,
+  "cfg_scale": 5.0,
+  "fbfm": {
+    "feedback_slots": 30,
+    "observations_per_slot": 4,
+    "state_weight": 1.0,
+    "kp": 1.0,
+    "beta": 10.0
+  },
+  "pixel_metrics_against_reference": {
+    "wan2.2_base": {
+      "full_frame_mae": 9.626061229099166,
+      "full_frame_psnr_db": 20.061823287139156,
+      "temporal_gradient_mae": 2.846816597370186
+    },
+    "fbfm": {
+      "full_frame_mae": 9.273109735249577,
+      "full_frame_psnr_db": 23.102111466246775,
+      "temporal_gradient_mae": 5.481732754177517
+    }
+  },
+  "interpretation": "Full-frame MAE/PSNR improve while temporal-gradient error worsens; this is a visual prediction diagnostic, not online control success."
+}

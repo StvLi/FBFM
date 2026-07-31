@@ -65,11 +65,11 @@ while (($#)); do
 done
 
 case "$ROUTE" in
-  all)      UPSTREAMS=(lingbot dreamzero robotwin libero rlinf wan) ;;
-  lingbot)  UPSTREAMS=(lingbot robotwin) ;;
+  all)      UPSTREAMS=(lingbot dreamzero robotwin pytorch3d curobo libero rlinf wan) ;;
+  lingbot)  UPSTREAMS=(lingbot robotwin pytorch3d curobo) ;;
   dreamzero) UPSTREAMS=(dreamzero libero rlinf) ;;
   wan)      UPSTREAMS=(wan) ;;
-  sim)      UPSTREAMS=(robotwin libero rlinf) ;;
+  sim)      UPSTREAMS=(robotwin pytorch3d curobo libero rlinf) ;;
   *) die "unsupported route '$ROUTE'; choose all, lingbot, dreamzero, wan, or sim" ;;
 esac
 
@@ -89,6 +89,16 @@ URL[robotwin]="https://github.com/RoboTwin-Platform/RoboTwin.git"
 REV[robotwin]="2eeec322d95799f537cbfe5f291a8220d965ccb8"
 DEST[robotwin]="RoboTwin"
 LICENSE[robotwin]="MIT"
+
+URL[pytorch3d]="https://github.com/facebookresearch/pytorch3d.git"
+REV[pytorch3d]="32a33e24428d07171ef54e359d902205eab95b9b"
+DEST[pytorch3d]="pytorch3d"
+LICENSE[pytorch3d]="BSD-3-Clause"
+
+URL[curobo]="https://github.com/NVlabs/curobo.git"
+REV[curobo]="0db44e5916492ad814baf2764b88cc156d22e525"
+DEST[curobo]="curobo"
+LICENSE[curobo]="NVIDIA-Source-Code-License"
 
 URL[libero]="https://github.com/RLinf/LIBERO.git"
 REV[libero]="0c5e40cc4ae63e09c14e7df6f74481e9ee8585f7"
@@ -233,7 +243,12 @@ for key in "${UPSTREAMS[@]}"; do
       patch="$REPO_ROOT/wam/wan2.2/patches/wan2.2_fbfm.patch"
       label="Wan2.2 FBFM"
       ;;
-    *) continue ;;
+    *)
+      if ((DRY_RUN == 0)) && repo_dirty "$EXTERNAL_ROOT/${DEST[$key]}"; then
+        die "$EXTERNAL_ROOT/${DEST[$key]} has local changes; expected a clean pinned checkout"
+      fi
+      continue
+      ;;
   esac
   if ((DRY_RUN)); then
     run git -C "$EXTERNAL_ROOT/${DEST[$key]}" apply "$patch"

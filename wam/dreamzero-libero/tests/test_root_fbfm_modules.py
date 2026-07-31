@@ -15,7 +15,6 @@ from fbfm.libero_observation import (
 )
 from fbfm.model_runtime import build_runtime_config, reset_policy_state
 
-
 FBFM_REPOSITORY = Path(__file__).resolve().parents[3]
 ROUTE_REPOSITORY = FBFM_REPOSITORY / "wam" / "dreamzero-libero"
 
@@ -102,6 +101,139 @@ def test_runtime_config_uses_checkpoint_local_paths(tmp_path):
     assert config.num_action_chunks == 16
     assert config.action_head_cfg.config.skip_component_loading is True
     assert config.action_head_cfg.config.defer_lora_injection is False
+
+
+def test_runtime_config_overrides_all_dreamzero_component_paths(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    tokenizer = tmp_path / "tokenizer"
+    wan_checkpoint = tmp_path / "Wan2.2-TI2V-5B"
+    image_encoder = (
+        tmp_path / "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+    )
+    checkpoint.mkdir()
+    tokenizer.mkdir()
+    wan_checkpoint.mkdir()
+    text_encoder = wan_checkpoint / "models_t5_umt5-xxl-enc-bf16.pth"
+    vae = wan_checkpoint / "Wan2.2_VAE.pth"
+    text_encoder.touch()
+    vae.touch()
+    image_encoder.touch()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "diffusion_model_pretrained_path": "/example/training/wan",
+                "text_encoder_pretrained_path": "/example/training/t5.pth",
+                "image_encoder_pretrained_path": "/example/training/clip.pth",
+                "vae_pretrained_path": "/example/training/vae.pth",
+                "action_head_cfg": {
+                    "config": {
+                        "skip_component_loading": False,
+                        "defer_lora_injection": True,
+                        "diffusion_model_cfg": {
+                            "diffusion_model_pretrained_path": "/example/training/wan"
+                        },
+                        "text_encoder_cfg": {
+                            "text_encoder_pretrained_path": "/example/training/t5.pth"
+                        },
+                        "image_encoder_cfg": {
+                            "image_encoder_pretrained_path": "/example/training/clip.pth"
+                        },
+                        "vae_cfg": {
+                            "vae_pretrained_path": "/example/training/vae.pth"
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = build_runtime_config(
+        checkpoint,
+        tokenizer,
+        wan_checkpoint_dir=wan_checkpoint,
+        image_encoder_path=image_encoder,
+    )
+    action_config = config.action_head_cfg.config
+    expected = {
+        "diffusion": str(wan_checkpoint.resolve()),
+        "text": str(text_encoder.resolve()),
+        "image": str(image_encoder.resolve()),
+        "vae": str(vae.resolve()),
+    }
+    assert config.diffusion_model_pretrained_path == expected["diffusion"]
+    assert config.text_encoder_pretrained_path == expected["text"]
+    assert config.image_encoder_pretrained_path == expected["image"]
+    assert config.vae_pretrained_path == expected["vae"]
+    assert (
+        action_config.diffusion_model_cfg.diffusion_model_pretrained_path
+        == expected["diffusion"]
+    )
+    assert (
+        action_config.text_encoder_cfg.text_encoder_pretrained_path
+        == expected["text"]
+    )
+    assert (
+        action_config.image_encoder_cfg.image_encoder_pretrained_path
+        == expected["image"]
+    )
+    assert action_config.vae_cfg.vae_pretrained_path == expected["vae"]
+
+
+def test_runtime_config_fails_before_missing_components_can_download(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    tokenizer = tmp_path / "tokenizer"
+    wan_checkpoint = tmp_path / "Wan2.2-TI2V-5B"
+    image_encoder = (
+        tmp_path / "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
+    )
+    checkpoint.mkdir()
+    tokenizer.mkdir()
+    wan_checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="refusing an implicit model download",
+    ) as error:
+        build_runtime_config(
+            checkpoint,
+            tokenizer,
+            wan_checkpoint_dir=wan_checkpoint,
+            image_encoder_path=image_encoder,
+        )
+
+    message = str(error.value)
+    assert "models_t5_umt5-xxl-enc-bf16.pth" in message
+    assert "Wan2.2_VAE.pth" in message
+    assert str(image_encoder.resolve()) in message
+
+
+def test_model_server_requires_explicit_component_paths(tmp_path):
+    script = ROUTE_REPOSITORY / "scripts" / "model_server.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--base-workspace",
+            str(tmp_path),
+            "--checkpoint",
+            str(tmp_path / "checkpoint"),
+            "--tokenizer",
+            str(tmp_path / "tokenizer"),
+            "--mode",
+            "FBFM",
+            "--audit",
+            str(tmp_path / "audit.jsonl"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "--wan-checkpoint" in result.stderr
+    assert "--image-encoder" in result.stderr
 
 
 def test_reset_policy_state_clears_sequence_caches():

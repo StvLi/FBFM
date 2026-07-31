@@ -343,7 +343,7 @@ class QwenPiServer:
 
     def init_norm(
             self,
-            states_path='/home/yangshuai/yangshuai_ssd0/checkpoint/qwen_pi0/norm_stats.json',
+            states_path=os.environ.get("QWEN_PI_NORM_STATS", "norm_stats.json"),
             state_dim=14,
             action_dim=14):
         '''
@@ -380,7 +380,7 @@ class QwenPiServer:
         from veomni.data.dataset import build_vla_dataset
 
         tokenizer = AutoTokenizer.from_pretrained(
-            '/home/yangshuai/yangshuai_ssd0/rep/VLA_pretraining/checkpoints/Qwen2.5-VL-3B-Instruct'
+            os.environ["QWEN_PI_BASE_MODEL"]
         )
 
         config = SimpleNamespace()
@@ -392,7 +392,7 @@ class QwenPiServer:
         dataset = build_vla_dataset(
             datasets_type='agilex',
             repo_id=
-            '/home/yangshuai/yangshuai_ssd0/cache/huggingface/lerobot/hanging_mug-aloha-agilex_clean_50_rep',
+            os.environ["QWEN_PI_REPLAY_DATASET"],
             config=config,
             chunk_size=50,
             tokenizer=tokenizer,
@@ -419,8 +419,7 @@ if __name__ == "__main__":
 
     from .websocket_policy_server import WebsocketPolicyServer
 
-    # PATH_TO_PI_MODEL = "/home/yangshuai/yangshuai_ssd0/checkpoint/qwen_pi0/qwenpi0_libero_48token_6bs_4node_bf16vlm_fp32_fsdp2_compile_tuneV/checkpoints/global_step_30260/hf_ckpt"
-    PATH_TO_PI_MODEL = "/home/yangshuai/yangshuai_ssd0/checkpoint/qwen_pi0/8GPU_cotraining/checkpoints/global_step_35000/hf_ckpt"
+    PATH_TO_PI_MODEL = os.environ["QWEN_PI_MODEL_PATH"]
 
     model = QwenPiServer(PATH_TO_PI_MODEL, use_length=50)
 

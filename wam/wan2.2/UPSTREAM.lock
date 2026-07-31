@@ -1,0 +1,9 @@
+upstream_repository=https://github.com/Wan-Video/Wan2.2.git
+upstream_commit=42bf4cfaa384bc21833865abc2f9e6c0e67233dc
+upstream_branch=main
+model_repository=https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B
+model_revision=921dbaf3f1674a56f47e83fb80a34bac8a8f203e
+overlay_patch=patches/wan2.2_fbfm.patch
+
+# The patch is generated against the exact commit above. Do not silently
+# replace this pin with a moving upstream branch when reproducing results.

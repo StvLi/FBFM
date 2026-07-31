@@ -5,8 +5,8 @@
 # =============================================================================
 
 # ============================ 可配置区域 ============================
-# TODO: 每次重新申请机器后，请修改这里的 job ID
-base_prefix="job-821c2a06-14a8-4617-be55-9411c6d095ea" 
+# Scheduler prefix is deployment-specific and must be supplied explicitly.
+base_prefix="${LINGBOT_CLUSTER_PREFIX:?set LINGBOT_CLUSTER_PREFIX to the common scheduler job prefix}"
 
 # 期望节点数
 hosts=()

@@ -14,8 +14,8 @@ Robotwin eval with FBFM enabled on June 6, 2026.
 
 - Task: `adjust_bottle`
 - Mode: `demo_randomized`
-- Checkpoint:
-  `/mnt/dataset/datasets/cjt_personal/pretrained_models/lingbot-va-posttrain-robotwin`
+- Checkpoint: `${LINGBOT_VA_MODEL}` (local checkpoint directory; weights are
+  not distributed with this repository)
 - Guidance scales: `video_guidance_scale=5`, `action_guidance_scale=1`
 - Episode count: `1`
 - Result: success
@@ -130,8 +130,10 @@ instead of only filling the first one.
 The latest patch also includes environment compatibility updates needed for the
 current machine:
 
-- `evaluation/robotwin/eval_polict_client_openpi.py` now reads `ROBOTWIN_ROOT`
-  and defaults to `/mnt/dataset/projs/projects/RoboTwin`.
+- `evaluation/robotwin/eval_polict_client_openpi.py` reads `ROBOTWIN_ROOT`. In
+  the canonical monorepo layout only, it can infer
+  `<repo>/external/RoboTwin`; other layouts fail fast when the variable is
+  absent.
 - `wan_va/configs/va_robotwin_cfg.py` now reads `LINGBOT_VA_MODEL` for the model
   path and `LINGBOT_VA_ENABLE_OFFLOAD` for the offload toggle.
 - `wan_va/distributed/fsdp.py` falls back to returning the model unchanged when

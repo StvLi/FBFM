@@ -16,6 +16,46 @@ POST /infer 输入样例：
 """
 import os
 import sys
+from pathlib import Path
+
+
+def _required_local_path(name: str, *, directory: bool) -> Path:
+    value = os.environ.get(name)
+    if not value:
+        kind = "directory" if directory else "file"
+        raise RuntimeError(f"{name} is required; set it to the local {kind}")
+    path = Path(value).expanduser().resolve()
+    valid = path.is_dir() if directory else path.is_file()
+    if not valid:
+        kind = "directory" if directory else "file"
+        raise FileNotFoundError(f"{name} does not point to an existing {kind}: {path}")
+    return path
+
+
+MODEL_PATH = str(_required_local_path("A2D_MODEL_PATH", directory=True))
+NORMALIZER_PATH = _required_local_path("A2D_NORMALIZER_PATH", directory=False)
+extra_pythonpath = os.environ.get("A2D_EXTRA_PYTHONPATH")
+if not extra_pythonpath:
+    raise RuntimeError(
+        "A2D_EXTRA_PYTHONPATH is required; set it to the path-separated directories "
+        "providing pose_transform and action_token"
+    )
+extra_import_roots = []
+for value in extra_pythonpath.split(os.pathsep):
+    if not value:
+        continue
+    root = Path(value).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"A2D_EXTRA_PYTHONPATH entry is not a directory: {root}"
+        )
+    extra_import_roots.append(root)
+if not extra_import_roots:
+    raise RuntimeError("A2D_EXTRA_PYTHONPATH contains no usable directory entries")
+for root in extra_import_roots:
+    if str(root) not in sys.path:
+        sys.path.append(str(root))
+
 import torch
 import h5py
 import logging
@@ -28,10 +68,6 @@ import traceback
 import json
 import cv2
 from scipy.spatial.transform import Rotation as R
-import sys
-sys.path.append("/mnt/data/real_eval")
-sys.path.append("/mnt/data/RoboTwin/eval_vla_robotwin")
-
 from pose_transform import add_delta_to_quat_pose
 from action_token.action_chunk_to_fast_token import ActionChunkProcessor
 
@@ -78,39 +114,15 @@ SERVICE_CONFIG = {
     'max_content_length': 16 * 1024 * 1024  # 最大请求大小16MB
 }
 
-# 加载模型
-# MODEL_PATH = '/share/project/jiyuheng/ckpt/robotics_pretrain_modeltp1pp1_S6_20'
-# MODEL_PATH = '/share/project/jiyuheng/ckpt/robotics_pretrain_modeltp1pp1_S6_23'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_S10_model/robotics_pretrain_modeltp1pp1_S10_A2D_pour_coffee_10epoch'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_S8_demo/train_qwen2_5_vl_3b_action_S10_A2D_open_close_10epoch'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_S7_model/train_3b_action_S7_A2D_open_close_640_480'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_X0_model/X0_A2D/train_3b_action_S7_subtask_A2D_pour_coffee_640_480'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_X0_model/X0_A2D/train_3b_action_X0_A2D_pour_coffee_320_240'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_X0_model/X0_A2D/train_3b_action_S7_subtask_A2D_open_close_640_480'
-# MODEL_PATH = '/mnt/data/ckpts/a2d_X0_model/X0_A2D/train_3b_action_X0_A2D_open_close_320_240'
-MODEL_PATH = '/mnt/data/ckpts/robotics_pretrain_modeltp1pp1_3b_action_S7_Subtask_X0_Pro_A2D_20Skill_640_480_merged_5epoch'
-# MODEL_PATH = '/mnt/data/ckpts/robotics_pretrain_modeltp1pp1_3b_action_S7_Subtask_X0_Pro_A2D_20Skill_640_480_merged_1epoch'
-# /mnt/data/ckpts/checkpoint-8603
-
-
-# MODEL_PATH = '/mnt/data/ckpts/robotics_pretrain_modeltp1pp1_Alpha_600h_pour_coffee_1epoch/robotics_pretrain_modeltp1pp1_Alpha_600h_pour_coffee_1epoch'
-# MODEL_PATH = '/mnt/data/ckpts/robotics_pretrain_modeltp1pp1_Alpha_600h_pour_coffee_3epoch/robotics_pretrain_modeltp1pp1_Alpha_600h_pour_coffee_3epoch'
-# MODEL_PATH = '/mnt/data/ckpts/robotics_pretrain_modeltp1pp1_Alpha_600h_pour_coffee_5epoch/robotics_pretrain_modeltp1pp1_Alpha_600h_pour_coffee_5epoch'
-
-
-
-
-
+# Legacy A2D checkpoints are not distributed; A2D_MODEL_PATH is mandatory.
 CONFIG_PATH = MODEL_PATH
 DEBUG=False
 # 全局模型变量
 model = None
 action_tokenizer = get_tokenizer(max_len=256)
 
-# 加载norm参数
-# with open("/mnt/data/real_eval/norms/a2d_norm_open_close_212.json", 'r') as f:
-# with open("/mnt/data/real_eval/norms/a2d_norm_pour_coffice.json", 'r') as f:
-with open("/mnt/data/real_eval/norms/a2d_norm_skill_20.json", 'r') as f:
+# Normalization statistics are deployment artifacts and must be supplied explicitly.
+with NORMALIZER_PATH.open("r", encoding="utf-8") as f:
     action_quantiles_low = json.load(f) 
 
 def load_model():
@@ -433,8 +445,6 @@ def infer_api():
         # 添加处理时间信息
         processing_time = time.time() - start_time
         if DEBUG:  ipdb.set_trace()
-        #with open(f'/share/project/dumengfei/code/real_eval/action_log/action.json', 'w') as f:
-        #    json.dump(current_eef_pose.tolist(), f)
         logger.info(f"推理完成，耗时: {processing_time:.2f}秒")
         print(f"Final eef_action_pos shape: ({len(final_ee_actions_pos)} x {len(final_ee_actions_pos[0])})")
         print(f"Final delta eef_action_pos[0]: {delta_actions_denorm[0]}")

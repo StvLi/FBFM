@@ -3,6 +3,25 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 lingbot=$(cd -- "$script_dir/.." && pwd)
+workspace=$(cd -- "$lingbot/../.." && pwd)
+env_root=${FBFM_ENV_ROOT:-$workspace/.venvs}
+client_python=${ROBOTWIN_CLIENT_PYTHON:-$env_root/fbfm-robotwin/bin/python}
+if [[ $client_python == */* ]]; then
+  [[ -x $client_python ]] || {
+    echo "RoboTwin client Python is not executable: $client_python" >&2
+    echo "Set ROBOTWIN_CLIENT_PYTHON or run scripts/bootstrap/create_envs.sh --route lingbot." >&2
+    exit 2
+  }
+  client_python=$(cd -- "$(dirname -- "$client_python")" && pwd)/$(basename -- "$client_python")
+else
+  requested_client_python=$client_python
+  client_python=$(command -v "$requested_client_python") || {
+    echo "RoboTwin client Python is not on PATH: $requested_client_python; set ROBOTWIN_CLIENT_PYTHON." >&2
+    exit 2
+  }
+fi
+export ROBOTWIN_CLIENT_PYTHON="$client_python"
+
 run_root=${LINGBOT_VA_FBFM20_ROOT:-$lingbot/robotwin_outputs/fbfm_20_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$run_root"
 
@@ -48,7 +67,7 @@ done
 trap - INT TERM
 (( status == 0 )) || exit 1
 
-/home/oem/tmp_ws/conda-envs/fbfm-robotwin/bin/python - "$run_root" <<'PY'
+"$client_python" - "$run_root" <<'PY'
 import json
 import math
 import re
@@ -57,6 +76,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 seed_blocks = {"shard0": 10000, "shard1": 20000, "shard2": 30000}
+episode_counts = {"shard0": 7, "shard1": 7, "shard2": 6}
 aggregate = {
     "task": "adjust_bottle",
     "mode": "FBFM",
@@ -79,6 +99,17 @@ for shard in sorted(root.glob("shard*")):
         result_path.parents[2].rglob("*.mp4"),
         key=lambda path: int(path.name.split("_", 1)[0]),
     )
+    expected_count = episode_counts.get(shard.name)
+    if expected_count is None:
+        raise RuntimeError(f"unexpected shard directory: {shard}")
+    indices = [int(path.name.split("_", 1)[0]) for path in videos]
+    video_successes = sum(path.stem.endswith("_True") for path in videos)
+    if (
+        int(result.get("total_num", -1)) != expected_count
+        or int(result.get("succ_num", -1)) != video_successes
+        or indices != list(range(expected_count))
+    ):
+        raise RuntimeError(f"inconsistent result/video records in {shard}")
     server_logs = list(shard.rglob("logs/server.log"))
     if len(server_logs) != 1:
         raise RuntimeError(f"expected one server.log in {shard}, got {server_logs}")

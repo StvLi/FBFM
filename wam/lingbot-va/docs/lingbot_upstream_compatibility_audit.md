@@ -1,5 +1,10 @@
 # Lingbot-VA / FBFM Compatibility Audit
 
+> This is a historical compatibility audit. Absolute paths and branch names
+> below document the original validation machine; they are not reproduction
+> entry points. Use [`../README.md`](../README.md) and the repository-root
+> `README.md` for the current portable setup and launch commands.
+
 ## Scope and baselines
 
 This audit separates Lingbot-VA inference semantics from the FBFM integration.
@@ -141,8 +146,8 @@ CPU regression tests currently prove:
 Run:
 
 ```bash
-source /home/oem/tmp_ws/environment/activate-lingbot-va.sh
-cd /home/oem/tmp_ws/FBFM
+source /path/to/activate-lingbot-va.sh
+cd /path/to/FBFM
 pytest -q -p no:cacheprovider \
   wam/lingbot-va/tests/test_fbfm_bridge.py \
   wam/lingbot-va/tests/test_async_transport.py

@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 import dreamzero_fbfm.server as server_module
+from dreamzero_fbfm.constraints import ConstraintMode
+from dreamzero_fbfm.settings import DEFAULT_STATE_WEIGHT
 
 
 class FakeConnection:
@@ -69,6 +71,9 @@ class FakeRuntime:
 class FakeInferenceRuntime(FakeRuntime):
     def __init__(self):
         super().__init__()
+        self.mode = ConstraintMode.FBFM
+        self.state_weight = DEFAULT_STATE_WEIGHT
+        self.state_feedback_kp = 1.0
         self.chunks = []
         self.feedback = []
 
@@ -180,6 +185,21 @@ def test_reset_restarts_single_frame_causal_warmup():
     ] == [[1], [7]]
 
 
+def test_reset_rejects_client_server_kp_mismatch():
+    server = _inference_server()
+    request = {
+        "type": "reset",
+        "task_description": "pick object",
+        "seed": 0,
+        "expected_mode": "FBFM",
+        "expected_state_weight": DEFAULT_STATE_WEIGHT,
+        "expected_state_feedback_kp": 100.0,
+    }
+
+    with pytest.raises(ValueError, match="state_feedback_kp mismatch"):
+        server._handle("reset", request)
+
+
 def test_server_accepts_multiple_sequential_clients(monkeypatch):
     connections = [FakeConnection(), FakeConnection()]
     listening_socket = FakeSocket(connections)
@@ -216,3 +236,41 @@ def test_server_accepts_multiple_sequential_clients(monkeypatch):
     assert all(connection.responses == [{"status": "ok", "type": "close"}] for connection in connections)
     assert [event for event, _ in server.audit.events].count("client_connected") == 2
     assert [event for event, _ in server.audit.events].count("client_disconnected") == 2
+
+
+def test_server_survives_broken_client_connection(monkeypatch):
+    connections = [FakeConnection(), FakeConnection()]
+    listening_socket = FakeSocket(connections)
+    monkeypatch.setattr(server_module.socket, "socket", lambda *_args, **_kwargs: listening_socket)
+    monkeypatch.setattr(
+        server_module,
+        "receive_message",
+        lambda connection: connection.messages.pop(0) if connection.messages else None,
+    )
+
+    def send(connection, response):
+        if connection is connections[0]:
+            raise BrokenPipeError("client stopped")
+        connection.responses.append(response)
+
+    monkeypatch.setattr(server_module, "send_message", send)
+    monkeypatch.setattr(
+        server_module.ModelServer,
+        "_handle",
+        lambda _self, request_type, _request: {"status": "ok", "type": request_type},
+    )
+
+    server = object.__new__(server_module.ModelServer)
+    server.host = "127.0.0.1"
+    server.port = 18766
+    server.audit = FakeAudit()
+    server.runtime = FakeRuntime()
+    server.job = None
+
+    with pytest.raises(KeyboardInterrupt):
+        server.serve()
+
+    assert connections[1].responses == [{"status": "ok", "type": "close"}]
+    errors = [values for event, values in server.audit.events if event == "client_connection_error"]
+    assert len(errors) == 1
+    assert "BrokenPipeError" in errors[0]["error"]

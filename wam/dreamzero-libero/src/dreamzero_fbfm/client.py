@@ -34,8 +34,27 @@ class FBFMClient:
             "state": encode_array(np.asarray(state, dtype=np.float32)),
         }
 
-    def reset(self, task_description: str, seed: int) -> None:
-        self._request({"type": "reset", "task_description": task_description, "seed": int(seed)})
+    def reset(
+        self,
+        task_description: str,
+        seed: int,
+        *,
+        mode: str | None = None,
+        state_weight: float | None = None,
+        state_feedback_kp: float | None = None,
+    ) -> None:
+        request: dict[str, Any] = {
+            "type": "reset",
+            "task_description": task_description,
+            "seed": int(seed),
+        }
+        if mode is not None:
+            request["expected_mode"] = mode
+        if state_weight is not None:
+            request["expected_state_weight"] = float(state_weight)
+        if state_feedback_kp is not None:
+            request["expected_state_feedback_kp"] = float(state_feedback_kp)
+        self._request(request)
 
     def predict_sync(self, main: np.ndarray, wrist: np.ndarray, state: np.ndarray) -> np.ndarray:
         response = self._request({"type": "predict_sync", **self._observation(main, wrist, state)})

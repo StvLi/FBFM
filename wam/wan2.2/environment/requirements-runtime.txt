@@ -1,0 +1,18 @@
+# Direct Wan2.2 TI2V/FBFM dependencies from the validated Python 3.10 run.
+# PyTorch and optional FlashAttention are installed in separate phases.
+accelerate==1.14.0
+dashscope==1.26.4
+diffusers==0.39.0
+easydict==1.13
+einops==0.8.2
+ftfy==6.3.1
+imageio[ffmpeg]==2.37.4
+imageio-ffmpeg==0.6.0
+ninja==1.13.0
+numpy==1.26.4
+opencv-python==4.11.0.86
+pillow==12.2.0
+pytest==9.1.1
+tokenizers==0.21.4
+tqdm==4.69.1
+transformers==4.51.3

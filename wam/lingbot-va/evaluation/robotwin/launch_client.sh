@@ -17,7 +17,7 @@ task_groups=(
   "place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb place_empty_cup blocks_ranking_rgb"
 )
 
-base_save_root=${1:-'/share/project/caomingyu/WAM_baseline/lingbot-va-rollout-kzz'}
+base_save_root=${1:-${ROBOTWIN_OUTPUT_ROOT:-robotwin_outputs/legacy}}
 save_root="${base_save_root}_$(date +%Y%m%d_%H%M%S)"
 task_name=${2:-"blocks_ranking_size"}
 
@@ -29,7 +29,7 @@ seed=0
 PORT=29056
 
 PYTHONWARNINGS=ignore::UserWarning \
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 "${ROBOTWIN_CLIENT_PYTHON:-python}" -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
     --overrides \
     --task_name ${task_name} \
     --task_config ${task_config} \

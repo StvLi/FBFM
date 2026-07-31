@@ -1,21 +1,23 @@
 # DreamZero x FBFM x LIBERO handover
 
-Updated: 2026-07-25
+Updated: 2026-07-26
 
 ## Repositories and revisions
 
 | Item | Location / revision |
 | --- | --- |
-| Canonical monorepo route | `/home/oem/tmp_ws/FBFM/wam/dreamzero-libero` |
-| Monorepo branch | `fix/dreamzero-rolling-feedback` |
-| Imported standalone repository | `/home/oem/tmp_ws/DreamZero-FBFM-LIBERO` |
-| A6000 integration repository | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO` |
+| Canonical monorepo route | `$FBFM_ROOT/wam/dreamzero-libero` |
+| Monorepo branch | `fix/dreamzero-binary-state-mask` |
+| Imported standalone repository | historical machine-local checkout; not the public source of record |
+| A6000 integration repository | historical machine-local deployment checkout |
+| Active experiment branch | `experiment/dreamzero-l1mass-state-weight` |
+| Parent relinearized/RMS method revision | `13de791` |
 | Imported standalone branch | `runnable-dreamzero-fbfm-libero` |
 | Rolling method revision | `118211b` |
 | Canonical audit/metadata revision | `1ee00fa` |
 | A6000 rolling method revision | `0d258e4` |
 | A6000 audit/metadata revision | `0f04fd3` |
-| Paper experiment branch | `/home/oem/tmp_ws/aaai_paper`, branch `experiment` |
+| Paper experiment branch | historical paper experiment repository, branch `experiment` |
 
 The second revision in each repository fixes experiment metadata and audit
 grouping; it does not alter the numerical method in `118211b`/`0d258e4`.
@@ -24,7 +26,7 @@ grouping; it does not alter the numerical method in `118211b`/`0d258e4`.
 
 | Item | Path |
 | --- | --- |
-| Base workspace | `/home/deepcybo-lite/fbfm_ws` |
+| Base workspace | `$DREAMZERO_BASE_WORKSPACE` |
 | DreamZero environment | `envs/miniconda3/envs/dreamzero` |
 | LIBERO environment | `envs/miniconda3/envs/libero` |
 | DreamZero source | `dreamzero` |
@@ -40,9 +42,13 @@ shards are read through host memory before the GPU transfer.
 ## Method mapping
 
 DreamZero transports video and action in one DiT call. FBFM reconstructs the
-joint endpoint at each native DiT evaluation, applies a block-diagonal observed
-state/action discrepancy, and computes one joint VJP. Cross-modal Jacobian terms
-are therefore retained. The integration preserves these upstream contracts:
+joint endpoint and applies a block-diagonal state/action discrepancy at every
+UniPC scheduler index. The full endpoint Jacobian is refreshed at the eight
+native DiT evaluations and reused at skipped DiT indices while the current
+sample, sigma, endpoint residual, and VJP are recomputed. Native velocities,
+not guided velocities, remain in `prev_predictions`. Cross-modal Jacobian terms
+are therefore retained without replacing DreamZero's cache schedule. The
+integration preserves these upstream contracts:
 
 - 16 native UniPC scheduler steps and the checkpoint's 8-evaluation DiT cache mask;
 - the released checkpoint, CFG, VAE, causal cache, action normalization, and 7D action output;
@@ -50,13 +56,17 @@ are therefore retained. The integration preserves these upstream contracts:
 - zero masks and the original numerical path in `NONE` mode.
 
 The action block constrains the committed `8 x 7 = 56` physical coordinates.
-The visual block constrains one `48 x 10 x 20 = 9600` latent slot. After every
-action, the current-wave anchor and the causal observations available so far are
-completed to a five-frame VAE window by holding the latest observation forward.
-The source window progresses from `[0,1,1,1,1]` to `[0,2,4,6,8]`; the latter is
-exactly the native complete block. The slot is re-encoded, refreshed and
-versioned before each of the eight DiT evaluations. Its fixed default weight is
-`56/9600`. See `docs/IMPLEMENTATION.md` for the solver equations and hook boundary.
+The visual block constrains one `48 x 10 x 20 = 9600` latent slot. Real feedback
+is sampled at the checkpoint's three-action video stride. Missing history is
+left-padded with the measured current-wave anchor; no unobserved future frame is
+copied into a hard target. The first two windows available in an eight-action
+wave are `[0,0,0,0,3]` and `[0,0,0,3,6]`. The action mask remains binary. The
+state alignment coefficient is fixed at the L1-mass value
+`56/9600=0.005833333333333334`. A separate `state_feedback_kp` scales only the
+aligned state residual, with `kp=1` reproducing the completed L1-mass result.
+The initial search points are `0.001`, `1`, and `100`; the middle point reuses
+the existing record. See `docs/IMPLEMENTATION.md` for the solver equations and
+hook boundary.
 
 ## Experiment state
 
@@ -75,7 +85,7 @@ after action 8; its data are diagnostic only.
 
 | Runtime artifact | Location |
 | --- | --- |
-| Rolling pilot root | `/home/deepcybo-lite/peize/DreamZero-FBFM-LIBERO/results/rolling_v1_task0_20_0d258e4` |
+| Rolling pilot root | `results/rolling_v1_task0_20_0d258e4` (relative to the historical A6000 deployment checkout) |
 | Episode outputs | `<pilot root>/tasks/libero_spatial/task_000` |
 | Joint solver audit | `<pilot root>/solver.jsonl` |
 | Task table | `<pilot root>/task_summary.csv` |
@@ -85,7 +95,28 @@ after action 8; its data are diagnostic only.
 The rolling pilot is complete at 9/20 successes (45.0%, 95% Wilson interval
 25.8%-65.8%). The matched delayed-feedback diagnostic achieved 8/20, while the
 historical base task-0 run achieved 19/20. Rolling feedback is implemented and
-working, but does not by itself explain or recover the performance gap.
+working, but does not by itself explain or recover the performance gap. These
+historical runs used the legacy `56/9600` state weight and must not be combined
+with binary-mask results under one protocol label.
+
+The current RMS-balanced, relinearized object-6 validation is complete at
+`4/20 = 20.0%` (95% Wilson interval `8.1%-41.6%`), versus the paired native
+base at `5/20 = 25.0%` (95% Wilson interval `11.2%-46.9%`). Its A6000 result
+root is `results/libero_object6_rms00764_fbfm_10_13de791`; the historical
+directory name still contains `10`, but its ledger and summary now contain
+trials 0-19. The complete record and negative binary/recurrent diagnostics are
+in the paper experiment repository's
+`experiments/dreamzero_object6_binary_mask_diagnosis.md`.
+
+The 20-trial extension exposed a rare but severe solver outlier in FBFM trial
+18, wave 16. Eight generated actions had norms above 100, with a maximum of
+168.37 and maximum absolute coordinate 152.81; native base's maximum action
+norm across all 20 trials was 1.57. Scheduler indices 7-9 reused a Jacobian
+whose correction grew from 138.15 at index 6 to 11260.61 at index 9. RMS
+modality balancing therefore fixes the typical scale mismatch but does not
+guarantee that a cached Jacobian remains inside its local linearization domain.
+Do not report the current branch as numerically stable until a trust-region or
+guarded native-update fallback is implemented and retested.
 
 ## Table management
 
@@ -102,8 +133,8 @@ launched, and use a new result root and filename prefix.
 
 ## Validation and caveats
 
-- Canonical CPU regression suite: 23 tests passed.
-- A6000 standalone route suite: 17 applicable tests passed. Two monorepo-path
+- Canonical CPU regression suite: 24 applicable tests passed.
+- A6000 standalone route suite: 24 applicable tests passed. Two monorepo-path
   tests are intentionally inapplicable to the standalone deployment layout.
 - The smoke succeeded in 168/480 steps; the formal pilot completed all 20 trials.
 - The solver audit contains 6,969 finite evaluations, 0 server errors, context
