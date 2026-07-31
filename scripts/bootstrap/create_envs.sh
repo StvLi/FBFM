@@ -42,6 +42,8 @@ Environment variables:
                          3.8, 3.10 respectively)
   FBFM_PIP_EXTRA_ARGS    extra arguments (word-split) passed to pip
   FBFM_INSTALL_UPSTREAM  set to 0 (same as --skip-upstream)
+  FBFM_WAN_SOURCE_ROOT   patched Wan2.2 checkout (defaults to route vendor,
+                         then external/Wan2.2)
 
 Conda environments are prefix-based, so no shell activation is required by
 the launchers.  For a prepared machine with existing environments, set
@@ -243,6 +245,7 @@ install_for() {
   pip_run "$python" install --upgrade pip setuptools wheel
   case "$key" in
     lingbot)
+      pip_run "$python" install pytest
       pip_file "$python" "$REPO_ROOT/wam/lingbot-va/requirements.txt"
       pip_editable "$python" "$REPO_ROOT/wam/lingbot-va" --no-deps
       if ((SKIP_UPSTREAM == 0)); then
@@ -254,6 +257,7 @@ install_for() {
       pip_editable "$python" "$EXTERNAL_ROOT/RoboTwin" --no-deps
       ;;
     dreamzero)
+      pip_run "$python" install pytest
       if ((SKIP_UPSTREAM == 0)); then
         pip_editable "$python" "$EXTERNAL_ROOT/dreamzero"
         pip_editable "$python" "$EXTERNAL_ROOT/RLinf" --no-deps
@@ -265,14 +269,15 @@ install_for() {
       pip_editable "$python" "$EXTERNAL_ROOT/LIBERO" --no-deps
       ;;
     wan)
-      pip_file "$python" "$EXTERNAL_ROOT/Wan2.2/requirements.txt"
-      # The FBFM Wan overlay is intentionally separate from upstream.  It may
-      # be absent until the overlay is copied into the checkout.
-      if [[ -d "$REPO_ROOT/wam/wan2.2" ]]; then
-        pip_editable "$python" "$REPO_ROOT/wam/wan2.2" --no-deps
-      else
-        pip_editable "$python" "$EXTERNAL_ROOT/Wan2.2" --no-deps
+      pip_run "$python" install pytest
+      wan_source="${FBFM_WAN_SOURCE_ROOT:-}"
+      if [[ -z "$wan_source" && -f "$REPO_ROOT/wam/wan2.2/vendor/Wan2.2/pyproject.toml" ]]; then
+        wan_source="$REPO_ROOT/wam/wan2.2/vendor/Wan2.2"
+      elif [[ -z "$wan_source" ]]; then
+        wan_source="$EXTERNAL_ROOT/Wan2.2"
       fi
+      pip_file "$python" "$wan_source/requirements.txt"
+      pip_editable "$python" "$wan_source" --no-deps
       ;;
   esac
 }

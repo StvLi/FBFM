@@ -161,8 +161,11 @@ for candidate in "${patch_candidates[@]}"; do
   [[ -f "$candidate" ]] && { wan_patch="$candidate"; break; }
 done
 if [[ -n "$wan_patch" && -d "$wan_dir" && -e "$wan_dir/.git" ]]; then
-  if git -C "$wan_dir" apply --check "$wan_patch" >/dev/null 2>&1; then
-    note "Wan2.2 FBFM patch applies cleanly"
+  # --cached checks against the pinned index and deliberately ignores overlay
+  # files already present in the working tree.  This makes verification useful
+  # both before and after the route-specific fetch script applies the patch.
+  if git -C "$wan_dir" apply --check --cached "$wan_patch" >/dev/null 2>&1; then
+    note "Wan2.2 FBFM patch applies cleanly to the pinned source index"
   elif git -C "$wan_dir" apply --reverse --check "$wan_patch" >/dev/null 2>&1; then
     note "Wan2.2 FBFM patch is already applied"
   else

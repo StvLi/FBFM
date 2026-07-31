@@ -24,7 +24,7 @@ Options:
 
 Python overrides (otherwise .venvs/fbfm-*/bin/python, then python3):
   FBFM_SHARED_PYTHON, FBFM_LINGBOT_PYTHON, FBFM_DREAMZERO_PYTHON,
-  FBFM_WAN_PYTHON, FBFM_ENV_ROOT
+  FBFM_WAN_PYTHON, FBFM_ENV_ROOT, FBFM_WAN_SOURCE_ROOT
 EOF
 }
 
@@ -117,25 +117,45 @@ run_dreamzero() {
 
 run_wan() {
   local py; py="$(python_for wan)"
-  local root="$REPO_ROOT/wam/wan2.2"
-  if [[ ! -d "$root" ]]; then
-    echo "smoke: Wan2.2 overlay is absent; run the submission assembly first (skipping)" >&2
+  local route_root="$REPO_ROOT/wam/wan2.2"
+  local overlay_root="$route_root"
+  [[ ! -d "$route_root/overlay" ]] || overlay_root="$route_root/overlay"
+
+  # Unit tests must import a complete, patched Wan package.  The source-only
+  # overlay is intentionally not a second copy of upstream and cannot be put
+  # on PYTHONPATH by itself because upstream `wan` is a regular package.
+  local runtime_root="${FBFM_WAN_SOURCE_ROOT:-}"
+  if [[ -z "$runtime_root" && -d "$route_root/vendor/Wan2.2" ]]; then
+    runtime_root="$route_root/vendor/Wan2.2"
+  elif [[ -z "$runtime_root" && -d "${FBFM_EXTERNAL_ROOT:-$REPO_ROOT/external}/Wan2.2" ]]; then
+    runtime_root="${FBFM_EXTERNAL_ROOT:-$REPO_ROOT/external}/Wan2.2"
+  fi
+  if [[ -z "$runtime_root" || ! -d "$runtime_root" ]]; then
+    echo "smoke: patched Wan2.2 checkout is absent; run wam/wan2.2/scripts/fetch_upstream.sh (skipping)" >&2
     return 0
   fi
-  [[ -f "$root/tests/test_fbfm_state_feedback.py" ]] || {
-    echo "smoke: Wan2.2 FBFM tests are absent; skipping" >&2
+
+  local test_file="$runtime_root/tests/test_fbfm_state_feedback.py"
+  local entrypoint="$runtime_root/generate_fbfm.py"
+  local vae_validator="$runtime_root/scripts/validate_fbfm_vae.py"
+  [[ -f "$test_file" ]] || test_file="$overlay_root/tests/test_fbfm_state_feedback.py"
+  [[ -f "$entrypoint" ]] || entrypoint="$overlay_root/generate_fbfm.py"
+  [[ -f "$vae_validator" ]] || vae_validator="$overlay_root/scripts/validate_fbfm_vae.py"
+  [[ -f "$test_file" && -f "$entrypoint" ]] || {
+    echo "smoke: Wan2.2 FBFM overlay files are absent; skipping" >&2
     return 0
   }
+
   PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-    PYTHONPATH="$root:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    "$py" -m pytest -p no:cacheprovider -q "$root/tests/test_fbfm_state_feedback.py"
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    "$py" "$root/generate_fbfm.py" --help >/dev/null
+    PYTHONPATH="$runtime_root:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$py" -m pytest -p no:cacheprovider -q "$test_file"
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_root:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$py" "$entrypoint" --help >/dev/null
   if [[ -n "$MODEL" ]]; then
-    [[ -f "$root/scripts/validate_fbfm_vae.py" ]] || die "Wan VAE validator is missing from the overlay"
+    [[ -f "$vae_validator" ]] || die "Wan VAE validator is missing from the overlay"
     [[ -d "$MODEL" ]] || die "Wan VAE model directory does not exist: $MODEL"
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-      "$py" "$root/scripts/validate_fbfm_vae.py" --ckpt-dir "$MODEL"
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$runtime_root:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+      "$py" "$vae_validator" --ckpt-dir "$MODEL"
   fi
 }
 
