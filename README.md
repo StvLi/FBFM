@@ -567,30 +567,3 @@ bash scripts/package_submission.sh /path/to/FBFM-submission.tar.gz
 The packager writes both `FBFM-submission.tar.gz` and its `.sha256` file. Review
 the archive listing and third-party licenses before uploading it to the AAAI
 submission system.
-
-## Abstract
-
-Although world-action models (WAMs) enhance long-horizon robot control by
-predicting visual evolution before acting, long-horizon reliability demands
-repeated re-grounding in real observations—not recursive rollout. Existing WAMs
-address this by refreshing history or KV cache with ground-truth data between
-chunks. However, such chunk-wise feedback operates at a coarse temporal
-granularity and thus fails to correct prediction errors at the individual
-time-step level. To address this, we propose Feedback Flow Matching (FBFM), a
-training-free inference mechanism that pushes re-grounding inside the actively
-generated chunk. During flow matching, FBFM applies a masked pseudoinverse
-correction to the conditional velocity field: it leverages the preceding action
-chunk to guide generation of the next action chunk, and uses the image observed
-after executing that preceding chunk to guide the next frame prediction. This
-cross-chunk pairing—where feedback from one chunk arrives in time to shape the
-next—creates an asynchronous loop that corrects errors without waiting for
-chunk boundaries. Being training-free, the mechanism improves responsiveness to
-unexpected events and suppresses drift in long-horizon tasks. We evaluate FBFM
-on a joint-generation WAM (DreamZero) and a stage-wise WAM (LingBot-VA). Across
-42 selected RoboTwin tasks, FBFM raises the equal-weight task-configuration
-success rate by 3.0 percentage points; across four LIBERO suites, it provides a
-modest 0.6-point pooled gain, including 2.5-point improvements on LIBERO-Goal
-and LIBERO-10. Prediction from recorded physical-robot observations further
-shows improved state tracking. We argue that FBFM offers a new paradigm for
-fine-grained online correction, bridging open-loop flow generation with
-closed-loop real-world dynamics.
